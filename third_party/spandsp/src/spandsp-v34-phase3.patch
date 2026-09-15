@@ -139,6 +139,24 @@
      return 0;
  }
  /*- End of function --------------------------------------------------------*/
+@@ -1549,7 +1659,7 @@
+             i = -i;
+         /*endif*/
+         //printf("v = %10.5f %5d - %f %f %d %d\n", v, i, p, s->pri_ted.baud_phase, s->total_baud_timing_correction);
+-        s->eq_put_step += i;
++        /* pri TED nudge disabled (diagnostic) */;
+         s->total_baud_timing_correction += i;
+     }
+     /*endif*/
+@@ -1572,7 +1682,7 @@
+             i = -i;
+         /*endif*/
+         //printf("v = %10.5f %5d - %f %f %d\n", v, i, p, s->pri_ted.baud_phase, s->total_baud_timing_correction);
+-        s->eq_put_step += i;
++        /* pri TED nudge disabled (diagnostic) */;
+         s->total_baud_timing_correction += i;
+     }
+     /*endif*/
 @@ -1971,6 +2081,7 @@
                  s->received_event = V34_EVENT_L2_SEEN;
                  s->current_demodulator = V34_MODULATION_TONES;
@@ -147,7 +165,7 @@
              }
              /*endif*/
          }
-@@ -2042,7 +2153,14 @@
+@@ -2042,7 +2153,18 @@
                 and the start of actual user data */
              if (s->duplex)
              {
@@ -159,11 +177,15 @@
 +                s->stage = V34_RX_STAGE_PRIMARY_CHANNEL;
 +                s->data_rx_active = true;
 +                s->data_rx_count = 0;
++                {
++                    const char *p = getenv("V34_RX_INITPHASE");
++                    s->eq_put_step = p ? atoi(p) : 0;
++                }
 +                span_log(s->logging, SPAN_LOG_FLOW, "Rx - E seen, starting primary channel\n");
              }
              else
              {
-@@ -2325,12 +2443,38 @@
+@@ -2325,12 +2447,47 @@
  
      /* On alternate insertions we have a whole baud and must process it. */
      if ((s->baud_half ^= 1))
@@ -182,8 +204,17 @@
 +           Q9.7 format the transmitter produced them in. */
 +        if (s->data_rx_symbol_count >= s->data_rx_offset)
 +        {
++            static int conj_mode = -1;
++            float im = sample->im;
++            if (conj_mode < 0)
++            {
++                const char *c = getenv("V34_RX_CONJ");
++                conj_mode = c ? atoi(c) : 0;
++            }
++            if (conj_mode == 1)
++                im = -im;
 +            s->data_rx_symbols[2*s->data_rx_count] = (int16_t) (sample->re*s->data_rx_scale);
-+            s->data_rx_symbols[2*s->data_rx_count + 1] = (int16_t) (sample->im*s->data_rx_scale);
++            s->data_rx_symbols[2*s->data_rx_count + 1] = (int16_t) (im*s->data_rx_scale);
 +            if (++s->data_rx_count >= 8)
 +            {
 +                v34_put_mapping_frame(s, s->data_rx_symbols);
@@ -202,7 +233,7 @@
  #if 0
      z = equalizer_get(s);
  
-@@ -2371,22 +2515,27 @@
+@@ -2371,22 +2528,27 @@
      float ii;
      float qq;
      float v;
@@ -239,7 +270,7 @@
  // printf("XYX0 %d\n", len);
      for (i = 0;  i < len;  i++)
      {
-@@ -2694,6 +2843,16 @@
+@@ -2694,6 +2856,19 @@
      s->rx.baud_rate = baud_rate;
      s->rx.bit_rate = bit_rate;
      s->rx.high_carrier = high_carrier;
@@ -248,15 +279,18 @@
 +    s->rx.s_det_count = 0;
 +    s->rx.data_rx_active = false;
 +    s->rx.data_rx_count = 0;
-+    s->rx.data_rx_scale = 10.0f;   /* provisional: maps received units to Q9.7 */
++    s->rx.data_rx_scale = 1.2f;   /* provisional: maps received units to Q9.7 */
 +    {
 +        const char *o = getenv("V34_RX_OFFSET");
++        const char *sc = getenv("V34_RX_SCALE");
 +        s->rx.data_rx_offset = o ? atoi(o) : 0;
++        if (sc)
++            s->rx.data_rx_scale = (float) atof(sc);
 +    }
  
      s->rx.v34_carrier_phase_rate = dds_phase_ratef(carrier_frequency(s->rx.baud_rate, s->rx.high_carrier));
      s->rx.cc_carrier_phase_rate = dds_phase_ratef((s->calling_party)  ?  2400.0f  :  1200.0f);
-@@ -2713,9 +2872,13 @@
+@@ -2713,9 +2888,13 @@
      s->rx.carrier_track_p = 40000.0f;
  
      /* Create a default symbol sync filter */
