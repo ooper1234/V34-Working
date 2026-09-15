@@ -233,6 +233,7 @@ static void process_audio(sm_call_t *c, const int16_t *in, int n)
     {
         c->phase = SM_CALL_DATA;
         c->negotiated_rate = c->modem.negotiated_bit_rate;
+        c->modem.negotiated_bit_rate = c->negotiated_rate;
         sm_deframer_init(&c->deframer);
         sm_log_message(&c->log, SM_LOG_FLOW,
                        "==> DATA MODE at %d bps (%s)",
@@ -434,7 +435,7 @@ out:
     sm_log_message(&c->log, SM_LOG_FLOW,
                    "call summary: samples_in=%lld samples_out=%lld tx_bytes=%lld rx_bytes=%lld rate=%d state=%s",
                    c->samples_in, c->samples_out, c->data_bytes_tx, c->data_bytes_rx,
-                   c->modem.negotiated_bit_rate,
+                   c->negotiated_rate ? c->negotiated_rate : c->modem.negotiated_bit_rate,
                    c->phase == SM_CALL_DATA ? "DATA" : "HANDSHAKE");
     stop_pppd(c);
     close(socket_fd);

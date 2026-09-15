@@ -1,0 +1,29 @@
+; Asterisk AudioSocket dialplan for the softmodem daemon
+;
+; Setup:
+;   1. sm_daemon listens on TCP 9092 (default).
+;   2. In Asterisk, receive the call from the PAP2T and Answer().
+;   3. AudioSocket() connects to the daemon over TCP, sending 8 kHz
+;      16-bit signed linear mono PCM in both directions.
+;   4. The daemon runs the V.22bis answerer and its pppd side of the link.
+;
+; This file is an example; merge into your /etc/asterisk/extensions.conf.
+
+[modem-incoming]
+; The PAP2T Line 2 dials this extension (any digits work; see dialplan below)
+exten => _X.,1,NoOp(Dial-up modem call from ${CALLERID(num)} to ${EXTEN})
+ same => n,Set(UUID=${SHELL(uuidgen)})
+ same => n,Answer()
+ same => n,AudioSocket(${UUID},127.0.0.1:9092)
+ same => n,Hangup()
+
+; If you want the classic "modem extension", e.g. 555:
+exten => 555,1,NoOp(Dial-up modem call)
+ same => n,Set(UUID=${SHELL(uuidgen)})
+ same => n,Answer()
+ same => n,AudioSocket(${UUID},127.0.0.1:9092)
+ same => n,Hangup()
+
+[from-pap2t]
+; Route calls arriving from the PAP2T (line 2) to the modem handler
+exten => _X.,1,Goto(modem-incoming,${EXTEN},1)

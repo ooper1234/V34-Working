@@ -1,0 +1,58 @@
+; Minimal Asterisk SIP configuration for the PAP2T ATA (chan_pjsip format)
+;
+; The PAP2T should be configured with:
+;   Line 2 (modem line):
+;     SIP Port:          5061 (any)
+;     Proxy:              <this host>:5060
+;     Display Name:      modem
+;     User ID:           modem
+;     Password:          <secret>
+;     Register:          yes
+;     Use Auth ID:       no
+;     Dial Plan:         (*xx|[2-9]xxxxxx|xxxxxxxxxxxx.)   ; allows most digits
+;
+; This example enables anonymous registration for the modem user, matching
+; the PAP2T's current configuration on this machine.
+
+[global]
+type = global
+user_agent = softmodem-asterisk
+
+[transport-udp]
+type = transport
+protocol = udp
+bind = 0.0.0.0:5060
+
+[modem]
+type = endpoint
+context = modem-incoming
+disallow = all
+allow = ulaw
+direct_media = no
+rtp_symmetric = yes
+force_rport = yes
+rewrite_contact = yes
+language = en
+auth = modem-auth
+aors = modem
+
+[modem-auth]
+type = auth
+auth_type = userpass
+username = modem
+password = modempass
+
+[modem]
+type = aor
+max_contacts = 4
+qualify_frequency = 60
+
+[modem-anonymous]
+type = endpoint
+context = modem-incoming
+disallow = all
+allow = ulaw
+direct_media = no
+rtp_symmetric = yes
+force_rport = yes
+rewrite_contact = yes
