@@ -1,0 +1,214 @@
+--- v34rx.c.orig
++++ v34rx.c
+@@ -265,11 +265,11 @@
+     /*endif*/
+     bitstream_flush(&s->bs, &t);
+ #if 0
+-    printf("Block ");
++    // printf("Block ");
+     for (i = 0;  i < (s->b + 7)/8;  i++)
+-        printf("%02X ", s->rxbuf[i]);
++        // printf("%02X ", s->rxbuf[i]);
+     /*endfor*/
+-    printf("\n");
++    // printf("\n");
+ #endif
+ 
+     bitstream_init(&s->bs, true);
+@@ -1146,7 +1146,7 @@
+ static void put_info_bit(v34_rx_state_t *s, int bit, int time_offset)
+ {
+     /* Put info0, info1, tone A or tone B bits */
+-    printf("Rx bit = %d\n", bit);
++    // printf("Rx bit = %d\n", bit);
+     s->bitstream = (s->bitstream << 1) | bit;
+     switch (s->stage)
+     {
+@@ -1172,7 +1172,7 @@
+            a little while since the last one */
+         if (s->persistence2 > 20)
+         {
+-            printf("Rx bit reversal in tone A\n");
++            // printf("Rx bit reversal in tone A\n");
+             switch (s->received_event)
+             {
+             case V34_EVENT_REVERSAL_1:
+@@ -1224,7 +1224,7 @@
+            a little while since the last one */
+         if (s->persistence2 > 20)
+         {
+-            printf("Rx bit reversal in tone B\n");
++            // printf("Rx bit reversal in tone B\n");
+             switch (s->received_event)
+             {
+             case V34_EVENT_REVERSAL_2:
+@@ -1261,7 +1261,7 @@
+         if ((s->bitstream & 0x3FF) == 0x372)
+         {
+             span_log(s->logging, SPAN_LOG_FLOW, "Rx - info sync code detected\n");
+-            printf("Rx bit info sync code detected\n");
++            // printf("Rx bit info sync code detected\n");
+             s->crc = 0xFFFF;
+             s->bit_count = 1;
+         }
+@@ -1277,17 +1277,17 @@
+         if (s->bit_count++ == s->target_bits)
+         {
+             span_log(s->logging, SPAN_LOG_FLOW, "Rx - info CRC result 0x%x\n", s->crc);
+-            printf("Rx bit CRC result 0x%X\n", s->crc);
+-            printf("Rx 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
+-                   s->info_buf[0],
+-                   s->info_buf[1],
+-                   s->info_buf[2],
+-                   s->info_buf[3],
+-                   s->info_buf[4],
+-                   s->info_buf[5],
+-                   s->info_buf[6],
+-                   s->info_buf[7],
+-                   s->info_buf[8]);
++            // printf("Rx bit CRC result 0x%X\n", s->crc);
++            // printf("Rx 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
++            //                    s->info_buf[0],
++            //                    s->info_buf[1],
++            //                    s->info_buf[2],
++            //                    s->info_buf[3],
++            //                    s->info_buf[4],
++            //                    s->info_buf[5],
++            //                    s->info_buf[6],
++            //                    s->info_buf[7],
++            //                    s->info_buf[8]);
+             if (s->crc == 0)
+             {
+                 switch (s->stage)
+@@ -1410,7 +1410,7 @@
+         zz.re = sample.re*z.re - sample.im*z.im;
+         zz.im = -sample.re*z.im - sample.im*z.re;
+         angle = arctan2(zz.im, zz.re);
+-        printf("XXX%d, %7d, %f, %f, 0x%08X, %d\n", s->calling_party, amp[i], zz.re, zz.im, angle, angle);
++        // printf("XXX%d, %7d, %f, %f, 0x%08X, %d\n", s->calling_party, amp[i], zz.re, zz.im, angle, angle);
+         if (abs(angle - s->last_angles[1]) > DDS_PHASE(90.0f)  &&  s->blip_duration > 3)
+         {
+             put_info_bit(s, 1, i);
+@@ -1918,11 +1918,11 @@
+     /*endfor*/
+     for (i = 0;  i < 25;  i++)
+     {
+-        printf("DFT %4d, %12.5f, %12.5f, %12.5f\n",
+-               i,
+-               (i + 1)*150.0f,
+-               s->l1_l2_gains[i],
+-               s->l1_l2_phases[i]);
++        // printf("DFT %4d, %12.5f, %12.5f, %12.5f\n",
++        //                i,
++        //                (i + 1)*150.0f,
++        //                s->l1_l2_gains[i],
++        //                s->l1_l2_phases[i]);
+         span_log(s->logging, SPAN_LOG_FLOW, "DFT %4d, %12.5f, %12.5f, %12.5f\n",
+                  i,
+                  (i + 1)*150.0f,
+@@ -2181,7 +2181,7 @@
+     float v;
+ 
+     step = 6;
+-printf("XYX0 %d\n", len);
++// printf("XYX0 %d\n", len);
+     for (i = 0;  i < len;  i++)
+     {
+         s->rrc_filter[s->rrc_filter_step] = amp[i];
+@@ -2281,7 +2281,7 @@
+ 
+             //angle = arctan2(zz.im, zz.re);
+             //printf("XYX1 %10.5f %10.5f\n", atan2(zz.re, zz.im), sqrt(zz.re*zz.re + zz.im*zz.im));
+-            printf("XYX2 %10.5f %10.5f\n", zz.re, zz.im);
++            // printf("XYX2 %10.5f %10.5f\n", zz.re, zz.im);
+         }
+         /*endif*/
+ #if defined(SPANDSP_USE_FIXED_POINT)
+@@ -2387,7 +2387,7 @@
+     s->shaper_im = v34_rx_shapers_im[s->baud_rate][s->high_carrier];
+     s->shaper_sets = steps_per_baud[s->baud_rate];
+     s->v34_carrier_phase_rate = dds_phase_ratef(carrier_frequency(s->baud_rate, 0));
+-printf("XYX0 %d\n", len);
++// printf("XYX0 %d\n", len);
+     for (i = 0;  i < len;  i++)
+     {
+         s->rrc_filter[s->rrc_filter_step] = amp[i];
+@@ -2463,8 +2463,8 @@
+             process_primary_half_baud(s, &zz);
+ 
+             //angle = arctan2(zz.im, zz.re);
+-            printf("XYX1 %10.5f %10.5f\n", atan2(zz.re, zz.im), sqrt(zz.re*zz.re + zz.im*zz.im));
+-            printf("XYX2 %10.5f %10.5f\n", zz.re, zz.im);
++            // printf("XYX1 %10.5f %10.5f\n", atan2(zz.re, zz.im), sqrt(zz.re*zz.re + zz.im*zz.im));
++            // printf("XYX2 %10.5f %10.5f\n", zz.re, zz.im);
+         }
+         /*endif*/
+ #if defined(SPANDSP_USE_FIXED_POINT)
+--- v34tx.c.orig
++++ v34tx.c
+@@ -2174,12 +2174,12 @@
+     {
+         if (s->tx.calling_party)
+         {
+-printf("info 1 Tx silence\n");
++// printf("info 1 Tx silence\n");
+             tx_silence_init(s, 30000);
+         }
+         else
+         {
+-printf("info 1 Tx S !S\n");
++// printf("info 1 Tx S !S\n");
+             s_not_s_baud_init(s);
+         }
+         /*endif*/
+@@ -2700,7 +2700,7 @@
+     int sample;
+ 
+     /* The V.34 modulator. */
+-printf("ZZZ baud rate %d\n", s->tx.baud_rate);
++// printf("ZZZ baud rate %d\n", s->tx.baud_rate);
+     num = s->tx.parms.samples_per_symbol_numerator;
+     den = s->tx.parms.samples_per_symbol_denominator;
+     shaper = v34_tx_shapers[s->tx.baud_rate];
+@@ -2712,7 +2712,7 @@
+             v = s->tx.current_getbaud(s);
+             s->tx.rrc_filter_re[s->tx.rrc_filter_step] = v.re;
+             s->tx.rrc_filter_im[s->tx.rrc_filter_step] = v.im;
+-printf("V.34 baud %10.5f %10.5f - %10.5f\n", s->tx.rrc_filter_re[s->tx.rrc_filter_step], s->tx.rrc_filter_im[s->tx.rrc_filter_step], s->tx.gain);
++// printf("V.34 baud %10.5f %10.5f - %10.5f\n", s->tx.rrc_filter_re[s->tx.rrc_filter_step], s->tx.rrc_filter_im[s->tx.rrc_filter_step], s->tx.gain);
+             if (++s->tx.rrc_filter_step >= V34_TX_FILTER_STEPS)
+                 s->tx.rrc_filter_step = 0;
+             /*endif*/
+@@ -2747,7 +2747,7 @@
+         /* Don't bother saturating. We should never clip. */
+         amp[sample] = (int16_t) lfastrintf((x.re*z.re - x.im*z.im)*s->tx.gain);
+ #endif
+-printf("V.34 sample %d\n", amp[sample]);
++// printf("V.34 sample %d\n", amp[sample]);
+     }
+     /*endfor*/
+     return sample;
+@@ -2779,10 +2779,10 @@
+             v = s->tx.current_getbaud(s);
+             s->tx.rrc_filter_re[s->tx.rrc_filter_step] = v.re;
+             s->tx.rrc_filter_im[s->tx.rrc_filter_step] = v.im;
+-printf("CC baud %10.5f %10.5f - %10.5f\n",
+-       s->tx.rrc_filter_re[s->tx.rrc_filter_step],
+-       s->tx.rrc_filter_im[s->tx.rrc_filter_step],
+-       s->tx.gain);
++// printf("CC baud %10.5f %10.5f - %10.5f\n",
++//        s->tx.rrc_filter_re[s->tx.rrc_filter_step],
++//        s->tx.rrc_filter_im[s->tx.rrc_filter_step],
++//        s->tx.gain);
+             if (++s->tx.rrc_filter_step >= V34_INFO_TX_FILTER_STEPS)
+                 s->tx.rrc_filter_step = 0;
+             /*endif*/
+@@ -2818,7 +2818,7 @@
+         /* Don't bother saturating. We should never clip. */
+         amp[sample] = (int16_t) lfastrintf(famp*s->tx.gain);
+ #endif
+-printf("CC sample %d\n", amp[sample]);
++// printf("CC sample %d\n", amp[sample]);
+     }
+     return sample;
+ }

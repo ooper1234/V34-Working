@@ -48,10 +48,10 @@ See `docs/v8.md` section 10. Short version:
 | Mode | Status over this path |
 |---|---|
 | V.22bis 2400/1200 | Working, real hardware, both startups |
-| V.32 / V.32bis | Not implemented. spanDSP's V.32bis is a non-functional stub; a real implementation is a large project |
-| V.34 | Not implemented. spanDSP's V.34 is documented "not yet functional" |
-| V.90 / V.92 / Quick Connect | Not possible on this path: they require a digital PCM connection at the answerer; the PAP2T exposes an analog FXS port and audio is G.711 |
-| V.42 / V.42bis | Not implemented; PPP runs directly over async framing |
+| V.34 | spanDSP's unfinished engine was located, made to build and run in this repo (plus generators and a loopback harness). It completes V.8 and V.34 phases 1-2 and then stalls at the phase 2/3 boundary; the S/!S detection and the data pump are not implemented upstream. Details and the exact blocker list: `docs/v34.md` |
+| V.32 / V.32bis | Not implemented (spanDSP's v32bis is a non-functional stub); V.34 is the more promising route and is in progress |
+| V.90 / V.92 / Quick Connect | No engine exists anywhere usable, and V.90 requires a working V.34 link first. The PCM transport is ready; the missing piece is the modem engine, not the audio path |
+| V.42 / V.42bis | Not implemented; PPP runs directly over async framing (spanDSP's V.42 sources are vendored but not integrated) |
 
 ## Layout
 

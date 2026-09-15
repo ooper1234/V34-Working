@@ -1,0 +1,319 @@
+/* V.34 loopback harness: a calling and an answering modem connected directly,
+   starting with V.8 negotiation then the spanDSP V.34 engine. Prints every
+   V.8/V.34 state transition and a data bit error count.
+
+   spanDSP's V.34 is work in progress: this test currently proves the V.8
+   startup and V.34 phases 1-2 (INFO0, A/B tones, INFO1a/INFO1c exchange and
+   L1/L2 line probing). It then stalls at phase 3 because the S/!S signal
+   detection is not implemented in the receiver (V34_EVENT_S is never
+   generated). See docs/v34.md for the full status.
+
+   Usage: v34_loopback [baud rate] [bit rate] [seconds]
+   e.g.   v34_loopback 2400 4800 60                                        */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+#define SPANDSP_EXPOSE_INTERNAL_STRUCTURES 1
+#include "spandsp/telephony.h"
+#include "spandsp/logging.h"
+#include "spandsp/complex.h"
+#include "spandsp/async.h"
+#include "spandsp/dds.h"
+#include "spandsp/power_meter.h"
+#include "spandsp/fsk.h"
+#include "spandsp/queue.h"
+#include "spandsp/tone_generate.h"
+#include "spandsp/super_tone_rx.h"
+#include "spandsp/modem_connect_tones.h"
+#include "spandsp/v8.h"
+#include "spandsp/v29rx.h"
+#include "spandsp/v34.h"
+#include "spandsp/bitstream.h"
+#include "spandsp/modem_echo.h"
+#include "spandsp/private/bitstream.h"
+#include "spandsp/private/power_meter.h"
+#include "spandsp/private/logging.h"
+#include "spandsp/private/v34.h"
+
+#define CHUNK 160
+#define RATE 8000
+
+static int g_baud = 2400;
+static int g_bps = 4800;
+static int g_seconds = 40;
+
+static v34_state_t *v34_caller;
+static v34_state_t *v34_answerer;
+static int caller_phase;      /* 0 = V.8 TX, 1 = V.34 TX */
+static int answerer_phase;
+
+static uint8_t tx_buf[400000];
+static int tx_ptr;
+static int rx_ptr;
+static int rx_bits;
+static int rx_bad;
+
+static int get_bit(void *user_data)
+{
+    int bit = 1;
+    (void) user_data;
+    tx_buf[tx_ptr] = (uint8_t) bit;
+    if (++tx_ptr >= (int) sizeof(tx_buf))
+        tx_ptr = 0;
+    return bit;
+}
+
+static void put_bit(void *user_data, int bit)
+{
+    (void) user_data;
+    if (bit < 0)
+    {
+        printf("  [v34] signal status %d\n", bit);
+        return;
+    }
+    if (bit != tx_buf[rx_ptr])
+        rx_bad++;
+    rx_bits++;
+    if (++rx_ptr >= (int) sizeof(tx_buf))
+        rx_ptr = 0;
+}
+
+static int get_aux_bit(void *user_data)
+{
+    (void) user_data;
+    return 1;
+}
+
+static void put_aux_bit(void *user_data, int bit)
+{
+    (void) user_data;
+    printf("  [aux] rx bit %d\n", bit);
+}
+
+
+static const char *tx_stage_name(int st)
+{
+    switch (st)
+    {
+    case V34_TX_STAGE_INITIAL_PREAMBLE: return "PREAMBLE";
+    case V34_TX_STAGE_INFO0: return "INFO0";
+    case V34_TX_STAGE_INITIAL_A: return "INIT_A";
+    case V34_TX_STAGE_FIRST_A: return "FIRST_A";
+    case V34_TX_STAGE_FIRST_NOT_A: return "FIRST_NOT_A";
+    case V34_TX_STAGE_FIRST_NOT_A_REVERSAL_SEEN: return "NOT_A_REV";
+    case V34_TX_STAGE_SECOND_A: return "SECOND_A";
+    case V34_TX_STAGE_L1: return "L1";
+    case V34_TX_STAGE_L2: return "L2";
+    case V34_TX_STAGE_POST_L2_A: return "POST_L2_A";
+    case V34_TX_STAGE_POST_L2_NOT_A: return "POST_L2_NOT_A";
+    case V34_TX_STAGE_A_SILENCE: return "A_SILENCE";
+    case V34_TX_STAGE_PRE_INFO1_A: return "PRE_INFO1_A";
+    case V34_TX_STAGE_INFO1: return "INFO1";
+    case V34_TX_STAGE_FIRST_B: return "FIRST_B";
+    case V34_TX_STAGE_FIRST_B_INFO_SEEN: return "B_INFO_SEEN";
+    case V34_TX_STAGE_FIRST_NOT_B_WAIT: return "NOT_B_WAIT";
+    case V34_TX_STAGE_FIRST_NOT_B: return "FIRST_NOT_B";
+    case V34_TX_STAGE_FIRST_B_SILENCE: return "B_SILENCE";
+    case V34_TX_STAGE_FIRST_B_POST_REVERSAL_SILENCE: return "B_POST_REV_SIL";
+    case V34_TX_STAGE_SECOND_B: return "SECOND_B";
+    case V34_TX_STAGE_SECOND_B_WAIT: return "SECOND_B_WAIT";
+    case V34_TX_STAGE_SECOND_NOT_B: return "SECOND_NOT_B";
+    case V34_TX_STAGE_INFO0_RETRY: return "INFO0_RETRY";
+    case V34_TX_STAGE_FIRST_S: return "FIRST_S";
+    case V34_TX_STAGE_FIRST_NOT_S: return "FIRST_NOT_S";
+    case V34_TX_STAGE_MD: return "MD";
+    case V34_TX_STAGE_SECOND_S: return "SECOND_S";
+    case V34_TX_STAGE_SECOND_NOT_S: return "SECOND_NOT_S";
+    case V34_TX_STAGE_TRN: return "TRN";
+    case V34_TX_STAGE_J: return "J";
+    case V34_TX_STAGE_J_DASHED: return "J_DASHED";
+    case V34_TX_STAGE_MP: return "MP";
+    default: return "?";
+    }
+}
+
+static const char *rx_stage_name(int st)
+{
+    switch (st)
+    {
+    case V34_RX_STAGE_INFO0: return "INFO0";
+    case V34_RX_STAGE_INFOH: return "INFOH";
+    case V34_RX_STAGE_INFO1C: return "INFO1C";
+    case V34_RX_STAGE_INFO1A: return "INFO1A";
+    case V34_RX_STAGE_TONE_A: return "TONE_A";
+    case V34_RX_STAGE_TONE_B: return "TONE_B";
+    case V34_RX_STAGE_L1_L2: return "L1_L2";
+    case V34_RX_STAGE_CC: return "CC";
+    case V34_RX_STAGE_PRIMARY_CHANNEL: return "PRIMARY";
+    default: return "?";
+    }
+}
+
+static int last_cts = -1, last_crs = -1, last_ats = -1, last_ars = -1;
+
+static void report_stages(v34_state_t *caller, v34_state_t *answerer)
+{
+    if (caller->tx.stage != last_cts || caller->rx.stage != last_crs
+        || answerer->tx.stage != last_ats || answerer->rx.stage != last_ars)
+    {
+        last_cts = caller->tx.stage;
+        last_crs = caller->rx.stage;
+        last_ats = answerer->tx.stage;
+        last_ars = answerer->rx.stage;
+        printf("STAGES caller tx=%s rx=%s | answerer tx=%s rx=%s\n",
+               tx_stage_name(last_cts), rx_stage_name(last_crs),
+               tx_stage_name(last_ats), rx_stage_name(last_ars));
+        fflush(stdout);
+    }
+}
+
+static void v8_handler(void *user_data, v8_parms_t *result)
+{
+    const char *who = (const char *) user_data;
+
+    printf("[V8 %s] status=%d mods=0x%x cf=%d proto=%d\n", who, result->status,
+           (unsigned) result->jm_cm.modulations, (int) result->jm_cm.call_function,
+           (int) result->jm_cm.protocols);
+    fflush(stdout);
+    if (result->status == V8_STATUS_V8_CALL)
+    {
+        if (strcmp(who, "caller") == 0)
+            v34_restart(v34_caller, g_baud, g_bps, true);
+        else
+            v34_restart(v34_answerer, g_baud, g_bps, true);
+    }
+}
+
+int main(int argc, char **argv)
+{
+    v8_state_t *v8_caller;
+    v8_state_t *v8_answerer;
+    v8_parms_t parms;
+    int16_t caller_tx[CHUNK];
+    int16_t answerer_tx[CHUNK];
+    long sample;
+    long total = (long) g_seconds * RATE;
+    logging_state_t *log;
+
+    if (argc > 1)
+        g_baud = atoi(argv[1]);
+    if (argc > 2)
+        g_bps = atoi(argv[2]);
+    if (argc > 3)
+        g_seconds = atoi(argv[3]);
+
+    v34_caller = v34_init(NULL, g_baud, g_bps, true, true, get_bit, NULL, put_bit, NULL);
+    v34_answerer = v34_init(NULL, g_baud, g_bps, false, true, get_bit, NULL, put_bit, NULL);
+    if (!v34_caller || !v34_answerer)
+    {
+        fprintf(stderr, "v34_init failed\n");
+        return 1;
+    }
+    v34_set_get_aux_bit(v34_caller, get_aux_bit, NULL);
+    v34_set_put_aux_bit(v34_caller, put_aux_bit, NULL);
+    v34_set_get_aux_bit(v34_answerer, get_aux_bit, NULL);
+    v34_set_put_aux_bit(v34_answerer, put_aux_bit, NULL);
+    v34_tx_power(v34_caller, -13.0f);
+    v34_tx_power(v34_answerer, -13.0f);
+    log = v34_get_logging_state(v34_caller);
+    span_log_set_level(log, SPAN_LOG_SHOW_SEVERITY | SPAN_LOG_SHOW_PROTOCOL | SPAN_LOG_SHOW_TAG | SPAN_LOG_FLOW);
+    span_log_set_tag(log, "caller  ");
+    log = v34_get_logging_state(v34_answerer);
+    span_log_set_level(log, SPAN_LOG_SHOW_SEVERITY | SPAN_LOG_SHOW_PROTOCOL | SPAN_LOG_SHOW_TAG | SPAN_LOG_FLOW);
+    span_log_set_tag(log, "answerer");
+
+    memset(&parms, 0, sizeof(parms));
+    parms.modem_connect_tone = MODEM_CONNECT_TONES_ANSAM;
+    parms.gateway_mode = false;
+    parms.send_ci = true;
+    parms.v92 = -1;
+    parms.jm_cm.call_function = V8_CALL_V_SERIES;
+    parms.jm_cm.modulations = V8_MOD_V34;
+    parms.jm_cm.protocols = V8_PROTOCOL_LAPM_V42;
+    parms.jm_cm.pstn_access = 0;
+    parms.jm_cm.nsf = -1;
+    parms.jm_cm.t66 = -1;
+    v8_answerer = v8_init(NULL, false, &parms, v8_handler, (void *) "answerer");
+    parms.modem_connect_tone = MODEM_CONNECT_TONES_NONE;
+    v8_caller = v8_init(NULL, true, &parms, v8_handler, (void *) "caller");
+    if (!v8_caller || !v8_answerer)
+    {
+        fprintf(stderr, "v8_init failed\n");
+        return 1;
+    }
+    log = v8_get_logging_state(v8_caller);
+    span_log_set_level(log, SPAN_LOG_SHOW_SEVERITY | SPAN_LOG_SHOW_PROTOCOL | SPAN_LOG_SHOW_TAG | SPAN_LOG_FLOW);
+    span_log_set_tag(log, "v8-callr");
+    log = v8_get_logging_state(v8_answerer);
+    span_log_set_level(log, SPAN_LOG_SHOW_SEVERITY | SPAN_LOG_SHOW_PROTOCOL | SPAN_LOG_SHOW_TAG | SPAN_LOG_FLOW);
+    span_log_set_tag(log, "v8-answr");
+
+    for (sample = 0; sample < total; sample += CHUNK)
+    {
+        int n;
+
+        /* Caller TX */
+        n = 0;
+        if (caller_phase == 0)
+        {
+            n = v8_tx(v8_caller, caller_tx, CHUNK);
+            if (n < CHUNK)
+                caller_phase = 1;
+        }
+        if (n < CHUNK)
+        {
+            int got = v34_tx(v34_caller, caller_tx + n, CHUNK - n);
+            if (got < 0)
+                got = 0;
+            n += got;
+        }
+        if (n < CHUNK)
+            memset(&caller_tx[n], 0, (CHUNK - n) * sizeof(int16_t));
+
+        /* Answerer TX */
+        n = 0;
+        if (answerer_phase == 0)
+        {
+            n = v8_tx(v8_answerer, answerer_tx, CHUNK);
+            if (n < CHUNK)
+                answerer_phase = 1;
+        }
+        if (n < CHUNK)
+        {
+            int got = v34_tx(v34_answerer, answerer_tx + n, CHUNK - n);
+            if (got < 0)
+                got = 0;
+            n += got;
+        }
+        if (n < CHUNK)
+            memset(&answerer_tx[n], 0, (CHUNK - n) * sizeof(int16_t));
+
+        /* Cross-connect RX (ideal channel) */
+        if (answerer_phase == 0)
+            v8_rx(v8_answerer, caller_tx, CHUNK);
+        else
+            v34_rx(v34_answerer, caller_tx, CHUNK);
+        if (caller_phase == 0)
+            v8_rx(v8_caller, answerer_tx, CHUNK);
+        else
+            v34_rx(v34_caller, answerer_tx, CHUNK);
+
+        report_stages(v34_caller, v34_answerer);
+        if ((sample % (RATE * 5)) == 0)
+        {
+            printf("  t=%lds rx_bits=%d bad=%d\n", sample / RATE, rx_bits, rx_bad);
+            fflush(stdout);
+        }
+    }
+
+    printf("final: rx_bits=%d rx_bad=%d\n", rx_bits, rx_bad);
+    v34_free(v34_caller);
+    v34_free(v34_answerer);
+    v8_free(v8_caller);
+    v8_free(v8_answerer);
+    return rx_bits > 0 ? 0 : 2;
+}

@@ -106,6 +106,27 @@ target_link_libraries(as_client v22bs_helpers softmodem ${MATH_LIB})
 add_executable(sip_client tests/sip_client.c)
 target_link_libraries(sip_client v22bs_helpers softmodem ${MATH_LIB})
 
+# Optional V.34 engine (spanDSP work in progress, built by
+# src/modem/v34/build_v34.sh into src/modem/v34/v34build/libsmv34.a).
+# Only the loopback harness links it; the daemon does not, because it is not
+# functional yet (see docs/v34.md).
+find_path(SPANDSP_V34_INC spandsp/v34.h
+    PATHS ${CMAKE_SOURCE_DIR}/third_party/spandsp/src
+)
+find_library(SPANDSP_V34_LIB smv34
+    PATHS ${CMAKE_SOURCE_DIR}/src/modem/v34/v34build
+)
+if(SPANDSP_V34_INC AND SPANDSP_V34_LIB)
+    message(STATUS "V.34 engine enabled (${SPANDSP_V34_LIB})")
+    add_executable(v34_loopback tests/v34_loopback.c)
+    target_include_directories(v34_loopback PRIVATE ${SPANDSP_V34_INC}
+        ${CMAKE_SOURCE_DIR}/src/modem/v34/v34build/include)
+    target_link_libraries(v34_loopback ${SPANDSP_V34_LIB} softmodem ${MATH_LIB})
+else()
+    message(STATUS "V.34 engine not found - v34_loopback skipped "
+                   "(build it with src/modem/v34/build_v34.sh)")
+endif()
+
 # Reference (spandsp) cross-interop test - optional. Needs spanDSP headers
 # and the ref_-prefixed reference library built by tests/build_ref.sh into
 # tests/refbuild/. Without it the target is skipped and every other target

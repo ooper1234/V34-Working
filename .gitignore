@@ -2,3 +2,4 @@ build/
 src/modem/v8/v8build/
 *.o
 *.a
+src/modem/v34/v34build/
