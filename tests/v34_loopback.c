@@ -357,6 +357,10 @@ int main(int argc, char **argv)
     }
 
     printf("final: rx_bits=%d rx_bad=%d\n", rx_bits, rx_bad);
+    if (rx_bits > 0)
+        printf("NOTE: the primary-channel receiver front end (timing lock, AGC,\n"
+               "      level calibration) is not complete; received bits are not\n"
+               "      yet valid data (expect ~50%% errors). See docs/v34.md.\n");
     if (cap_caller)
         fclose(cap_caller);
     if (cap_answerer)

@@ -445,6 +445,7 @@ typedef struct
     int data_baud_pos;
     int16_t data_bits[16];
 
+
     /*! \brief The get_bit function in use at any instant. */
     span_get_bit_func_t current_get_bit;
 
@@ -739,6 +740,13 @@ typedef struct
     float s_det_acc_b_re;
     float s_det_acc_b_im;
     float s_det_power;
+    /*! \brief Primary-channel receive state (addition). Eight 2D symbols
+               per mapping frame are collected and demapped. */
+    bool data_rx_active;
+    int data_rx_count;
+    int data_rx_symbol_count;
+    float data_rx_scale;
+    int16_t data_rx_symbols[16];
 
     int dft_ptr;
 #if defined(SPANDSP_USE_FIXED_POINT)
