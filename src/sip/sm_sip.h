@@ -28,6 +28,7 @@ typedef struct {
     char daemon_host[64];           /* sm_daemon host (default 127.0.0.1) */
     int daemon_port;                /* sm_daemon AudioSocket port (9092) */
     char uuid[37];                  /* UUID string for the AudioSocket call */
+    const char *capture_dir;        /* if set, dump per-call mu-law audio */
     sm_log_level_t log_level;
 } sm_sip_config_t;
 

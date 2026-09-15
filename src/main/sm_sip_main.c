@@ -77,6 +77,8 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--once") == 0)
             once = 1;
+        else if (strcmp(argv[i], "--capture") == 0 && i + 1 < argc)
+            cfg.capture_dir = argv[++i];
         else if (strcmp(argv[i], "--debug") == 0)
             cfg.log_level = SM_LOG_FLOW;
         else if (strcmp(argv[i], "--help") == 0)

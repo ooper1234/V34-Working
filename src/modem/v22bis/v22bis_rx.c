@@ -522,9 +522,23 @@ int v22bis_rx(v22bis_state_t *s, const int16_t amp[], int len)
         {
             if (power < s->rx.carrier_off_power)
             {
-                v22bis_restart(s);
-                report_status(s, V22BIS_STATUS_CARRIER_DOWN);
-                continue;
+                /* Debounce carrier loss: adjacent-channel energy (e.g. a
+                   V.32/V.34 calling modem's 1800 Hz signal or the tail of
+                   the answer tone) can dip the meter below the threshold
+                   for a few frames. Only a sustained loss (100 ms) means
+                   the far end is gone. Importantly, do NOT reset the TX
+                   side: an answerer must keep sending its training signal
+                   until the calling modem responds. */
+                if (++s->rx.carrier_down_count >= 800)
+                {
+                    v22bis_rx_restart(s);
+                    report_status(s, V22BIS_STATUS_CARRIER_DOWN);
+                    continue;
+                }
+            }
+            else
+            {
+                s->rx.carrier_down_count = 0;
             }
         }
         else
@@ -532,6 +546,7 @@ int v22bis_rx(v22bis_state_t *s, const int16_t amp[], int len)
             if (power < s->rx.carrier_on_power)
                 continue;
             s->rx.signal_present = 1;
+            s->rx.carrier_down_count = 0;
             sm_log_message(&s->log, SM_LOG_FLOW, "Carrier up (%.1f Hz)", v22bis_rx_carrier_frequency(s));
             report_status(s, V22BIS_STATUS_CARRIER_UP);
         }
@@ -651,6 +666,7 @@ void v22bis_rx_restart(v22bis_state_t *s)
 
     s->rx.constellation_state = 0;
     s->rx.sixteen_way_decisions = false;
+    s->rx.carrier_down_count = 0;
 
     equalizer_reset(s);
 

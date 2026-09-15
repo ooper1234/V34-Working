@@ -348,6 +348,11 @@ struct sm_sip {
     int last_ok_len;
 
     int calls_done;
+    int call_seq;
+
+    /* Optional audio capture (mu-law) for debugging. */
+    FILE *cap_rx;
+    FILE *cap_tx;
 };
 
 static void make_tag(char *out, size_t outlen)
@@ -459,6 +464,16 @@ static void end_call(sm_sip_t *s)
         close(s->rtp_fd);
         s->rtp_fd = -1;
     }
+    if (s->cap_rx)
+    {
+        fclose(s->cap_rx);
+        s->cap_rx = NULL;
+    }
+    if (s->cap_tx)
+    {
+        fclose(s->cap_tx);
+        s->cap_tx = NULL;
+    }
     s->call_active = 0;
     s->media_active = 0;
     s->rtp_peer_known = 0;
@@ -498,6 +513,7 @@ static void send_bye(sm_sip_t *s)
 /* Process one RTP packet (PCMU). Returns 0 on success. */
 static int process_rtp(sm_sip_t *s, const uint8_t *pkt, int len)
 {
+
     int version, cc, has_ext, has_pad, pt;
     int hdr_len;
     const uint8_t *payload;
@@ -540,6 +556,8 @@ static int process_rtp(sm_sip_t *s, const uint8_t *pkt, int len)
         payload_len = SM_SIP_RTP_MAXPAY;
 
     nsamples = payload_len;
+    if (s->cap_rx)
+        fwrite(payload, 1, (size_t) payload_len, s->cap_rx);
     for (i = 0; i < nsamples; i++)
         pcm[i] = sm_ulaw_decode(payload[i]);
 
@@ -575,6 +593,8 @@ static int process_rtp(sm_sip_t *s, const uint8_t *pkt, int len)
 
                 for (j = 0; j < out_len; j++)
                     ulaw_out[j] = sm_ulaw_encode(((int16_t *) buf)[j]);
+                if (s->cap_tx)
+                    fwrite(ulaw_out, 1, (size_t) out_len, s->cap_tx);
                 rtpbuf[0] = 0x80;
                 rtpbuf[1] = 0;              /* PT 0 PCMU */
                 rtpbuf[2] = (uint8_t) (s->rtp_seq >> 8);
@@ -711,6 +731,19 @@ static void handle_invite(sm_sip_t *s, const sip_msg_t *m,
         end_call(s);
         return;
     }
+
+    /* Optional capture for debugging real modems. */
+    if (s->cfg.capture_dir && s->cfg.capture_dir[0])
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/call%d-rx.ulaw", s->cfg.capture_dir, s->call_seq);
+        s->cap_rx = fopen(path, "wb");
+        snprintf(path, sizeof(path), "%s/call%d-tx.ulaw", s->cfg.capture_dir, s->call_seq);
+        s->cap_tx = fopen(path, "wb");
+        sm_log_message(&s->log, SM_LOG_FLOW, "capture enabled in %s (call %d)",
+                       s->cfg.capture_dir, s->call_seq);
+    }
+    s->call_seq++;
 
     /* Record call state. */
     snprintf(s->call_id, sizeof(s->call_id), "%s", m->call_id);

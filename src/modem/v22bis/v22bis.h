@@ -93,6 +93,7 @@ typedef struct {
         float training_error;
         float carrier_track_p;
         float carrier_track_i;
+        int carrier_down_count;      /* debounce for carrier loss */
         int eq_step;
         int eq_put_step;
         int gardner_integrate;
