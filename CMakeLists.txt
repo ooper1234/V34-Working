@@ -18,6 +18,8 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/src/audio
     ${CMAKE_SOURCE_DIR}/src/serial
     ${CMAKE_SOURCE_DIR}/src/ppp
+    ${CMAKE_SOURCE_DIR}/src/sip
+    ${CMAKE_SOURCE_DIR}/src/call
     ${CMAKE_SOURCE_DIR}/src/dsp
     ${CMAKE_SOURCE_DIR}/src/dsp/carrier
     ${CMAKE_SOURCE_DIR}/src/dsp/detectors
@@ -37,12 +39,17 @@ add_library(softmodem STATIC
     src/ast_socket/sm_ast_socket.c
     src/ppp/sm_pppd.c
     src/call/sm_call.c
+    src/sip/sm_sip.c
 )
 target_link_libraries(softmodem ${MATH_LIB})
 
 # The answerer daemon
 add_executable(sm_daemon src/main/sm_daemon.c)
 target_link_libraries(sm_daemon softmodem ${MATH_LIB})
+
+# SIP/RTP bridge for the PAP2T ATA (replaces Asterisk when needed)
+add_executable(sm_sip src/main/sm_sip_main.c)
+target_link_libraries(sm_sip softmodem ${MATH_LIB})
 
 # Test helper: our implementation adapter (no spandsp required)
 add_library(v22bs_helpers STATIC
@@ -69,6 +76,11 @@ target_link_libraries(pppbr v22bs_helpers softmodem ${MATH_LIB})
 # calling modem and a real pppd on the client side.
 add_executable(as_client tests/as_client.c)
 target_link_libraries(as_client v22bs_helpers softmodem ${MATH_LIB})
+
+# SIP/RTP pipe: PAP2T substitute driving sm_sip with a software calling modem
+# and a real pppd on the client side.
+add_executable(sip_client tests/sip_client.c)
+target_link_libraries(sip_client v22bs_helpers softmodem ${MATH_LIB})
 
 # Reference (spandsp) cross-interop test - optional, needs spandsp headers
 find_path(SPANDSP_INCLUDE_DIR spandsp/v22bis.h
