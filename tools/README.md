@@ -12,6 +12,7 @@ raw 8 kHz G.711 u-law files (e.g. written by `sm_sip --capture`).
 | `v21demod.c` | V.21 FSK (980/1180 Hz) byte decoder with timestamps (V.8 CM/CI/CJ) |
 | `replay_rx.c` | replays a capture through the real V.22bis answerer receiver |
 | `v8_replay.c` | replays a capture through the actual spanDSP-based V.8 answerer |
+| `v34_frontend.c` | offline replica of the V.34 primary-channel receiver front end (same RRC tables and T/2 timing loop) for data-mode symbol analysis |
 
 Build examples:
 

@@ -745,6 +745,7 @@ typedef struct
     bool data_rx_active;
     int data_rx_count;
     int data_rx_symbol_count;
+    int data_rx_offset;
     float data_rx_scale;
     int16_t data_rx_symbols[16];
 

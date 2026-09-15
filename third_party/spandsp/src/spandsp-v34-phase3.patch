@@ -163,7 +163,15 @@
              }
              else
              {
-@@ -2331,6 +2449,29 @@
+@@ -2325,12 +2443,38 @@
+ 
+     /* On alternate insertions we have a whole baud and must process it. */
+     if ((s->baud_half ^= 1))
++    {
+         return;
++    }
+     /*endif*/
+     pri_symbol_sync(s);
  
      s->last_sample = *sample;
  
@@ -172,29 +180,54 @@
 +        /* Collect one 2D symbol per baud. The demapper (v34_put_mapping_frame)
 +           takes the eight symbols of a mapping frame in the same order and
 +           Q9.7 format the transmitter produced them in. */
-+        /* NOTE: the receive front end (symbol timing acquisition, AGC and
-+           the data-level calibration) is not implemented yet, so the symbols
-+           collected here are not yet valid data: this foundation currently
-+           demaps at roughly 50% bit error rate in loopback. The receiver
-+           must be completed around pri_symbol_sync() and the equalizer
-+           before this can carry data. See docs/v34.md. */
-+        s->data_rx_symbol_count++;
-+        s->data_rx_symbols[2*s->data_rx_count] = (int16_t) (sample->re*s->data_rx_scale);
-+        s->data_rx_symbols[2*s->data_rx_count + 1] = (int16_t) (sample->im*s->data_rx_scale);
-+        if (++s->data_rx_count >= 8)
++        if (s->data_rx_symbol_count >= s->data_rx_offset)
 +        {
-+            v34_put_mapping_frame(s, s->data_rx_symbols);
-+            s->data_rx_count = 0;
++            s->data_rx_symbols[2*s->data_rx_count] = (int16_t) (sample->re*s->data_rx_scale);
++            s->data_rx_symbols[2*s->data_rx_count + 1] = (int16_t) (sample->im*s->data_rx_scale);
++            if (++s->data_rx_count >= 8)
++            {
++                v34_put_mapping_frame(s, s->data_rx_symbols);
++                s->data_rx_count = 0;
++            }
++            /*endif*/
 +        }
 +        /*endif*/
++        /* NOTE: the receive front end (symbol timing acquisition, AGC and
++           the data-level calibration) is not implemented yet, so the symbols
++           collected here are not yet valid data. See docs/v34.md. */
++        s->data_rx_symbol_count++;
 +    }
 +    /*endif*/
 +
  #if 0
      z = equalizer_get(s);
  
-@@ -2382,11 +2523,10 @@
-         192*8000*7/(2400*10)
+@@ -2371,22 +2515,27 @@
+     float ii;
+     float qq;
+     float v;
+-    /* The following lead to integer values for the rx increments per symbol, for each of the 6 baud rates */
++    /* Fractional-timing increments for the T/2 sample insertion, for each of
++       the 6 baud rates. The processing in process_primary_half_baud(), the
++       Godard TED and the equalizer all expect one insertion per half baud
++       (this mirrors the control-channel receiver, which uses
++       RX_PULSESHAPER_2400_COEFF_SETS*40/(3*2) for its 600 baud stream).
++       The upstream table held a whole-baud increment, which made the
++       receiver process every second baud. */
+     static const int steps_per_baud[6] =
+     {
+-        192*8000/2400,
+-        192*8000*7/(2400*8),
+-        189*8000*6/(2400*7),
+-        192*8000*4/(2400*5),
+-        192*8000*3/(2400*4),
+-        192*8000*7/(2400*10)
++        192*8000/(2400*2),
++        192*8000*7/(2400*8*2),
++        189*8000*6/(2400*7*2),
++        192*8000*4/(2400*5*2),
++        192*8000*3/(2400*4*2),
++        192*8000*7/(2400*10*2)
      };
  
 -    s->baud_rate = 5;
@@ -206,7 +239,7 @@
  // printf("XYX0 %d\n", len);
      for (i = 0;  i < len;  i++)
      {
-@@ -2694,6 +2834,12 @@
+@@ -2694,6 +2843,16 @@
      s->rx.baud_rate = baud_rate;
      s->rx.bit_rate = bit_rate;
      s->rx.high_carrier = high_carrier;
@@ -215,10 +248,30 @@
 +    s->rx.s_det_count = 0;
 +    s->rx.data_rx_active = false;
 +    s->rx.data_rx_count = 0;
-+    s->rx.data_rx_scale = 1.0f;
++    s->rx.data_rx_scale = 10.0f;   /* provisional: maps received units to Q9.7 */
++    {
++        const char *o = getenv("V34_RX_OFFSET");
++        s->rx.data_rx_offset = o ? atoi(o) : 0;
++    }
  
      s->rx.v34_carrier_phase_rate = dds_phase_ratef(carrier_frequency(s->rx.baud_rate, s->rx.high_carrier));
      s->rx.cc_carrier_phase_rate = dds_phase_ratef((s->calling_party)  ?  2400.0f  :  1200.0f);
+@@ -2713,9 +2872,13 @@
+     s->rx.carrier_track_p = 40000.0f;
+ 
+     /* Create a default symbol sync filter */
++    /* The band-edge filters must be centred on the actual V.34 carrier and
++       spaced by the actual symbol rate. Upstream passed the high_carrier
++       flag and the baud rate code here, so the timing detector never locked
++       (carrier 1 Hz, 0 baud). */
+     create_godard_coeffs(&s->rx.pri_ted,
+-                         s->rx.high_carrier,
+-                         s->rx.baud_rate,
++                         carrier_frequency(s->rx.baud_rate, s->rx.high_carrier),
++                         exact_baud_rate(s->rx.baud_rate),
+                          0.99f);
+     create_godard_coeffs(&s->rx.cc_ted,
+                          (s->calling_party)  ?  2400.0f  :  1200.0f,
 --- v34tx.c.orig
 +++ v34tx.c
 @@ -324,6 +324,7 @@
@@ -394,7 +447,7 @@
      if (s->tx.duplex)
      {
          s->tx.txbits = mp_sequence_tx(&s->tx, &s->tx.mp);
-@@ -2478,6 +2529,49 @@
+@@ -2478,6 +2529,43 @@
  }
  /*- End of function --------------------------------------------------------*/
  
@@ -412,14 +465,8 @@
 +    {
 +        v34_get_mapping_frame(&s->tx, s->tx.data_bits);
 +        s->tx.data_baud_pos = 0;
-+        if (0)
-+            span_log(&s->logging, SPAN_LOG_FLOW, "Tx - data frame %d: %d %d %d %d %d %d %d %d\n",
-+                     s->tx.data_frame,
-+                     s->tx.data_bits[0], s->tx.data_bits[1],
-+                     s->tx.data_bits[2], s->tx.data_bits[3],
-+                     s->tx.data_bits[4], s->tx.data_bits[5],
-+                     s->tx.data_bits[6], s->tx.data_bits[7]);
-+        /*endif*/
++        /* (Data-frame tracing removed; the offline front-end replica in
++           tools/v34_frontend.c is the way to inspect data-mode symbols.) */
 +    }
 +    /*endif*/
 +    i = s->tx.data_baud_pos++;
@@ -444,7 +491,7 @@
  static complex_sig_t get_e_baud(v34_state_t *s)
  {
      static const uint16_t e_pattern[2] =
-@@ -2487,14 +2581,28 @@
+@@ -2487,14 +2575,28 @@
      };
      int bit;
  
@@ -478,7 +525,7 @@
      }
      /*endif*/
      return training_constellation_4[bit];
-@@ -2506,6 +2614,7 @@
+@@ -2506,6 +2608,7 @@
      span_log(&s->logging, SPAN_LOG_FLOW, "Tx - e_baud_init()\n");
      s->tx.tone_duration = 0;
      s->tx.stage = V34_TX_STAGE_HDX_E;

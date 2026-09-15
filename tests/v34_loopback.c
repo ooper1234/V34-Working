@@ -193,6 +193,8 @@ static const char *rx_stage_name(int st)
 
 static int last_cts = -1, last_crs = -1, last_ats = -1, last_ars = -1;
 static long g_sample;
+static int last_tx_frame;
+static int last_rx_sym;
 
 static void report_stages(v34_state_t *caller, v34_state_t *answerer)
 {
@@ -349,6 +351,39 @@ int main(int argc, char **argv)
 
         g_sample = sample;
         report_stages(v34_caller, v34_answerer);
+
+        /* Diagnostic: record TX frames (answerer -> caller direction) and the
+           caller's received symbols so the two can be compared directly. */
+        if (v34_answerer->tx.data_frame != last_tx_frame
+            && v34_answerer->tx.data_frame > 0)
+        {
+            int j;
+
+            last_tx_frame = v34_answerer->tx.data_frame;
+            if (last_tx_frame >= 200 && last_tx_frame < 260)
+            {
+                printf("SYMTX %d", last_tx_frame);
+                for (j = 0; j < 16; j++)
+                    printf(" %d", v34_answerer->tx.data_bits[j]);
+                printf("\n");
+            }
+        }
+        if (v34_caller->rx.data_rx_count == 0
+            && v34_caller->rx.data_rx_symbol_count != last_rx_sym
+            && v34_caller->rx.data_rx_symbol_count > 0)
+        {
+            int j;
+
+            last_rx_sym = v34_caller->rx.data_rx_symbol_count;
+            if (last_rx_sym >= 1600 && last_rx_sym < 2200)
+            {
+                printf("SYMRX %d", last_rx_sym);
+                for (j = 0; j < 8; j++)
+                    printf(" %d,%d", v34_caller->rx.data_rx_symbols[2*j],
+                           v34_caller->rx.data_rx_symbols[2*j + 1]);
+                printf("\n");
+            }
+        }
         if ((sample % (RATE * 5)) == 0)
         {
             printf("  t=%lds rx_bits=%d bad=%d\n", sample / RATE, rx_bits, rx_bad);
