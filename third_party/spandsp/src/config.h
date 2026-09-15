@@ -1,0 +1,15 @@
+#define HAVE_STDBOOL_H 1
+#define HAVE_MATH_H 1
+#define HAVE_ACOSF 1
+#define HAVE_ASINF 1
+#define HAVE_ATAN2F 1
+#define HAVE_ATANF 1
+#define HAVE_CEILF 1
+#define HAVE_COSF 1
+#define HAVE_EXPF 1
+#define HAVE_FLOORF 1
+#define HAVE_LOG10F 1
+#define HAVE_LOGF 1
+#define HAVE_POWF 1
+#define HAVE_SINF 1
+#define HAVE_TANF 1

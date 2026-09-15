@@ -39,6 +39,7 @@ static void usage(void)
             "  --ip-down-script PATH  pppd ip-down script\n"
             "  --no-ppp             run without pppd (loopback/testing)\n"
             "  --echo               echo received data back (byte-exact test mode)\n"
+            "  --v8                 negotiate with V.8 first (else plain answer tone)\n"
             "  --debug              verbose logging\n"
             "  --shim FD            internal pppd relay (do not use)\n",
             prog, DEFAULT_PORT);
@@ -134,6 +135,8 @@ int main(int argc, char **argv)
             cfg.enable_ppp = 0;
         else if (strcmp(argv[i], "--echo") == 0)
             cfg.echo_data = 1;
+        else if (strcmp(argv[i], "--v8") == 0)
+            cfg.use_v8 = 1;
         else if (strcmp(argv[i], "--debug") == 0)
             cfg.log_level = SM_LOG_FLOW;
         else if (strcmp(argv[i], "--help") == 0)

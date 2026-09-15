@@ -9,11 +9,16 @@
 
 #include <sys/types.h>
 
+#ifdef SM_HAVE_V8
+#include "modem/v8/sm_v8.h"
+#endif
+
 /* One dial-up call: AudioSocket PCM <-> V.22bis answerer <-> async serial
    <-> pty <-> pppd. */
 typedef enum {
     SM_CALL_IDLE = 0,
     SM_CALL_ANSWER_TONE,      /* sending 2100 Hz ANS */
+    SM_CALL_V8,               /* V.8 negotiation */
     SM_CALL_HANDSHAKE,        /* V.22bis training running */
     SM_CALL_DATA,             /* both directions in NORMAL_OPERATION */
     SM_CALL_HANGUP
@@ -36,6 +41,7 @@ typedef struct {
     int auth;
     int enable_ppp;
     int echo_data;                  /* loop data back instead of using pppd */
+    int use_v8;                     /* run V.8 negotiation first */
     sm_log_level_t log_level;
 } sm_call_config_t;
 
@@ -61,6 +67,13 @@ typedef struct {
     pid_t pppd_pid;
     int ppp_started;
 
+#ifdef SM_HAVE_V8
+    sm_v8_t *v8;
+    int v8_done;
+    int v8_ok;
+    int rx_guard;                   /* samples to ignore after V.8 (FSK tail) */
+#endif
+
     /* state */
     sm_call_phase_t phase;
     int rx_normal;
@@ -78,6 +91,7 @@ typedef struct {
 
     /* per-frame TX scratch (max AudioSocket payload / 2 samples) */
     int16_t txbuf[SM_AS_MAX_PAYLOAD / 2];
+    int16_t rxsquelch[SM_AS_MAX_PAYLOAD / 2];
 } sm_call_t;
 
 /* Initialise a call with the given configuration. */

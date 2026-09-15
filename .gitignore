@@ -1,5 +1,4 @@
 build/
+src/modem/v8/v8build/
 *.o
 *.a
-*.pcm
-*.bin

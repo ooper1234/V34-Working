@@ -103,6 +103,8 @@ typedef struct {
         int sixteen_way_decisions;
         int pattern_repeats;
         int last_raw_bits;
+        uint64_t raw_history;      /* recent raw bits, 2 bits per symbol */
+        int raw_hist_count;
     } rx;
 
     /* --- transmit --- */

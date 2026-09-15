@@ -1,0 +1,18 @@
+--- v8.c.orig
++++ v8.c.patched
+@@ -1196,6 +1196,15 @@
+                 s->result.status = V8_STATUS_V8_OFFERED;
+                 report_event(s);
+ 
++                /* The CM decoder has overwritten the result structure's jm_cm
++                   fields with the calling modem's capabilities. Restore the
++                   modulation set this endpoint actually supports, so the JM
++                   reply does not advertise modulations that are not
++                   implemented (e.g. V.90, V.34). Otherwise the calling modem
++                   selects the best modulation from the echoed list and starts
++                   a start-up sequence this endpoint cannot handle. */
++                s->result.jm_cm.modulations = s->parms.jm_cm.modulations;
++
+                 /* If we are simply running a V.8 end point, we can simply continue with
+                    the protocol. If we are running V.8 for a gateway, we need to pause at
+                    this point, to see what the other side wants to do. */

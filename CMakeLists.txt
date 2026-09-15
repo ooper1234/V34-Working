@@ -30,6 +30,28 @@ include_directories(
 # Math library
 set(MATH_LIB m)
 
+# Optional V.8 support (spanDSP-based). Requires the spanDSP source tree used
+# to build src/modem/v8/v8build/libsmv8.a (see src/modem/v8/build_v8.sh)
+# and the vendored headers in third_party/spandsp.
+find_path(SPANDSP_V8_INC spandsp/v8.h
+    PATHS ${CMAKE_SOURCE_DIR}/third_party/spandsp/src
+)
+find_library(SPANDSP_V8_LIB smv8
+    PATHS ${CMAKE_SOURCE_DIR}/src/modem/v8/v8build
+)
+if(SPANDSP_V8_INC AND SPANDSP_V8_LIB)
+    message(STATUS "V.8 support enabled (${SPANDSP_V8_LIB})")
+    set(SM_V8_SRC src/modem/v8/sm_v8.c)
+    set(SM_V8_DEFS SM_HAVE_V8)
+    set(SM_V8_LIBS ${SPANDSP_V8_LIB})
+    include_directories(${SPANDSP_V8_INC})
+else()
+    message(STATUS "V.8 support disabled (build libsmv8.a first)")
+    set(SM_V8_SRC "")
+    set(SM_V8_DEFS "")
+    set(SM_V8_LIBS "")
+endif()
+
 # Core library: modem + infra
 add_library(softmodem STATIC
     src/modem/v22bis/v22bis_tx.c
@@ -40,8 +62,10 @@ add_library(softmodem STATIC
     src/ppp/sm_pppd.c
     src/call/sm_call.c
     src/sip/sm_sip.c
+    ${SM_V8_SRC}
 )
-target_link_libraries(softmodem ${MATH_LIB})
+target_compile_definitions(softmodem PUBLIC ${SM_V8_DEFS})
+target_link_libraries(softmodem ${MATH_LIB} ${SM_V8_LIBS})
 
 # The answerer daemon
 add_executable(sm_daemon src/main/sm_daemon.c)

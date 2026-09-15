@@ -64,6 +64,38 @@ static void call_status(void *ud, v22bis_status_t st)
 /* Init                                                                */
 /* ------------------------------------------------------------------ */
 
+#ifdef SM_HAVE_V8
+static void call_v8_result(void *user_data, int status,
+                           int modulations, int call_function, int protocols)
+{
+    sm_call_t *c = user_data;
+
+    sm_log_message(&c->log, SM_LOG_FLOW,
+                   "V.8 status=%d mods=0x%x cf=%d proto=%d",
+                   status, modulations, call_function, protocols);
+    switch (status)
+    {
+    case 0:  /* V8_STATUS_IN_PROGRESS */
+        break;
+    case 2:  /* V8_STATUS_V8_CALL */
+        c->v8_done = 1;
+        c->v8_ok = (modulations & 0x04) != 0;   /* V8_MOD_V22 */
+        break;
+    case 3:  /* V8_STATUS_NON_V8_CALL */
+        c->v8_done = 1;
+        c->v8_ok = 0;
+        break;
+    case 4:  /* V8_STATUS_FAILED */
+        c->v8_done = 1;
+        c->v8_ok = 0;
+        break;
+    default:
+        /* offered / calling tone / cng - keep going */
+        break;
+    }
+}
+#endif
+
 void sm_call_init(sm_call_t *c, const sm_call_config_t *cfg, int call_id)
 {
     memset(c, 0, sizeof(*c));
@@ -74,12 +106,29 @@ void sm_call_init(sm_call_t *c, const sm_call_config_t *cfg, int call_id)
     sm_log_init(&c->log, cfg->log_level, "CALL", call_id);
     v22bis_init(&c->modem, false /* answerer */, cfg->rate,
                 call_get_bit, c, call_put_bit, c, call_status, c);
+    c->modem.log.call_id = call_id;
+    sm_log_set_level(&c->modem.log, cfg->log_level);
     sm_bitq_init(&c->txbits);
     sm_deframer_init(&c->deframer);
 
     c->tone_phase = 0.0;
     c->tone_phase_inc = SM_TWO_PI * 2100.0 / (double) SM_SAMPLE_RATE;
     c->tone_amplitude = 6000.0;
+
+#ifdef SM_HAVE_V8
+    if (cfg->use_v8)
+    {
+        c->v8 = sm_v8_create(false /* answerer */, 0x04 /* V8_MOD_V22 */,
+                             call_v8_result, c, cfg->log_level);
+        if (c->v8)
+        {
+            c->phase = SM_CALL_V8;
+            return;
+        }
+        sm_log_message(&c->log, SM_LOG_WARNING,
+                       "V.8 init failed; falling back to classic answer sequence");
+    }
+#endif
 
     if (cfg->answer_tone_ms > 0 || cfg->pre_tone_silence_ms > 0)
     {
@@ -194,6 +243,21 @@ static void process_audio(sm_call_t *c, const int16_t *in, int n)
 
     while (i < n)
     {
+#ifdef SM_HAVE_V8
+        if (c->phase == SM_CALL_V8)
+        {
+            int m = n - i;
+            int got;
+
+            got = c->v8 ? sm_v8_tx(c->v8, c->txbuf + i, m) : 0;
+            if (got < m)
+                memset(c->txbuf + i + got, 0, (size_t) (m - got) * sizeof(int16_t));
+            if (c->v8)
+                sm_v8_rx(c->v8, in + i, m);
+            i = n;
+            break;
+        }
+#endif
         if (c->phase == SM_CALL_ANSWER_TONE)
         {
             /* Tone phase: one sample at a time so the switch to modem TX is
@@ -220,11 +284,49 @@ static void process_audio(sm_call_t *c, const int16_t *in, int n)
         else
         {
             int m = n - i;
-            v22bis_tx(&c->modem, c->txbuf + i, m);
-            v22bis_rx(&c->modem, in + i, m);
-            i = n;
+#ifdef SM_HAVE_V8
+            if (c->rx_guard > 0)
+            {
+                int skip = (m < c->rx_guard) ? m : c->rx_guard;
+                /* The TX must run for these samples; the RX sees silence. */
+                v22bis_tx(&c->modem, c->txbuf + i, skip);
+                memset(c->rxsquelch, 0, (size_t) skip * sizeof(int16_t));
+                v22bis_rx(&c->modem, c->rxsquelch, skip);
+                c->rx_guard -= skip;
+                i += skip;
+                m -= skip;
+            }
+#endif
+            if (m > 0)
+            {
+                v22bis_tx(&c->modem, c->txbuf + i, m);
+                v22bis_rx(&c->modem, in + i, m);
+                i = n;
+            }
         }
     }
+
+#ifdef SM_HAVE_V8
+    /* V.8 -> V.22bis transition. Reset the V.22bis receiver and squelch its
+       input for 500 ms. Rationale: right after V.8 the answerer transmits
+       U11 on the 2400 Hz carrier, and the calling modem answers with an
+       unmodulated 1200 Hz carrier while its 155+456 ms timer runs. Echo of
+       our own U11 leaks into the 1200 Hz RX band and can trip the carrier
+       detector early, making the receiver commit to 1200 bps before the
+       calling modem's S1 (sent 155+456 ms after U11 starts, lasting 100 ms).
+       Squelching until ~500 ms puts symbol acquisition on the calling
+       modem's own carrier, so the error-tolerant S1 search sees the whole
+       S1 burst. TX is unaffected. */
+    if (c->phase == SM_CALL_V8 && c->v8_done)
+    {
+        sm_log_message(&c->log, SM_LOG_FLOW,
+                       c->v8_ok ? "V.8 negotiated V.22bis; starting V.22bis"
+                                : "V.8 not negotiated (non-V.8 call); starting V.22bis");
+        v22bis_rx_restart(&c->modem);
+        c->rx_guard = SM_SAMPLE_RATE * 500 / 1000;
+        c->phase = SM_CALL_HANDSHAKE;
+    }
+#endif
 
     /* Detect data mode: both directions in NORMAL_OPERATION. */
     if (c->phase == SM_CALL_HANDSHAKE
@@ -437,6 +539,13 @@ out:
                    c->samples_in, c->samples_out, c->data_bytes_tx, c->data_bytes_rx,
                    c->negotiated_rate ? c->negotiated_rate : c->modem.negotiated_bit_rate,
                    c->phase == SM_CALL_DATA ? "DATA" : "HANDSHAKE");
+#ifdef SM_HAVE_V8
+    if (c->v8)
+    {
+        sm_v8_destroy(c->v8);
+        c->v8 = NULL;
+    }
+#endif
     stop_pppd(c);
     close(socket_fd);
     return rc;

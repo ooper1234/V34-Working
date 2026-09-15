@@ -6,6 +6,15 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+
+static int rx_trace_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = (getenv("SM_RX_TRACE") != NULL);
+    return enabled;
+}
 
 /* V.22bis receiver. Reference architecture: SpanDSP v22bis_rx.c. All training
    timings and thresholds below come from that verified reference. */
@@ -301,6 +310,8 @@ static void process_half_baud(v22bis_state_t *s, const sm_complexf_t *sample)
         target = &z;
         if (++s->rx.training_count >= 40)
         {
+            if (rx_trace_enabled())
+                fprintf(stderr, "TRACE acq_done bit_rate=%d\n", s->bit_rate);
             s->rx.gardner_step = 4;
             s->rx.pattern_repeats = 0;
             s->rx.training = s->calling_party
@@ -371,32 +382,59 @@ static void process_half_baud(v22bis_state_t *s, const sm_complexf_t *sample)
         bitstream = decode_baudx(s, nearest);
         (void) bitstream;
         s->rx.training_count++;
+        if (rx_trace_enabled())
+            fprintf(stderr, "TRACE scr1200 n=%d raw=%d repeats=%d neg=%d\n",
+                    s->rx.training_count, raw_bits, s->rx.pattern_repeats,
+                    s->negotiated_bit_rate);
 
         if (s->negotiated_bit_rate == 1200)
         {
-            /* Search for S1 (00/11 alternating) requesting 2400. */
-            if (((s->rx.last_raw_bits ^ raw_bits) == 0x3))
-                s->rx.pattern_repeats++;
-            else
+            /* Search for S1 (00/11 alternating) requesting 2400. The pattern
+               is detected over a sliding window instead of requiring an
+               uninterrupted run of clean symbols: real calling modems are
+               often preceded by a plain carrier segment, so the equalizer is
+               still settling when S1 arrives and a few symbols demodulate
+               wrongly. Alternation in random data is 25%, so requiring 75%
+               over 32 symbols cannot false-trigger. */
+            s->rx.raw_history = (s->rx.raw_history << 2) | (uint64_t) raw_bits;
+            s->rx.raw_hist_count++;
+            if (s->rx.raw_hist_count >= 16)
             {
-                if (s->rx.pattern_repeats >= 15
-                    && (s->rx.last_raw_bits == 0x3 || s->rx.last_raw_bits == 0x0))
+                int k;
+                int alt = 0;
+                for (k = 0; k < 31; k++)
                 {
-                    sm_log_message(&s->log, SM_LOG_FLOW,
-                                   "+++ S1 detected (%d long)", s->rx.pattern_repeats);
-                    if (s->bit_rate == 2400)
+                    int a = (int) ((s->rx.raw_history >> (2 * k)) & 3u);
+                    int b = (int) ((s->rx.raw_history >> (2 * (k + 1))) & 3u);
+                    if ((a ^ b) == 3)
+                        alt++;
+                }
+                if (alt >= 23
+                    && (s->rx.last_raw_bits == 0x3 || s->rx.last_raw_bits == 0x0))
+                    s->rx.pattern_repeats = alt;
+                else
+                    s->rx.pattern_repeats = 0;
+            }
+            if (s->rx.pattern_repeats >= 23
+                && (s->rx.last_raw_bits == 0x3 || s->rx.last_raw_bits == 0x0))
+            {
+                sm_log_message(&s->log, SM_LOG_FLOW,
+                               "+++ S1 detected (%d long)", s->rx.pattern_repeats);
+                if (s->bit_rate == 2400)
+                {
+                    if (!s->calling_party)
                     {
-                        if (!s->calling_party)
-                        {
-                            s->tx.training = V22BIS_TX_TRAINING_U0011;
-                            s->tx.training_count = 0;
-                        }
-                        s->negotiated_bit_rate = 2400;
+                        s->tx.training = V22BIS_TX_TRAINING_U0011;
+                        s->tx.training_count = 0;
                     }
+                    s->negotiated_bit_rate = 2400;
                 }
                 s->rx.pattern_repeats = 0;
+                s->rx.raw_hist_count = 0;
+                s->rx.training_count = 0;
+                break;
             }
-            if (s->rx.training_count >= ms_to_symbols(270))
+            if (s->rx.training_count >= ms_to_symbols(400))
             {
                 /* No S1 seen in time: commit to 1200 b/s. */
                 if (s->calling_party)
@@ -672,6 +710,8 @@ void v22bis_rx_restart(v22bis_state_t *s)
 
     s->rx.pattern_repeats = 0;
     s->rx.last_raw_bits = 0;
+    s->rx.raw_history = 0;
+    s->rx.raw_hist_count = 0;
     s->rx.gardner_integrate = 0;
     s->rx.gardner_step = 256;
     s->rx.baud_phase = 0;
