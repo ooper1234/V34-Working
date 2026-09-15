@@ -81,6 +81,11 @@ make
 ./pppbr --rate 2400 --duration 30
 ```
 
+The optional spanDSP cross-interop test (`v22bis_cross`) is built only when
+`tests/refbuild/librefspandsp.a` exists; create it with `tests/build_ref.sh`
+(defaults to a spanDSP source tree under /tmp. All other targets build from
+the repository alone (the V.8 subset is vendored in `third_party/spandsp`).
+
 Real hardware (USB modem on PAP2T Line 2):
 
 ```

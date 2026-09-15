@@ -106,17 +106,27 @@ target_link_libraries(as_client v22bs_helpers softmodem ${MATH_LIB})
 add_executable(sip_client tests/sip_client.c)
 target_link_libraries(sip_client v22bs_helpers softmodem ${MATH_LIB})
 
-# Reference (spandsp) cross-interop test - optional, needs spandsp headers
+# Reference (spandsp) cross-interop test - optional. Needs spanDSP headers
+# and the ref_-prefixed reference library built by tests/build_ref.sh into
+# tests/refbuild/. Without it the target is skipped and every other target
+# still builds.
 find_path(SPANDSP_INCLUDE_DIR spandsp/v22bis.h
-    PATHS /usr/include /usr/local/include /tmp/opencode/spandsp/src
+    PATHS ${CMAKE_SOURCE_DIR}/third_party/spandsp/src
+          /usr/include /usr/local/include /tmp/opencode/spandsp/src
 )
-if(SPANDSP_INCLUDE_DIR)
+find_library(SPANDSP_REF_LIB refspandsp
+    PATHS ${CMAKE_SOURCE_DIR}/tests/refbuild
+)
+if(SPANDSP_INCLUDE_DIR AND SPANDSP_REF_LIB)
     message(STATUS "spandsp headers found at ${SPANDSP_INCLUDE_DIR}")
+    message(STATUS "spandsp reference library found at ${SPANDSP_REF_LIB}")
     add_library(v22bs_ref STATIC tests/v22bs_side_ref.c)
     target_include_directories(v22bs_ref PUBLIC ${SPANDSP_INCLUDE_DIR})
     target_link_libraries(v22bs_ref softmodem ${MATH_LIB})
     add_executable(v22bis_cross tests/v22bis_cross.c)
-    target_link_libraries(v22bis_cross v22bs_helpers v22bs_ref softmodem ${MATH_LIB})
+    target_link_libraries(v22bis_cross v22bs_helpers v22bs_ref softmodem
+                          ${SPANDSP_REF_LIB} ${MATH_LIB})
 else()
-    message(STATUS "spandsp headers not found - v22bis_cross skipped")
+    message(STATUS "spandsp reference library not found - v22bis_cross skipped "
+                   "(build it with tests/build_ref.sh)")
 endif()
