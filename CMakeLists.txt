@@ -122,6 +122,9 @@ if(SPANDSP_V34_INC AND SPANDSP_V34_LIB)
     target_include_directories(v34_loopback PRIVATE ${SPANDSP_V34_INC}
         ${CMAKE_SOURCE_DIR}/src/modem/v34/v34build/include)
     target_link_libraries(v34_loopback ${SPANDSP_V34_LIB} softmodem ${MATH_LIB})
+    add_executable(v34_mapping tests/v34_mapping.c)
+    target_include_directories(v34_mapping PRIVATE ${SPANDSP_V34_INC})
+    target_link_libraries(v34_mapping ${SPANDSP_V34_LIB} softmodem ${MATH_LIB})
 else()
     message(STATUS "V.34 engine not found - v34_loopback skipped "
                    "(build it with src/modem/v34/build_v34.sh)")
