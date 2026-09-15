@@ -169,6 +169,7 @@ static const char *tx_stage_name(int st)
     case V34_TX_STAGE_J: return "J";
     case V34_TX_STAGE_J_DASHED: return "J_DASHED";
     case V34_TX_STAGE_MP: return "MP";
+    case V34_TX_STAGE_DATA: return "DATA";
     default: return "?";
     }
 }

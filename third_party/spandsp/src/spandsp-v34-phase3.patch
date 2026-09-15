@@ -157,7 +157,15 @@
      s->rx.cc_carrier_phase_rate = dds_phase_ratef((s->calling_party)  ?  2400.0f  :  1200.0f);
 --- v34tx.c.orig
 +++ v34tx.c
-@@ -2126,9 +2126,16 @@
+@@ -324,6 +324,7 @@
+ static void trn_baud_init(v34_state_t *s);
+ static void mp_or_mph_baud_init(v34_state_t *s);
+ static void e_baud_init(v34_state_t *s);
++static void data_baud_init(v34_state_t *s);
+ 
+ /* Control channel startup routines */
+ static void pph_baud_init(v34_state_t *s);
+@@ -2126,9 +2127,16 @@
      if (s->tx.txptr >= s->tx.txbits)
      {
          if (s->tx.calling_party)
@@ -175,7 +183,7 @@
          /*endif*/
      }
      /*endif*/
-@@ -2174,12 +2181,18 @@
+@@ -2174,12 +2182,18 @@
      {
          if (s->tx.calling_party)
          {
@@ -197,7 +205,7 @@
              s_not_s_baud_init(s);
          }
          /*endif*/
-@@ -2348,6 +2361,14 @@
+@@ -2348,6 +2362,14 @@
              ||
              (s->tx.duplex  &&  ++s->tx.tone_duration >= 512))
          {
@@ -212,7 +220,7 @@
              s->tx.stage = V34_TX_STAGE_J;
              s->tx.persistence2 = j_pattern[0];
              s->tx.tone_duration = 0;
-@@ -2364,7 +2385,7 @@
+@@ -2364,7 +2386,7 @@
          {
              if (s->tx.duplex)
              {
@@ -221,7 +229,7 @@
                  {
                      if (s->tx.calling_party)
                      {
-@@ -2375,7 +2396,10 @@
+@@ -2375,7 +2397,10 @@
                      }
                      else
                      {
@@ -233,7 +241,7 @@
                      }
                      /*endif*/
                  }
-@@ -2403,6 +2427,9 @@
+@@ -2403,6 +2428,9 @@
          s->tx.persistence2 >>= 1;
          if (++s->tx.tone_duration >= 16)
          {
@@ -243,7 +251,7 @@
          }
          /*endif*/
          break;
-@@ -2418,6 +2445,16 @@
+@@ -2418,6 +2446,16 @@
      s->tx.tone_duration = 0;
      s->tx.stage = V34_TX_STAGE_TRN;
      s->tx.current_getbaud = get_trn_baud;
@@ -260,7 +268,7 @@
  }
  /*- End of function --------------------------------------------------------*/
  
-@@ -2429,26 +2466,36 @@
+@@ -2429,26 +2467,36 @@
      bit = (scramble(&s->tx, get_data_bit(&s->tx)) << 1) | bit;
      if (s->tx.txptr >= s->tx.txbits)
      {
@@ -310,7 +318,7 @@
          }
          /*endif*/
      }
-@@ -2461,7 +2508,10 @@
+@@ -2461,7 +2509,10 @@
  static void mp_or_mph_baud_init(v34_state_t *s)
  {
      span_log(&s->logging, SPAN_LOG_FLOW, "Tx - mp_baud_init()\n");
@@ -322,7 +330,69 @@
      if (s->tx.duplex)
      {
          s->tx.txbits = mp_sequence_tx(&s->tx, &s->tx.mp);
-@@ -2506,6 +2556,7 @@
+@@ -2478,6 +2529,41 @@
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
++/* Primary-channel data generator (our addition).
++
++   The mapping engine (v34_get_mapping_frame) consumes data bits and produces
++   one mapping frame: eight 2D symbols in Q9.7 format. This generator serves
++   those symbols one per baud through the primary-channel modulator. */
++static complex_sig_t get_data_baud(v34_state_t *s)
++{
++    int i;
++    complex_sig_t z;
++
++    if (s->tx.data_baud_pos >= 8)
++    {
++        v34_get_mapping_frame(&s->tx, s->tx.data_bits);
++        s->tx.data_baud_pos = 0;
++    }
++    /*endif*/
++    i = s->tx.data_baud_pos++;
++    /* Q9.7 to signal units (one constellation unit is 1.0). */
++    z.re = (float) s->tx.data_bits[2*i]/128.0f;
++    z.im = (float) s->tx.data_bits[2*i + 1]/128.0f;
++    return z;
++}
++/*- End of function --------------------------------------------------------*/
++
++static void data_baud_init(v34_state_t *s)
++{
++    span_log(&s->logging, SPAN_LOG_FLOW, "Tx - data_baud_init()\n");
++    s->tx.tone_duration = 0;
++    s->tx.stage = V34_TX_STAGE_DATA;
++    s->tx.current_modulator = V34_MODULATION_V34;
++    s->tx.current_getbaud = get_data_baud;
++    s->tx.data_baud_pos = 8;
++}
++/*- End of function --------------------------------------------------------*/
++
+ static complex_sig_t get_e_baud(v34_state_t *s)
+ {
+     static const uint16_t e_pattern[2] =
+@@ -2490,11 +2576,14 @@
+     bit = (e_pattern[0] >> s->tx.tone_duration) & 1;
+     if (++s->tx.tone_duration == 16)
+     {
+-        //if (s->tx.duplex)
+-            /* CC comes next */
+-        //else
+-            /* B1 comes next */
+-        ///*endif*/
++        if (s->tx.duplex)
++        {
++            /* The E sequence ends the control channel exchange. The primary
++               channel data mode begins (B1 is part of the first data frame
++               in this implementation). */
++            data_baud_init(s);
++        }
++        /*endif*/
+     }
+     /*endif*/
+     return training_constellation_4[bit];
+@@ -2506,6 +2595,7 @@
      span_log(&s->logging, SPAN_LOG_FLOW, "Tx - e_baud_init()\n");
      s->tx.tone_duration = 0;
      s->tx.stage = V34_TX_STAGE_HDX_E;

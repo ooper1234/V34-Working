@@ -130,6 +130,8 @@ enum v34_tx_stages_e
     V34_TX_STAGE_J_DASHED,
     /*! \brief MP is being transmitted */
     V34_TX_STAGE_MP,
+    /*! \brief Primary-channel data mode (addition over upstream) */
+    V34_TX_STAGE_DATA,
 
     /*! \brief Half-duplex initial stages */
     V34_TX_STAGE_HDX_INITIAL_A,
@@ -438,6 +440,10 @@ typedef struct
     bool trn_after_j;
     /*! \brief Count of MP' copies sent in phase 4 (addition). */
     int mp_tx_count;
+    /*! \brief Primary-channel data generator state (addition). One mapping
+               frame produces eight 2D symbols, served one per baud. */
+    int data_baud_pos;
+    int16_t data_bits[16];
 
     /*! \brief The get_bit function in use at any instant. */
     span_get_bit_func_t current_get_bit;
