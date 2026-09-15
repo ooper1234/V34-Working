@@ -42,6 +42,43 @@
 #define CHUNK 160
 #define RATE 8000
 
+
+static FILE *cap_caller;
+static FILE *cap_answerer;
+
+/* Inline G.711 mu-law encoder, so captures can be analysed with tools/ */
+static uint8_t lin2ulaw(int16_t pcm)
+{
+    int sign;
+    int exponent;
+    int mantissa;
+    int mask;
+
+    sign = (pcm >> 8) & 0x80;
+    if (sign)
+        pcm = -pcm;
+    if (pcm > 32635)
+        pcm = 32635;
+    pcm += 0x84;
+    exponent = 7;
+    for (mask = 0x4000;  (pcm & mask) == 0  &&  exponent > 0;  exponent--, mask >>= 1)
+        ;
+    mantissa = (pcm >> (exponent + 3)) & 0x0F;
+    return (uint8_t) ~(sign | (exponent << 4) | mantissa);
+}
+
+static void capture_block(FILE *f, const int16_t *amp, int len)
+{
+    uint8_t buf[CHUNK];
+    int i;
+
+    if (!f)
+        return;
+    for (i = 0; i < len; i++)
+        buf[i] = lin2ulaw(amp[i]);
+    fwrite(buf, 1, (size_t) len, f);
+}
+
 static int g_baud = 2400;
 static int g_bps = 4800;
 static int g_seconds = 40;
@@ -154,6 +191,7 @@ static const char *rx_stage_name(int st)
 }
 
 static int last_cts = -1, last_crs = -1, last_ats = -1, last_ars = -1;
+static long g_sample;
 
 static void report_stages(v34_state_t *caller, v34_state_t *answerer)
 {
@@ -164,7 +202,8 @@ static void report_stages(v34_state_t *caller, v34_state_t *answerer)
         last_crs = caller->rx.stage;
         last_ats = answerer->tx.stage;
         last_ars = answerer->rx.stage;
-        printf("STAGES caller tx=%s rx=%s | answerer tx=%s rx=%s\n",
+        printf("t=%.3f STAGES caller tx=%s rx=%s | answerer tx=%s rx=%s\n",
+               (double) g_sample / RATE,
                tx_stage_name(last_cts), rx_stage_name(last_crs),
                tx_stage_name(last_ats), rx_stage_name(last_ars));
         fflush(stdout);
@@ -206,6 +245,8 @@ int main(int argc, char **argv)
     if (argc > 3)
         g_seconds = atoi(argv[3]);
 
+    cap_caller = fopen("v34_caller_tx.ulaw", "wb");
+    cap_answerer = fopen("v34_answerer_tx.ulaw", "wb");
     v34_caller = v34_init(NULL, g_baud, g_bps, true, true, get_bit, NULL, put_bit, NULL);
     v34_answerer = v34_init(NULL, g_baud, g_bps, false, true, get_bit, NULL, put_bit, NULL);
     if (!v34_caller || !v34_answerer)
@@ -292,6 +333,9 @@ int main(int argc, char **argv)
         if (n < CHUNK)
             memset(&answerer_tx[n], 0, (CHUNK - n) * sizeof(int16_t));
 
+        capture_block(cap_caller, caller_tx, CHUNK);
+        capture_block(cap_answerer, answerer_tx, CHUNK);
+
         /* Cross-connect RX (ideal channel) */
         if (answerer_phase == 0)
             v8_rx(v8_answerer, caller_tx, CHUNK);
@@ -302,6 +346,7 @@ int main(int argc, char **argv)
         else
             v34_rx(v34_caller, answerer_tx, CHUNK);
 
+        g_sample = sample;
         report_stages(v34_caller, v34_answerer);
         if ((sample % (RATE * 5)) == 0)
         {
@@ -311,6 +356,10 @@ int main(int argc, char **argv)
     }
 
     printf("final: rx_bits=%d rx_bad=%d\n", rx_bits, rx_bad);
+    if (cap_caller)
+        fclose(cap_caller);
+    if (cap_answerer)
+        fclose(cap_answerer);
     v34_free(v34_caller);
     v34_free(v34_answerer);
     v8_free(v8_caller);

@@ -432,6 +432,13 @@ typedef struct
 
     int persistence2;
 
+    /*! \brief True when the TRN being transmitted is the one after J/J'
+               (the phase-4 TRN), which is followed by MP/MPH rather than J.
+               Addition over upstream spanDSP. */
+    bool trn_after_j;
+    /*! \brief Count of MP' copies sent in phase 4 (addition). */
+    int mp_tx_count;
+
     /*! \brief The get_bit function in use at any instant. */
     span_get_bit_func_t current_get_bit;
 
@@ -706,6 +713,26 @@ typedef struct
     int mp_len;
     int mp_and_fill_len;
     int mp_seen;
+
+    /* Phase-3 S signal detection (addition over upstream spanDSP).
+       The S/!S alignment signal is the first phase-3 signal transmitted on
+       the V.34 carrier: baseband symbols alternating between (1,0) and
+       (0,1) with periodic 180 degree reversals. Its baseband spectrum has
+       coherent components at DC and at baud_rate/2. A two-tone coherent
+       correlator over a sliding block detects it and generates
+       V34_EVENT_S, which gates the phase-3 transmit sequence. */
+    bool s_signal_seen;
+    int s_det_count;
+    int s_det_hits;
+    uint32_t s_det_phase_fc;
+    int32_t s_det_rate_fc;
+    uint32_t s_det_phase_nyq;
+    int32_t s_det_rate_nyq;
+    float s_det_acc_a_re;
+    float s_det_acc_a_im;
+    float s_det_acc_b_re;
+    float s_det_acc_b_im;
+    float s_det_power;
 
     int dft_ptr;
 #if defined(SPANDSP_USE_FIXED_POINT)

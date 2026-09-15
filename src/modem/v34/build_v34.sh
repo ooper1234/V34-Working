@@ -89,11 +89,15 @@ gen/make_modem_filter -m V.34_3429 -t > include/v34_tx_3429_rrc.h
 echo "== patching sources (leftover debug printfs)"
 cp "$SRC/v34rx.c" "$SRC/v34tx.c" .
 patch -p0 -s -N < "$SRC/spandsp-v34-debug-printfs.patch" || true
+patch -p0 -s -N < "$SRC/spandsp-v34-phase3.patch" || true
 
 echo "== compiling"
 rm -f *.o
-for f in v34tx v34rx v34_logging bitstream crc vector_float complex_vector_float; do
-    gcc $CFLAGS -c -o "$f.o" "$f.c" 2>/dev/null || gcc $CFLAGS -c -o "$f.o" "$SRC/$f.c"
+# The patched copies in this directory are authoritative for v34tx/v34rx.
+gcc $CFLAGS -c -o v34tx.o v34tx.c
+gcc $CFLAGS -c -o v34rx.o v34rx.c
+for f in v34_logging bitstream crc vector_float complex_vector_float; do
+    gcc $CFLAGS -c -o "$f.o" "$SRC/$f.c"
 done
 rm -f libsmv34.a
 ar rcs libsmv34.a *.o
