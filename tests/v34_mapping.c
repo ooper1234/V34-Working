@@ -43,18 +43,30 @@ SPAN_DECLARE(void) v34_put_mapping_frame(v34_rx_state_t *s, int16_t bits[16]);
 
 /* PRBS-15 data source, identical sequence read by the transmitter and
    expected by the receiver. */
-static uint32_t prbs_state = 0x1234;
+static uint32_t prbs_state = 1;       /* transmitter's data source */
+static uint32_t prbs_state_rx = 1;    /* receiver's independent reference */
 static long tx_bit_count;
 static long rx_bit_count;
 static long mismatches;
 static long rx_bits;
 
+static int prbs_next_bit_common(uint32_t *st)
+{
+    /* PRBS-15: x^15 + x^14 + 1. (The previous recurrence x[n-1]^x[n-2] had
+       period 3, which made comparisons meaningless.) */
+    uint32_t bit = ((*st >> 14) ^ (*st >> 13)) & 1;
+    *st = ((*st << 1) | bit) & 0x7FFF;
+    return (int) bit;
+}
+
 static int prbs_next_bit(void)
 {
-    /* x^15 + x^14 + 1 */
-    uint32_t bit = (prbs_state ^ (prbs_state >> 1)) & 1;
-    prbs_state = (prbs_state << 1) | bit;
-    return (int) (prbs_state & 1);
+    return prbs_next_bit_common(&prbs_state);
+}
+
+static int prbs_next_bit_rx(void)
+{
+    return prbs_next_bit_common(&prbs_state_rx);
 }
 
 static int tx_get_bit(void *user_data)
@@ -71,7 +83,7 @@ static void rx_put_bit(void *user_data, int bit)
     (void) user_data;
     if (bit < 0)
         return;
-    expected = prbs_next_bit();
+    expected = prbs_next_bit_rx();
     if (bit != expected)
         mismatches++;
     rx_bits++;

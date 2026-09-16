@@ -112,9 +112,12 @@ static data_dir_t dir_b;   /* answerer transmits, caller receives */
 
 static int dir_next_bit(data_dir_t *d)
 {
-    uint32_t bit = (d->state ^ (d->state >> 1)) & 1;
-    d->state = (d->state << 1) | bit;
-    return (int) (d->state & 1);
+    /* Proper PRBS-15 (x^15 + x^14 + 1). The previous recurrence fed back
+       from the two lowest bits only, giving a period-3 sequence, which made
+       capture comparisons against a reference sequence impossible. */
+    uint32_t bit = ((d->state >> 14) ^ (d->state >> 13)) & 1;
+    d->state = ((d->state << 1) | bit) & 0x7FFF;
+    return (int) bit;
 }
 
 static int get_bit_a(void *user_data)
@@ -276,8 +279,8 @@ int main(int argc, char **argv)
 
     cap_caller = fopen("v34_caller_tx.ulaw", "wb");
     cap_answerer = fopen("v34_answerer_tx.ulaw", "wb");
-    dir_a.state = 0x1234;
-    dir_b.state = 0x5678;
+    dir_a.state = 1;
+    dir_b.state = 2;
     (void) g_dir;
     v34_caller = v34_init(NULL, g_baud, g_bps, true, true, get_bit_a, &dir_a, put_bit_a, &dir_b);
     v34_answerer = v34_init(NULL, g_baud, g_bps, false, true, get_bit_a, &dir_b, put_bit_a, &dir_a);
