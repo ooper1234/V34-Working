@@ -52,7 +52,13 @@ EOF
 CFLAGS="-O2 -fPIC -I. -I$OUT/include -I$SRC -DHAVE_CONFIG_H -include prelude.h"
 
 echo "== building generators"
-gcc $CFLAGS -o gen/make_modem_filter $SRC/make_modem_filter.c $SRC/filter_tools.c -lm
+# The V.34 receive tables must be generated with the same rolloff as the
+# transmit tables (0.12); upstream's V.34 mode table uses 0.25 for receive
+# against 0.12 for transmit, which leaves a mismatched, non-Nyquist cascade
+# and heavy ISI in the primary channel. See the patch header.
+cp "$SRC/make_modem_filter.c" make_modem_filter.c
+patch -p0 -s -N < "$SRC/spandsp-v34-rx-matched-filter.patch" || true
+gcc $CFLAGS -o gen/make_modem_filter make_modem_filter.c $SRC/filter_tools.c -lm
 gcc $CFLAGS -o gen/make_shell $SRC/make_v34_shell_map.c -lm
 gcc $CFLAGS -o gen/make_conv $SRC/make_v34_convolutional_coders.c -lm
 cat > spandsp.h << 'EOF'

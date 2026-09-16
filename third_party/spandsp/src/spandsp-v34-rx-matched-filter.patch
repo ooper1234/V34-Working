@@ -1,0 +1,101 @@
+--- make_modem_filter.c.orig
++++ make_modem_filter.c
+@@ -415,7 +415,7 @@
+     {
+         rx_coeff_sets = 192;
+         rx_coeffs_per_filter = 27;
+-        rx_excess_bandwidth = 0.25;
++        rx_excess_bandwidth = 0.12;
+         tx_coeff_sets = 10;
+         tx_coeffs_per_filter = 9;
+         tx_excess_bandwidth = 0.12;
+@@ -428,7 +428,7 @@
+     {
+         rx_coeff_sets = 192;
+         rx_coeffs_per_filter = 27;
+-        rx_excess_bandwidth = 0.25;
++        rx_excess_bandwidth = 0.12;
+         tx_coeff_sets = 10;
+         tx_coeffs_per_filter = 9;
+         tx_excess_bandwidth = 0.12;
+@@ -441,7 +441,7 @@
+     {
+         rx_coeff_sets = 192;
+         rx_coeffs_per_filter = 27;
+-        rx_excess_bandwidth = 0.25;
++        rx_excess_bandwidth = 0.12;
+         tx_coeff_sets = 35;
+         tx_coeffs_per_filter = 9;
+         tx_excess_bandwidth = 0.12;
+@@ -454,7 +454,7 @@
+     {
+         rx_coeff_sets = 192;
+         rx_coeffs_per_filter = 27;
+-        rx_excess_bandwidth = 0.25;
++        rx_excess_bandwidth = 0.12;
+         tx_coeff_sets = 35;
+         tx_coeffs_per_filter = 9;
+         tx_excess_bandwidth = 0.12;
+@@ -467,7 +467,7 @@
+     {
+         rx_coeff_sets = 192;
+         rx_coeffs_per_filter = 27;
+-        rx_excess_bandwidth = 0.25;
++        rx_excess_bandwidth = 0.12;
+         tx_coeff_sets = 20;
+         tx_coeffs_per_filter = 9;
+         tx_excess_bandwidth = 0.12;
+@@ -480,7 +480,7 @@
+     {
+         rx_coeff_sets = 192;
+         rx_coeffs_per_filter = 27;
+-        rx_excess_bandwidth = 0.25;
++        rx_excess_bandwidth = 0.12;
+         tx_coeff_sets = 20;
+         tx_coeffs_per_filter = 9;
+         tx_excess_bandwidth = 0.12;
+@@ -493,7 +493,7 @@
+     {
+         rx_coeff_sets = 192;
+         rx_coeffs_per_filter = 27;
+-        rx_excess_bandwidth = 0.25;
++        rx_excess_bandwidth = 0.12;
+         tx_coeff_sets = 8;
+         tx_coeffs_per_filter = 9;
+         tx_excess_bandwidth = 0.12;
+@@ -506,7 +506,7 @@
+     {
+         rx_coeff_sets = 192;
+         rx_coeffs_per_filter = 27;
+-        rx_excess_bandwidth = 0.25;
++        rx_excess_bandwidth = 0.12;
+         tx_coeff_sets = 8;
+         tx_coeffs_per_filter = 9;
+         tx_excess_bandwidth = 0.12;
+@@ -519,7 +519,7 @@
+     {
+         rx_coeff_sets = 192;
+         rx_coeffs_per_filter = 27;
+-        rx_excess_bandwidth = 0.25;
++        rx_excess_bandwidth = 0.12;
+         tx_coeff_sets = 5;
+         tx_coeffs_per_filter = 9;
+         tx_excess_bandwidth = 0.12;
+@@ -532,7 +532,7 @@
+     {
+         rx_coeff_sets = 192;
+         rx_coeffs_per_filter = 27;
+-        rx_excess_bandwidth = 0.25;
++        rx_excess_bandwidth = 0.12;
+         tx_coeff_sets = 5;
+         tx_coeffs_per_filter = 9;
+         tx_excess_bandwidth = 0.12;
+@@ -546,7 +546,7 @@
+         /* There is only one carrier frequency defined for this baud rate */
+         rx_coeff_sets = 192;
+         rx_coeffs_per_filter = 27;
+-        rx_excess_bandwidth = 0.25;
++        rx_excess_bandwidth = 0.12;
+         tx_coeff_sets = 7;
+         tx_coeffs_per_filter = 9;
+         tx_excess_bandwidth = 0.12;
