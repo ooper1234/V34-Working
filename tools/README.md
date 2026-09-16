@@ -13,6 +13,7 @@ raw 8 kHz G.711 u-law files (e.g. written by `sm_sip --capture`).
 | `replay_rx.c` | replays a capture through the real V.22bis answerer receiver |
 | `v8_replay.c` | replays a capture through the actual spanDSP-based V.8 answerer |
 | `v34_frontend.c` | offline replica of the V.34 primary-channel receiver front end (same RRC tables and T/2 timing loop) for data-mode symbol analysis |
+| `v34_ideal_path.c` | deterministic V.34 ideal-path test: known symbols -> exact TX waveform -> real RX front end/demapper; also decodes waveform captures with carrier/timing/ones-source options |
 
 Build examples:
 

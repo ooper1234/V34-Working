@@ -165,7 +165,7 @@
              }
              /*endif*/
          }
-@@ -2042,7 +2153,18 @@
+@@ -2042,7 +2153,29 @@
                 and the start of actual user data */
              if (s->duplex)
              {
@@ -179,13 +179,24 @@
 +                s->data_rx_count = 0;
 +                {
 +                    const char *p = getenv("V34_RX_INITPHASE");
++                    /* Start the primary timing from the same clean state the
++                       ideal-path test uses. The handshake leaves the sampling
++                       phase, TED integrators and AGC wherever the control
++                       channel left them, which is not aligned to the data
++                       symbol grid. */
 +                    s->eq_put_step = p ? atoi(p) : 0;
++                    memset(&s->pri_ted, 0, sizeof(s->pri_ted));
++                    create_godard_coeffs(&s->pri_ted,
++                                         carrier_frequency(s->baud_rate, s->high_carrier),
++                                         exact_baud_rate(s->baud_rate),
++                                         0.99f);
++                    s->data_rx_agc_reset = true;
 +                }
 +                span_log(s->logging, SPAN_LOG_FLOW, "Rx - E seen, starting primary channel\n");
              }
              else
              {
-@@ -2325,12 +2447,47 @@
+@@ -2325,12 +2458,55 @@
  
      /* On alternate insertions we have a whole baud and must process it. */
      if ((s->baud_half ^= 1))
@@ -205,7 +216,10 @@
 +        if (s->data_rx_symbol_count >= s->data_rx_offset)
 +        {
 +            static int conj_mode = -1;
++            float re = sample->re;
 +            float im = sample->im;
++            float rr;
++            float ri;
 +            if (conj_mode < 0)
 +            {
 +                const char *c = getenv("V34_RX_CONJ");
@@ -213,8 +227,13 @@
 +            }
 +            if (conj_mode == 1)
 +                im = -im;
-+            s->data_rx_symbols[2*s->data_rx_count] = (int16_t) (sample->re*s->data_rx_scale);
-+            s->data_rx_symbols[2*s->data_rx_count + 1] = (int16_t) (im*s->data_rx_scale);
++            /* Optional complex correction (carrier rotation/receive gain). A
++               real receiver tracks these; this is how the ideal-path test
++               measures and applies them. */
++            rr = re*s->data_rx_rot_re - im*s->data_rx_rot_im;
++            ri = re*s->data_rx_rot_im + im*s->data_rx_rot_re;
++            s->data_rx_symbols[2*s->data_rx_count] = (int16_t) (rr*s->data_rx_scale);
++            s->data_rx_symbols[2*s->data_rx_count + 1] = (int16_t) (ri*s->data_rx_scale);
 +            if (++s->data_rx_count >= 8)
 +            {
 +                v34_put_mapping_frame(s, s->data_rx_symbols);
@@ -233,7 +252,7 @@
  #if 0
      z = equalizer_get(s);
  
-@@ -2371,22 +2528,27 @@
+@@ -2371,22 +2547,27 @@
      float ii;
      float qq;
      float v;
@@ -270,7 +289,7 @@
  // printf("XYX0 %d\n", len);
      for (i = 0;  i < len;  i++)
      {
-@@ -2694,6 +2856,19 @@
+@@ -2694,6 +2875,30 @@
      s->rx.baud_rate = baud_rate;
      s->rx.bit_rate = bit_rate;
      s->rx.high_carrier = high_carrier;
@@ -286,11 +305,22 @@
 +        s->rx.data_rx_offset = o ? atoi(o) : 0;
 +        if (sc)
 +            s->rx.data_rx_scale = (float) atof(sc);
++        s->rx.data_rx_rot_re = 1.0f;
++        s->rx.data_rx_rot_im = 0.0f;
++        {
++            const char *rd = getenv("V34_RX_ROTDEG");
++            if (rd)
++            {
++                double a = atof(rd)*M_PI/180.0;
++                s->rx.data_rx_rot_re = (float) cos(a);
++                s->rx.data_rx_rot_im = (float) sin(a);
++            }
++        }
 +    }
  
      s->rx.v34_carrier_phase_rate = dds_phase_ratef(carrier_frequency(s->rx.baud_rate, s->rx.high_carrier));
      s->rx.cc_carrier_phase_rate = dds_phase_ratef((s->calling_party)  ?  2400.0f  :  1200.0f);
-@@ -2713,9 +2888,13 @@
+@@ -2713,9 +2918,13 @@
      s->rx.carrier_track_p = 40000.0f;
  
      /* Create a default symbol sync filter */
@@ -481,7 +511,7 @@
      if (s->tx.duplex)
      {
          s->tx.txbits = mp_sequence_tx(&s->tx, &s->tx.mp);
-@@ -2478,6 +2529,43 @@
+@@ -2478,6 +2529,54 @@
  }
  /*- End of function --------------------------------------------------------*/
  
@@ -499,8 +529,15 @@
 +    {
 +        v34_get_mapping_frame(&s->tx, s->tx.data_bits);
 +        s->tx.data_baud_pos = 0;
-+        /* (Data-frame tracing removed; the offline front-end replica in
-+           tools/v34_frontend.c is the way to inspect data-mode symbols.) */
++        /* Enable V34_SYM_TRACE to log the first four frames of each
++           superframe, for comparing against a waveform capture. */
++        if (getenv("V34_SYM_TRACE")  &&  s->tx.super_frame < 33  &&  s->tx.data_frame < 4)
++            span_log(&s->logging, SPAN_LOG_FLOW, "SYM %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
++                     s->tx.data_frame,
++                     s->tx.data_bits[0], s->tx.data_bits[1], s->tx.data_bits[2], s->tx.data_bits[3],
++                     s->tx.data_bits[4], s->tx.data_bits[5], s->tx.data_bits[6], s->tx.data_bits[7],
++                     s->tx.data_bits[8], s->tx.data_bits[9], s->tx.data_bits[10], s->tx.data_bits[11],
++                     s->tx.data_bits[12], s->tx.data_bits[13], s->tx.data_bits[14], s->tx.data_bits[15]);
 +    }
 +    /*endif*/
 +    i = s->tx.data_baud_pos++;
@@ -519,13 +556,17 @@
 +    s->tx.current_modulator = V34_MODULATION_V34;
 +    s->tx.current_getbaud = get_data_baud;
 +    s->tx.data_baud_pos = 8;
++    /* The actual timing/filter reset happens at the first primary-modulator
++       call (see tx_v34_modulation), so that the control-channel modulator
++       can finish the final E symbol with its own phase. */
++    s->tx.data_first_baud = true;
 +}
 +/*- End of function --------------------------------------------------------*/
 +
  static complex_sig_t get_e_baud(v34_state_t *s)
  {
      static const uint16_t e_pattern[2] =
-@@ -2487,14 +2575,28 @@
+@@ -2487,14 +2586,28 @@
      };
      int bit;
  
@@ -559,7 +600,7 @@
      }
      /*endif*/
      return training_constellation_4[bit];
-@@ -2506,6 +2608,7 @@
+@@ -2506,6 +2619,7 @@
      span_log(&s->logging, SPAN_LOG_FLOW, "Tx - e_baud_init()\n");
      s->tx.tone_duration = 0;
      s->tx.stage = V34_TX_STAGE_HDX_E;
@@ -567,3 +608,78 @@
      s->tx.current_getbaud = get_e_baud;
  }
  /*- End of function --------------------------------------------------------*/
+@@ -2701,6 +2815,23 @@
+ 
+     /* The V.34 modulator. */
+ // printf("ZZZ baud rate %d\n", s->tx.baud_rate);
++    if (s->tx.data_first_baud)
++    {
++        /* First call of the primary modulator after E. The control-channel
++           modulator left baud_phase in 0..39 (its symbol is 40 samples),
++           but this modulator's polyphase table has only num (e.g. 10)
++           phases and indexes it with num-1-baud_phase. Without this reset
++           the shaper is indexed out of bounds and the data-mode waveform is
++           garbage. Clear the pulse-shaping history too: it holds
++           control-channel symbols. The reset was deferred to here so the
++           final E symbol is transmitted correctly by the CC modulator. */
++        s->tx.data_first_baud = false;
++        s->tx.baud_phase = 0;
++        memset(s->tx.rrc_filter_re, 0, sizeof(s->tx.rrc_filter_re));
++        memset(s->tx.rrc_filter_im, 0, sizeof(s->tx.rrc_filter_im));
++        s->tx.rrc_filter_step = 0;
++    }
++    /*endif*/
+     num = s->tx.parms.samples_per_symbol_numerator;
+     den = s->tx.parms.samples_per_symbol_denominator;
+     shaper = v34_tx_shapers[s->tx.baud_rate];
+@@ -2721,12 +2852,18 @@
+         /* Root raised cosine pulse shaping at baseband */
+ #if defined(SPANDSP_USE_FIXED_POINT)
+         x = complex_seti32(0, 0);
+-        for (i = 0;  i < V34_TX_FILTER_STEPS;  i++)
+         {
+-            x.re += (int32_t) shaper[num - 1 - s->tx.baud_phase][i]*(int32_t) s->tx.rrc_filter[i + s->tx.rrc_filter_step].re;
+-            x.im += (int32_t) shaper[num - 1 - s->tx.baud_phase][i]*(int32_t) s->tx.rrc_filter[i + s->tx.rrc_filter_step].im;
++            int k = s->tx.rrc_filter_step;
++
++            for (i = 0;  i < V34_TX_FILTER_STEPS;  i++)
++            {
++                x.re += (int32_t) shaper[num - 1 - s->tx.baud_phase][i]*(int32_t) s->tx.rrc_filter_re[k];
++                x.im += (int32_t) shaper[num - 1 - s->tx.baud_phase][i]*(int32_t) s->tx.rrc_filter_im[k];
++                if (++k >= V34_TX_FILTER_STEPS)
++                    k = 0;
++            }
++            /*endfor*/
+         }
+-        /*endfor*/
+         /* Now create and modulate the carrier */
+         x.re >>= 4;
+         x.im >>= 4;
+@@ -2736,12 +2873,23 @@
+         amp[sample] = (int16_t) ((i*s->tx.gain) >> 15);
+ #else
+         x = zero;
+-        for (i = 0;  i < V34_TX_FILTER_STEPS;  i++)
+         {
+-            x.re += shaper[num - 1 - s->tx.baud_phase][i]*s->tx.rrc_filter_re[i + s->tx.rrc_filter_step];
+-            x.im += shaper[num - 1 - s->tx.baud_phase][i]*s->tx.rrc_filter_im[i + s->tx.rrc_filter_step];
++            /* The pulse shaping buffer is V34_TX_FILTER_STEPS long and read
++               circularly (the same semantics as vec_circular_dot_prod*,
++               which the control-channel modulator uses). Upstream indexed it
++               linearly, reading past the end of the buffer for every symbol
++               after the first, which corrupted the data-mode waveform. */
++            int k = s->tx.rrc_filter_step;
++
++            for (i = 0;  i < V34_TX_FILTER_STEPS;  i++)
++            {
++                x.re += shaper[num - 1 - s->tx.baud_phase][i]*s->tx.rrc_filter_re[k];
++                x.im += shaper[num - 1 - s->tx.baud_phase][i]*s->tx.rrc_filter_im[k];
++                if (++k >= V34_TX_FILTER_STEPS)
++                    k = 0;
++            }
++            /*endfor*/
+         }
+-        /*endfor*/
+         /* Now create and modulate the carrier */
+         z = dds_complexf(&(s->tx.carrier_phase), s->tx.v34_carrier_phase_rate);
+         /* Don't bother saturating. We should never clip. */

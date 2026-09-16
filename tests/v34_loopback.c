@@ -94,30 +94,54 @@ static int rx_ptr;
 static int rx_bits;
 static int rx_bad;
 
-static int get_bit(void *user_data)
+/* Per-direction PRBS data: the transmitter pulls bits from the sequence and
+   the receiver compares against the same sequence. Constant data is
+   pathological for the V.34 scrambler (all-ones is its fixed point), so a
+   pseudo-random source is required for a meaningful data test. */
+typedef struct
 {
-    int bit = 1;
-    (void) user_data;
-    tx_buf[tx_ptr] = (uint8_t) bit;
-    if (++tx_ptr >= (int) sizeof(tx_buf))
-        tx_ptr = 0;
+    uint32_t state;
+    uint8_t buf[400000];
+    int wr;
+    int rd;
+    long bits;
+} data_dir_t;
+
+static data_dir_t dir_a;   /* caller transmits, answerer receives */
+static data_dir_t dir_b;   /* answerer transmits, caller receives */
+
+static int dir_next_bit(data_dir_t *d)
+{
+    uint32_t bit = (d->state ^ (d->state >> 1)) & 1;
+    d->state = (d->state << 1) | bit;
+    return (int) (d->state & 1);
+}
+
+static int get_bit_a(void *user_data)
+{
+    data_dir_t *d = user_data;
+    int bit = dir_next_bit(d);
+    if (d->wr < (int) sizeof(d->buf))
+        d->buf[d->wr++] = (uint8_t) bit;
+    d->bits++;
     return bit;
 }
 
-static void put_bit(void *user_data, int bit)
+static void put_bit_a(void *user_data, int bit)
 {
-    (void) user_data;
+    data_dir_t *d = user_data;
     if (bit < 0)
     {
         printf("  [v34] signal status %d\n", bit);
         return;
     }
-    if (bit != tx_buf[rx_ptr])
+    if (d->rd < d->wr && bit != d->buf[d->rd])
         rx_bad++;
+    d->rd++;
     rx_bits++;
-    if (++rx_ptr >= (int) sizeof(tx_buf))
-        rx_ptr = 0;
 }
+
+static data_dir_t *g_dir;   /* not used; kept for clarity */
 
 static int get_aux_bit(void *user_data)
 {
@@ -195,6 +219,8 @@ static int last_cts = -1, last_crs = -1, last_ats = -1, last_ars = -1;
 static long g_sample;
 static int last_tx_frame;
 static int last_rx_sym;
+static int phase_aligned_caller;
+static int phase_aligned_answerer;
 
 static void report_stages(v34_state_t *caller, v34_state_t *answerer)
 {
@@ -250,8 +276,11 @@ int main(int argc, char **argv)
 
     cap_caller = fopen("v34_caller_tx.ulaw", "wb");
     cap_answerer = fopen("v34_answerer_tx.ulaw", "wb");
-    v34_caller = v34_init(NULL, g_baud, g_bps, true, true, get_bit, NULL, put_bit, NULL);
-    v34_answerer = v34_init(NULL, g_baud, g_bps, false, true, get_bit, NULL, put_bit, NULL);
+    dir_a.state = 0x1234;
+    dir_b.state = 0x5678;
+    (void) g_dir;
+    v34_caller = v34_init(NULL, g_baud, g_bps, true, true, get_bit_a, &dir_a, put_bit_a, &dir_b);
+    v34_answerer = v34_init(NULL, g_baud, g_bps, false, true, get_bit_a, &dir_b, put_bit_a, &dir_a);
     if (!v34_caller || !v34_answerer)
     {
         fprintf(stderr, "v34_init failed\n");
@@ -351,6 +380,28 @@ int main(int argc, char **argv)
 
         g_sample = sample;
         report_stages(v34_caller, v34_answerer);
+
+        /* Diagnostic: align the receiver's carrier phase accumulator with the
+           transmitter's when data mode begins. A QAM slicer cannot tolerate an
+           arbitrary constant phase offset, and the two phase accumulators
+           have unrelated histories from the handshake. */
+        if (getenv("V34_PHASE_ALIGN"))
+        {
+            /* One-shot: when a receiver first enters data reception, line its
+               carrier phase up with the far transmitter's. Without carrier
+               recovery this arbitrary offset makes QAM slicing impossible.
+               (Diagnostic for the loopback; a real receiver tracks phase.) */
+            if (v34_caller->rx.data_rx_active && !phase_aligned_caller)
+            {
+                v34_caller->rx.carrier_phase = v34_answerer->tx.carrier_phase;
+                phase_aligned_caller = 1;
+            }
+            if (v34_answerer->rx.data_rx_active && !phase_aligned_answerer)
+            {
+                v34_answerer->rx.carrier_phase = v34_caller->tx.carrier_phase;
+                phase_aligned_answerer = 1;
+            }
+        }
 
         /* Diagnostic: record TX frames (answerer -> caller direction) and the
            caller's received symbols so the two can be compared directly. */

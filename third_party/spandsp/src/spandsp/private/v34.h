@@ -444,6 +444,7 @@ typedef struct
                frame produces eight 2D symbols, served one per baud. */
     int data_baud_pos;
     int16_t data_bits[16];
+    bool data_first_baud;
 
 
     /*! \brief The get_bit function in use at any instant. */
@@ -746,6 +747,9 @@ typedef struct
     int data_rx_count;
     int data_rx_symbol_count;
     int data_rx_offset;
+    float data_rx_rot_re;
+    float data_rx_rot_im;
+    bool data_rx_agc_reset;
     float data_rx_scale;
     int16_t data_rx_symbols[16];
 
