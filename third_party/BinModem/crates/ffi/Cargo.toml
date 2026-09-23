@@ -1,0 +1,20 @@
+[package]
+name    = "binmodemffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+datapump = { path = "../datapump" }
+v8       = { path = "../v8" }
+dsp      = { path = "../dsp" }
+ec       = { path = "../ec" }
+
+# Not workspace = true: the workspace denies unsafe_code, and the C boundary
+# below is exactly what that would forbid.
+[lints.rust]
+unsafe_code = "allow"

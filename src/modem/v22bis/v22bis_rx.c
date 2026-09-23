@@ -386,6 +386,10 @@ static void process_half_baud(v22bis_state_t *s, const sm_complexf_t *sample)
             fprintf(stderr, "TRACE scr1200 n=%d raw=%d repeats=%d neg=%d\n",
                     s->rx.training_count, raw_bits, s->rx.pattern_repeats,
                     s->negotiated_bit_rate);
+        if (rx_trace_enabled() && s->rx.training_count <= 45)
+            fprintf(stderr, "TRACE scrz n=%d z=%.3f%+.3fj nearest=%02x st=%02x\n",
+                    s->rx.training_count, z.re, z.im, nearest,
+                    s->rx.constellation_state);
 
         if (s->negotiated_bit_rate == 1200)
         {

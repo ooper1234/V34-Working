@@ -1,0 +1,690 @@
+//! V.22bis transmitter into V.22bis receiver.
+//!
+//! The receiver has to acquire symbol timing, lock a carrier and synchronise a
+//! self-synchronising descrambler before anything readable emerges, so every
+//! test sends a lead-in first and looks for the payload in what follows.
+
+use datapump::v22bis::{BAUD, Channel, Rate, Receiver, Signal, Transmitter};
+
+const FS: f64 = 16_000.0;
+
+/// Run `payload` through a transmitter and receiver, returning recovered bytes.
+///
+/// `lead_in` bytes of filler go first, giving the loops time to settle.
+fn loopback(payload: &[u8], lead_in: usize, channel: Channel) -> Vec<u8> {
+    loopback_with(payload, lead_in, channel, 0, FS)
+}
+
+/// As `loopback`, but the signal arrives `quiet` samples in, and the receiver
+/// believes the line runs at `rx_fs`.
+///
+/// Both are things a real call decides for us. Nothing says a carrier will
+/// start on a sample boundary convenient to the receiver, and two modems keep
+/// their own clocks.
+fn loopback_with(
+    payload: &[u8],
+    lead_in: usize,
+    channel: Channel,
+    quiet: usize,
+    rx_fs: f64,
+) -> Vec<u8> {
+    let mut tx = Transmitter::new(channel, FS);
+    let peer = match channel {
+        Channel::Calling => Channel::Answering,
+        Channel::Answering => Channel::Calling,
+    };
+    let mut rx = Receiver::new(peer, rx_fs);
+
+    let mut out = Vec::new();
+    for _ in 0..quiet {
+        rx.feed(0.0);
+        out.extend(rx.take_bytes());
+    }
+
+    tx.push_bytes(&vec![0x55; lead_in]);
+    tx.push_bytes(payload);
+    // Trailing filler so the last payload symbols clear the filters.
+    tx.push_bytes(&[0x55; 32]);
+
+    let symbols = (lead_in + payload.len() + 32) * 2;
+    let samples = (symbols as f64 * FS / BAUD).ceil() as usize;
+    for _ in 0..samples {
+        rx.feed(tx.next_sample());
+        out.extend(rx.take_bytes());
+    }
+    out
+}
+
+/// Find `needle` in `haystack`, allowing for the unknown bit offset a receiver
+/// starts at: the recovered stream may be shifted by any number of bits.
+fn contains_at_any_bit_offset(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let bits: Vec<bool> = haystack
+        .iter()
+        .flat_map(|b| (0..8).rev().map(move |i| b & (1 << i) != 0))
+        .collect();
+    let want: Vec<bool> = needle
+        .iter()
+        .flat_map(|b| (0..8).rev().map(move |i| b & (1 << i) != 0))
+        .collect();
+    bits.windows(want.len()).any(|w| w == want.as_slice())
+}
+
+#[test]
+fn a_transmitter_and_receiver_agree() {
+    let payload = b"V.22bis carries this at 2400 bits per second.";
+    let got = loopback(payload, 96, Channel::Calling);
+    assert!(
+        contains_at_any_bit_offset(&got, payload),
+        "payload not recovered; got {} bytes: {:?}",
+        got.len(),
+        String::from_utf8_lossy(&got[got.len().saturating_sub(80)..])
+    );
+}
+
+#[test]
+fn the_answering_channel_works_the_same_way() {
+    // The high channel differs only in carrier frequency.
+    let payload = b"the high channel answers on 2400 Hz";
+    let got = loopback(payload, 96, Channel::Answering);
+    assert!(
+        contains_at_any_bit_offset(&got, payload),
+        "payload not recovered on the high channel"
+    );
+}
+
+#[test]
+fn a_long_transfer_stays_locked() {
+    // Timing and carrier loops must hold, not merely acquire.
+    let payload: Vec<u8> = (0..600).map(|i| (i % 251) as u8).collect();
+    let got = loopback(&payload, 96, Channel::Calling);
+    assert!(
+        contains_at_any_bit_offset(&got, &payload),
+        "a long transfer drifted out of lock"
+    );
+}
+
+#[test]
+fn a_constant_payload_survives_the_scrambler() {
+    // Runs of identical bits are what the scrambler exists to break up, and
+    // they are also what makes timing recovery hardest.
+    let payload = vec![0x00u8; 200];
+    let got = loopback(&payload, 96, Channel::Calling);
+    assert!(
+        contains_at_any_bit_offset(&got, &payload),
+        "a constant payload was not recovered"
+    );
+}
+
+#[test]
+fn all_ones_survive_too() {
+    let payload = vec![0xffu8; 200];
+    let got = loopback(&payload, 96, Channel::Calling);
+    assert!(contains_at_any_bit_offset(&got, &payload));
+}
+
+#[test]
+fn the_transmitted_signal_sits_in_its_own_channel() {
+    // The two directions share the line, so each must stay inside its band or
+    // the frequency-division duplex that V.22bis relies on breaks down.
+    let mut tx = Transmitter::new(Channel::Calling, FS);
+    tx.push_bytes(&vec![0x5a; 400]);
+    let n = 8192;
+    let samples: Vec<f64> = (0..n).map(|_| tx.next_sample()).collect();
+
+    let mut spectrum = dsp::Spectrum::new(4096, FS);
+    for &s in &samples {
+        spectrum.push(s);
+    }
+    let mut bins = vec![0.0f64; 2048];
+    spectrum.magnitudes_db(&mut bins);
+
+    let bin_at = |hz: f64| (hz / (FS / 4096.0)).round() as usize;
+    let peak_between = |lo: f64, hi: f64| {
+        (bin_at(lo)..=bin_at(hi))
+            .map(|k| bins[k])
+            .fold(f64::MIN, f64::max)
+    };
+
+    let own = peak_between(700.0, 1700.0);
+    let other = peak_between(1900.0, 2900.0);
+    assert!(
+        own - other > 25.0,
+        "low channel leaked into the high channel: {own:.1} dB against {other:.1} dB"
+    );
+}
+
+#[test]
+fn the_receiver_reports_a_settled_constellation() {
+    let mut tx = Transmitter::new(Channel::Calling, FS);
+    let mut rx = Receiver::new(Channel::Answering, FS);
+    tx.push_bytes(&vec![0x6c; 400]);
+    let samples = (800.0 * FS / BAUD) as usize;
+    let mut errors = Vec::new();
+    for i in 0..samples {
+        rx.feed(tx.next_sample());
+        if i % 27 == 0 {
+            errors.push(rx.phase_error().abs());
+        }
+    }
+    let settled: f64 = errors[errors.len() - 100..].iter().sum::<f64>() / 100.0;
+    assert!(
+        settled < 0.25,
+        "carrier loop did not settle; residual error {settled}"
+    );
+
+    let (i, q) = rx.constellation_point();
+    let magnitude = (i * i + q * q).sqrt();
+    assert!(
+        (0.2..=1.6).contains(&magnitude),
+        "constellation point at {magnitude}, so gain control is off"
+    );
+}
+
+// -- 1200 bit/s (V.22bis 2.5.2.2) --------------------------------------------
+
+
+fn loopback_at(payload: &[u8], lead_in: usize, rate: Rate) -> (Vec<u8>, Rate) {
+    let mut tx = Transmitter::at_rate(Channel::Calling, rate, FS);
+    let mut rx = Receiver::new(Channel::Answering, FS);
+    tx.push_bytes(&vec![0x55; lead_in]);
+    tx.push_bytes(payload);
+    tx.push_bytes(&[0x55; 64]);
+
+    // At 1200 a symbol carries half as much, so twice as many are needed.
+    let bits = (lead_in + payload.len() + 64) * 8;
+    let symbols = bits / rate.bits_per_symbol();
+    let samples = (symbols as f64 * FS / BAUD).ceil() as usize;
+    let mut out = Vec::new();
+    for _ in 0..samples {
+        rx.feed(tx.next_sample());
+        out.extend(rx.take_bytes());
+    }
+    (out, rx.rate())
+}
+
+#[test]
+fn twelve_hundred_bits_per_second_round_trips() {
+    let payload = b"V.22 compatibility mode carries this at 1200.";
+    let (got, _) = loopback_at(payload, 160, Rate::Bps1200);
+    assert!(
+        contains_at_any_bit_offset(&got, payload),
+        "payload not recovered at 1200 bit/s"
+    );
+}
+
+#[test]
+fn the_receiver_works_out_which_rate_is_in_use() {
+    // Decoding 1200 as though it were 2400 gives two real bits and two
+    // meaningless ones, which descrambles into convincing noise rather than an
+    // obvious failure. The constellation is what distinguishes them: four
+    // clusters at one radius against sixteen at three.
+    let (_, detected) = loopback_at(b"rate detection", 200, Rate::Bps1200);
+    assert_eq!(detected, Rate::Bps1200, "should have fallen back to 1200");
+
+    let (_, detected) = loopback_at(b"rate detection", 200, Rate::Bps2400);
+    assert_eq!(detected, Rate::Bps2400, "should have stayed at 2400");
+}
+
+#[test]
+fn the_two_rates_carry_the_same_average_power() {
+    // V.22bis 2.5.2.2 picks the 01 point for 1200 precisely so this holds.
+    let mut slow = Transmitter::at_rate(Channel::Calling, Rate::Bps1200, FS);
+    let mut fast = Transmitter::at_rate(Channel::Calling, Rate::Bps2400, FS);
+    slow.push_bytes(&vec![0x6b; 600]);
+    fast.push_bytes(&vec![0x6b; 600]);
+    let n = 40_000;
+    let power =
+        |tx: &mut Transmitter| (0..n).map(|_| tx.next_sample().powi(2)).sum::<f64>() / n as f64;
+    let (a, b) = (power(&mut slow), power(&mut fast));
+    assert!(
+        (a / b - 1.0).abs() < 0.05,
+        "1200 carries {a:.5} and 2400 carries {b:.5}"
+    );
+}
+
+#[test]
+fn the_signal_may_arrive_at_any_moment() {
+    // Symbol timing has to be *acquired*, not assumed. Delaying the carrier by
+    // a fraction of a symbol moves the instant the receiver is looking for, and
+    // twenty-six samples covers a whole symbol at 600 baud on a 16 kHz line.
+    //
+    // This is the test an earlier receiver would have failed. Its timing loop
+    // could only creep, so it sampled wherever the group delay of the filters
+    // ahead of it happened to leave it, and whether that worked was decided by
+    // how long those filters were rather than by anything it did.
+    let payload = b"acquired from a standing start";
+    for quiet in 0..27 {
+        let got = loopback_with(payload, 96, Channel::Calling, quiet, FS);
+        assert!(
+            contains_at_any_bit_offset(&got, payload),
+            "not acquired when the carrier started {quiet} samples in"
+        );
+    }
+}
+
+#[test]
+fn the_two_clocks_need_not_agree() {
+    // V.22bis 2.6 allows the carrier, and with it the symbol clock, to be out
+    // by a hundred parts per million. Twice that is asked for here, so the
+    // requirement is met with room to spare rather than exactly.
+    //
+    // Measured, the receiver holds from -300 to +400 ppm, and the limit does
+    // not move with the length of the transfer: past it acquisition costs one
+    // slipped symbol and everything after is offset, rather than the clocks
+    // slowly drifting apart. The asymmetry is unexplained.
+    let payload: Vec<u8> = (0..400).map(|i| (i % 251) as u8).collect();
+    for ppm in [-200.0, -100.0, 100.0, 200.0] {
+        let got = loopback_with(&payload, 96, Channel::Calling, 0, FS * (1.0 + ppm / 1e6));
+        assert!(
+            contains_at_any_bit_offset(&got, &payload),
+            "lost the payload with the clocks {ppm} ppm apart"
+        );
+    }
+}
+
+/// Run `payload` through while our own channel comes back on top of it.
+///
+/// One virtual cable is not a hybrid. What is written to it is what comes back,
+/// so a modem on one hears its own transmit at full strength, in the channel it
+/// is not listening to, from the moment it starts sending -- which is well
+/// before the far end has said anything at all.
+///
+/// `quiet_ms` is how long that goes on for before the far end speaks, and it is
+/// the variable that matters: every real call has a pause of some length there,
+/// for the answer tone and the handshake, and no two calls have the same one.
+fn with_own_channel(payload: &[u8], lead_in: usize, own_level: f64, quiet_ms: f64) -> Vec<u8> {
+    let mut far = Transmitter::new(Channel::Answering, FS);
+    let mut own = Transmitter::new(Channel::Calling, FS);
+    // A calling modem: listens on the high channel, transmits on the low one.
+    let mut rx = Receiver::new(Channel::Calling, FS);
+    own.push_bytes(&vec![0x5a; 8192]);
+
+    let mut out = Vec::new();
+    for _ in 0..(FS * quiet_ms / 1000.0) as usize {
+        rx.feed(own.next_sample() * own_level);
+        out.extend(rx.take_bytes());
+    }
+
+    far.push_bytes(&vec![0x55; lead_in]);
+    far.push_bytes(payload);
+    far.push_bytes(&[0x55; 32]);
+    let symbols = (lead_in + payload.len() + 32) * 2;
+    for _ in 0..(symbols as f64 * FS / BAUD).ceil() as usize {
+        rx.feed(far.next_sample() + own.next_sample() * own_level);
+        out.extend(rx.take_bytes());
+    }
+    out
+}
+
+/// How often the far end is heard, over many different pauses before it starts.
+///
+/// One pause is not a measurement. Its length decides where in the symbol the
+/// carrier appears and how far gain control has run down, and a single value
+/// answers for that one alignment and no other. These are spaced so that no two
+/// land at the same point of a symbol.
+fn acquisitions(own_level: f64) -> (usize, usize) {
+    let payload = b"the far end is saying this while we talk over it";
+    let quiets = (0..16).map(|i| 131.0 * f64::from(i) + 0.37 * f64::from(i));
+    let mut heard = 0;
+    let mut tried = 0;
+    for quiet_ms in quiets {
+        tried += 1;
+        if contains_at_any_bit_offset(&with_own_channel(payload, 96, own_level, quiet_ms), payload) {
+            heard += 1;
+        }
+    }
+    (heard, tried)
+}
+
+#[test]
+fn a_carrier_that_arrives_after_a_pause_is_still_acquired() {
+    // Every real call has a pause before the far end's carrier: the answer
+    // tone, the silence after it, the handshake. This is where V.22bis was
+    // falling over, and the cause was a guard that had already expired.
+    //
+    // The equaliser is held still for its first sixty-four symbols to keep it
+    // away from the acquisition transient -- gain control pinned to its clamp
+    // by silence, a carrier loop that has not yet found the phase. Those
+    // symbols used to be counted from when the receiver was built rather than
+    // from when a carrier appeared, so after any pause longer than about a
+    // tenth of a second the guard was long gone, and the equaliser adapted
+    // straight into the transient it exists to avoid. It then spent the call
+    // unlearning it.
+    //
+    // Below a tenth of a second it worked, which is why every loopback test
+    // here passed: they all start the signal at once.
+    let (heard, tried) = acquisitions(0.0);
+    assert!(
+        heard >= tried - 2,
+        "heard the far end after only {heard} of {tried} pauses"
+    );
+}
+
+#[test]
+fn our_own_channel_does_not_stop_us_hearing_the_other() {
+    // The same, with our own transmit coming back at the strength one cable
+    // returns it at, which is all of it. Band selection has to hold that out
+    // of the loops for the whole of the pause as well as during the call:
+    // there is no hybrid here to help it.
+    let (heard, tried) = acquisitions(1.0);
+    assert!(
+        heard >= tried - 2,
+        "our own channel cost us the far end in {} of {tried} pauses",
+        tried - heard
+    );
+}
+
+#[test]
+fn the_channel_we_transmit_in_is_not_heard_as_a_carrier() {
+    // Nothing this modem sends should ever look like an incoming call. On one
+    // cable it all comes straight back, so the only thing separating the two
+    // is the selectivity of the band filter.
+    let mut own = Transmitter::new(Channel::Calling, FS);
+    let mut rx = Receiver::new(Channel::Calling, FS);
+    own.push_bytes(&vec![0x5a; 4096]);
+
+    let mut sent = 0.0f64;
+    let n = (FS * 0.5) as usize;
+    for _ in 0..n {
+        let s = own.next_sample();
+        sent += s * s;
+        rx.feed(s);
+    }
+    let sent = (sent / n as f64).sqrt();
+    assert!(!rx.carrier(), "heard its own transmit as an incoming carrier");
+    // Where the two channels sit, 55 dB is what the filter is designed for and
+    // 60 is what it should comfortably beat end to end.
+    let rejection = 20.0 * (sent / rx.level().max(1e-12)).log10();
+    assert!(
+        rejection > 60.0,
+        "our own channel is only {rejection:.1} dB down after band selection"
+    );
+}
+
+
+/// Eight-bit mu-law: the companding every G.711 call is carried in.
+///
+/// Not an impairment somebody chose to model. It is what the network does to
+/// the signal, on every VoIP call, before anything has clipped or gone wrong.
+fn ulaw_roundtrip(x: f64) -> f64 {
+    const BIAS: f64 = 33.0;
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let magnitude = (x.abs() * 32635.0).min(32635.0) + BIAS;
+    let mut exponent = 7;
+    while exponent > 0 && magnitude < (1 << (exponent + 5)) as f64 {
+        exponent -= 1;
+    }
+    let mantissa = ((magnitude as u32) >> (exponent + 1)) & 0x0f;
+    let decoded = (((mantissa as f64) * 2.0 + 33.0) * (1u32 << exponent) as f64) - BIAS;
+    sign * decoded / 32635.0
+}
+
+/// The level our own channel reaches in the one we are listening to, after
+/// `distort` has had it.
+fn own_channel_leakage(distort: impl Fn(f64) -> f64) -> f64 {
+    let mut own = Transmitter::new(Channel::Calling, FS);
+    own.set_signal(Signal::DoubleDibit);
+    let mut rx = Receiver::new(Channel::Calling, FS);
+    for _ in 0..(FS * 1.0) as usize {
+        rx.feed(distort(own.next_sample()));
+    }
+    rx.level()
+}
+
+#[test]
+fn a_straight_line_keeps_our_own_channel_out_of_the_other_one() {
+    // What band selection is for, and it does it: 67 dB, and no carrier
+    // claimed. The two channels of V.22bis are far enough apart that a
+    // linear-phase filter can separate them completely.
+    let leak = own_channel_leakage(|x| x);
+    assert!(leak < 1.0e-3, "our own channel leaks at {leak:.2e} on a clean line");
+}
+
+#[test]
+fn a_bent_line_puts_our_own_channel_straight_on_top_of_the_other() {
+    // The frequency plan of V.22bis has the two carriers an octave apart:
+    // 1200 Hz and 2400 Hz. Double the one and you have the other exactly.
+    //
+    // So any even-order nonlinearity anywhere between here and the far end --
+    // a clipped sample, an amplifier run hot, or simply the companding of
+    // G.711, which is a logarithm and is nowhere near straight -- makes a copy
+    // of this modem's own transmission and lays it precisely over the channel
+    // it is trying to listen to. It arrives inside the passband. No amount of
+    // selectivity reaches it, because there is no frequency at which to reject
+    // it that is not also the frequency of the wanted signal.
+    //
+    // On a real line this is survivable, because a hybrid keeps most of the
+    // modem's own transmit out of its own receiver before any of it can be
+    // squared. Written to one virtual cable there is no hybrid: everything sent
+    // comes back at full strength to be squared at leisure.
+    //
+    // The test is the comparison, not the number. Same signal, same filter, and
+    // the only difference is a nonlinearity nobody can remove from the path.
+    let straight = own_channel_leakage(|x| x);
+    let companded = own_channel_leakage(ulaw_roundtrip);
+    assert!(
+        companded > straight * 20.0,
+        "companding lifted our own channel from {straight:.2e} only to {companded:.2e}"
+    );
+}
+
+/// How often the far end is heard through companding, with our own transmit
+/// `db` relative to it.
+fn acquisitions_through_companding(db: f64) -> (usize, usize) {
+    let payload = b"the far end is saying this while we talk over it";
+    // About -16 dBFS, which is the order of what a trunk delivers.
+    let far_level = 0.15;
+    let own_level = far_level * 10.0f64.powf(db / 20.0);
+    let mut heard = 0;
+    let mut tried = 0;
+    for i in 0..8 {
+        tried += 1;
+        let quiet_ms = 131.0 * f64::from(i) + 0.37 * f64::from(i);
+        let mut far = Transmitter::new(Channel::Answering, FS);
+        let mut own = Transmitter::new(Channel::Calling, FS);
+        let mut rx = Receiver::new(Channel::Calling, FS);
+        own.push_bytes(&vec![0x5a; 8192]);
+
+        let mut out = Vec::new();
+        for _ in 0..(FS * quiet_ms / 1000.0) as usize {
+            rx.feed(ulaw_roundtrip(own.next_sample() * own_level));
+            out.extend(rx.take_bytes());
+        }
+        far.push_bytes(&[0x55; 96]);
+        far.push_bytes(payload);
+        far.push_bytes(&[0x55; 32]);
+        let symbols = (96 + payload.len() + 32) * 2;
+        for _ in 0..(symbols as f64 * FS / BAUD).ceil() as usize {
+            let line = far.next_sample() * far_level + own.next_sample() * own_level;
+            rx.feed(ulaw_roundtrip(line));
+            out.extend(rx.take_bytes());
+        }
+        if contains_at_any_bit_offset(&out, payload) {
+            heard += 1;
+        }
+    }
+    (heard, tried)
+}
+
+#[test]
+fn transmitting_as_loudly_as_the_far_end_costs_us_the_far_end() {
+    // The harmonic grows as the square of our own level, so against a far end
+    // whose level we do not control it rises two decibels for every decibel of
+    // our own. Matching the far end is the worst place to sit that anyone would
+    // think to sit at.
+    let (heard, tried) = acquisitions_through_companding(0.0);
+    assert!(
+        heard * 2 < tried,
+        "expected transmitting this loudly to be the fault it is, heard {heard} of {tried}"
+    );
+}
+
+#[test]
+fn six_decibels_of_headroom_buys_the_far_end_back() {
+    // And is enough: measured across the range, everything from six decibels
+    // down behaves the same, so there is nothing bought by going quieter and a
+    // great deal lost by going louder. This is the number to set a drive
+    // control by on a line that has no hybrid in it.
+    let (heard, tried) = acquisitions_through_companding(-6.0);
+    assert!(
+        heard >= tried - 1,
+        "heard the far end after only {heard} of {tried} pauses at six decibels down"
+    );
+}
+
+/// How often the far end is heard at `rate`, with our own transmit `db`
+/// relative to it and the whole line through companding.
+///
+/// The levels this is called with are measured, not invented: a recorded call
+/// through a real trunk put our own transmit 9.6 dB above the far end in our
+/// own receiver, with the far end arriving at -24.7 dBFS.
+fn acquisitions_at(rate: Rate, db: f64) -> (usize, usize) {
+    let payload = b"the far end is saying this while we talk over it";
+    let far_level = 0.058;
+    let own_level = far_level * 10.0f64.powf(db / 20.0);
+    let (mut heard, mut tried) = (0, 0);
+    for i in 0..8 {
+        tried += 1;
+        let quiet_ms = 131.0 * f64::from(i) + 0.37 * f64::from(i);
+        let mut far = Transmitter::at_rate(Channel::Answering, rate, FS);
+        let mut own = Transmitter::at_rate(Channel::Calling, rate, FS);
+        let mut rx = Receiver::new(Channel::Calling, FS);
+        own.push_bytes(&vec![0x5a; 8192]);
+
+        let mut out = Vec::new();
+        for _ in 0..(FS * quiet_ms / 1000.0) as usize {
+            rx.feed(ulaw_roundtrip(own.next_sample() * own_level));
+            out.extend(rx.take_bytes());
+        }
+        far.push_bytes(&[0x55; 96]);
+        far.push_bytes(payload);
+        far.push_bytes(&[0x55; 32]);
+        // Two bits to a symbol at 1200 and four at 2400, so the same bytes take
+        // twice as long to send at the slower rate.
+        let bits = (96 + payload.len() + 32) * 8;
+        let symbols = bits / if rate == Rate::Bps1200 { 2 } else { 4 };
+        for _ in 0..(symbols as f64 * FS / BAUD).ceil() as usize {
+            let line = far.next_sample() * far_level + own.next_sample() * own_level;
+            rx.feed(ulaw_roundtrip(line));
+            out.extend(rx.take_bytes());
+        }
+        if contains_at_any_bit_offset(&out, payload) {
+            heard += 1;
+        }
+    }
+    (heard, tried)
+}
+
+#[test]
+fn twenty_four_hundred_cannot_be_had_while_we_shout_over_it() {
+    // The condition a recorded call was actually in. Sixteen points need about
+    // twenty decibels of signal to noise to be told apart, and there is not
+    // twenty decibels here: our own transmit, squared onto the far end's
+    // carrier by companding, is louder than the far end itself.
+    let (heard, tried) = acquisitions_at(Rate::Bps2400, 9.6);
+    assert_eq!(heard, 0, "expected 2400 to be hopeless here, heard {heard} of {tried}");
+}
+
+#[test]
+fn twelve_hundred_carries_the_call_that_twenty_four_hundred_cannot() {
+    // The same line, the same companding, the same harmonic sitting on the
+    // same carrier -- and every single attempt succeeds. Four points need
+    // about thirteen decibels rather than twenty, and thirteen is there.
+    //
+    // Which is what a rate ceiling is for. On a line like this 2400 is not the
+    // faster connection, it is the one that carries nothing, and AT+MS can say
+    // so: the max rate field is honoured all the way down to the handshake,
+    // which then never offers 2400 at all.
+    for db in [9.6, 0.0, -6.0] {
+        let (heard, tried) = acquisitions_at(Rate::Bps1200, db);
+        assert_eq!(
+            heard, tried,
+            "1200 lost the far end at {db:+.1} dB: heard {heard} of {tried}"
+        );
+    }
+}
+
+/// The offer of 2400 has to be read whenever it arrives.
+///
+/// 6.3.1.1.2 a) has the answering modem send unscrambled binary 1 until it
+/// hears something back, which on a real call was a second and a half. That
+/// signal is the same turn every symbol, which is a pure tone: constant
+/// envelope, no transitions, and so nothing whatever for a timing loop to
+/// measure. The clock is therefore wherever it was when the tone started, and
+/// a tone reads the same turn wherever it is sampled, so nothing gives it away.
+///
+/// Then comes the double dibit of 6.3.1.1.1 c), 100 ms of it, and it is the
+/// far end offering 2400. It alternates between two points a quarter turn
+/// apart -- so its midpoints are all the same point, and a clock half a symbol
+/// out reads a constant and no turn at all. That is a stable place for this
+/// timing detector to sit: its error is zero there exactly as it is at the
+/// right instant.
+///
+/// On the call this came from the far end offered 2400 for 135 ms at
+/// eighteen decibels and the receiver read `0000000000...` for the whole of
+/// it, saw no offer, and settled at 1200. Whether it did depended on where the
+/// clock happened to be when the pump was built, so the same recording
+/// connected at either rate according to nothing at all.
+///
+/// This does not reproduce that, and is not the thing guarding against it. It
+/// passes with the escape in `Handshake::step` and without it: from a clean
+/// start, and from a start with noise on it, the loop finds the symbol instant
+/// inside the 100 ms every time. The false lock wants the real recording,
+/// where it survives -- see the sweep in the `v22bis_capture` probe, which is
+/// the evidence. What this pins is the property the fix is for, so that a
+/// change which breaks it from some phases is caught rather than shipped.
+#[test]
+fn the_offer_of_2400_is_read_from_every_starting_phase() {
+    let sps = (FS / BAUD).round() as usize;
+    let mut missed = Vec::new();
+    // A line, not a wire. The loop's error through a pure tone is zero on a
+    // clean channel and noise on a real one, and it is the second that lets it
+    // wander to the midpoint and sit there.
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let mut noise = move || 0.04 * {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        f64::from(u16::try_from((seed >> 40) & 0xfff).unwrap_or(0)) / 2048.0 - 1.0
+    };
+    // Every phase the clock could have been left in by the tone before it.
+    for offset in 0..sps {
+        let mut tx = Transmitter::new(Channel::Answering, FS);
+        let mut rx = Receiver::new(Channel::Calling, FS);
+        for _ in 0..offset {
+            rx.feed(0.0);
+        }
+        // 6.3.1.1.2 a): unscrambled binary 1, and enough of it that anything
+        // the loop knew at the start has long since stopped mattering.
+        tx.set_rate(Rate::Bps1200);
+        tx.set_signal(Signal::UnscrambledOnes);
+        for _ in 0..(FS as usize) {
+            rx.feed(tx.next_sample() + noise());
+        }
+        assert_eq!(
+            rx.pattern(),
+            datapump::v22bis::Pattern::UnscrambledOnes,
+            "offset {offset}: the tone itself was not read",
+        );
+        // 6.3.1.1.1 b): 100 +/- 3 ms of it, and this end has that long.
+        tx.set_signal(Signal::DoubleDibit);
+        let mut seen = false;
+        for _ in 0..(FS * 0.100) as usize {
+            rx.feed(tx.next_sample() + noise());
+            if rx.pattern() == datapump::v22bis::Pattern::DoubleDibit {
+                seen = true;
+            }
+        }
+        if !seen {
+            missed.push(offset);
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "the offer was missed from {} of {sps} starting phases: {missed:?}",
+        missed.len(),
+    );
+}

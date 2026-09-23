@@ -1,0 +1,20 @@
+--- v34tx.c
++++ v34tx.c
+@@ -2507,7 +2507,7 @@
+         s->tx.persistence2 >>= 1;
+         bit = (scramble(&s->tx, (s->tx.persistence2 & 1)) << 1) | bit;
+         s->tx.persistence2 >>= 1;
+-        if (++s->tx.tone_duration >= 16)
++        if (++s->tx.tone_duration >= 8)
+         {
+             if (s->tx.duplex)
+             {
+@@ -2555,7 +2555,7 @@
+         s->tx.persistence2 >>= 1;
+         bit = (scramble(&s->tx, (s->tx.persistence2 & 1)) << 1) | bit;
+         s->tx.persistence2 >>= 1;
+-        if (++s->tx.tone_duration >= 16)
++        if (++s->tx.tone_duration >= 8)
+         {
+             /* J' is followed by the post-J TRN (V.34 phase 4) */
+             s->tx.trn_after_j = true;

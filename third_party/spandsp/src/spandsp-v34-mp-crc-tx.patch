@@ -1,0 +1,10 @@
+--- v34tx.c
++++ v34tx.c
+@@ -745,7 +745,7 @@
+     len = (mp->type == 1)  ?  170  :  68;
+     for (i = 17;  i < len;  i += 17)
+-        crc = crc_bit_block(s->txbuf, i, i + 15, crc);
++        crc = crc_bit_block(s->txbuf, i + 1, i + 16, crc);
+     /*endfor*/
+     /* 69:84/171:186    CRC. */
+     bitstream_put(&bs, &t, crc, 16);

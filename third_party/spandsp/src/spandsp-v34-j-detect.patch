@@ -1,0 +1,118 @@
+--- v34tx.c
++++ v34tx.c
+@@ -2386,21 +2386,12 @@
+ 
+ static complex_sig_t get_train_wait_baud(v34_state_t *s)
+ {
+-    /* V.34 11.3.1.2.4 to 11.3.1.2.6: after detecting the call modem's S-to-!S
+-       transition the answer modem transmits silence while receiving PP, the
+-       first 512T of TRN, and J.  J correlation is still TODO, so use a short
+-       bounded acquisition interval covering PP (288T), 512T of TRN, and the
+-       line/packet delay.  Keep it adjustable for hardware measurements. */
+-    int wait_ms = 300;
+-    const char *w = getenv("V34_ANSWER_TRAIN_WAIT_MS");
+-    int wait_symbols;
+-
+-    if (w  &&  atoi(w) > 0)
+-        wait_ms = atoi(w);
+-    /*endif*/
+-    wait_symbols = (int) (exact_baud_rate(s->tx.baud_rate)*wait_ms/1000.0);
+-
+-    if (++s->tx.tone_duration >= wait_symbols)
++    /* V.34 11.3.1.2.4 to 11.3.1.2.6: remain silent through the caller's
++       PP/TRN and advance only when its repeated J sequence has actually been
++       recognized by the primary-channel receiver.  Protocol recovery
++       timeouts belong in the retrain path; they must not synthesize a normal
++       Phase-3 transition. */
++    if (s->rx.j_signal_seen)
+         phase4_preamble_init(s);
+     /*endif*/
+     return zero;
+--- v34rx.c
++++ v34rx.c
+@@ -2814,7 +2814,9 @@
+     }
+     /*endif*/
+ 
+-    for (i = 0;  i < len  &&  s->stage == V34_RX_STAGE_CC;  i++)
++    for (i = 0;  i < len
++                &&  (s->stage == V34_RX_STAGE_CC
++                     || s->stage == V34_RX_STAGE_PRIMARY_CHANNEL);  i++)
+     {
+         complexf_t carrier = dds_lookup_complexf(s->carrier_phase);
+         complexf_t symbol;
+@@ -2904,6 +2906,63 @@
+                             (s->mp_timing_scramble[candidate] << 1) | raw;
+                         s->mp_timing_stream[candidate] =
+                             (s->mp_timing_stream[candidate] << 1) | b;
++                        if (s->stage == V34_RX_STAGE_PRIMARY_CHANNEL)
++                        {
++                            /* For an answer receiver, caller J uses the
++                               caller-direction scrambler and unmodified dibit
++                               differential mapping.  Other variants exist
++                               only for blind MP acquisition and can create a
++                               false short-pattern lock here. */
++                            if (descrambler_tap != 4  ||  variant != 0)
++                            {
++                                dibit >>= 1;
++                                continue;
++                            }
++                            /*endif*/
++                            /* J is the scrambled, differentially encoded
++                               repetition of 0x8990, sent least-significant bit
++                               first.  After self-synchronization, every rolling
++                               16-bit window is a cyclic rotation of 0x0991.
++                               A small Hamming radius tolerates pre-equalizer
++                               line errors; accumulated matches reject random
++                               TRN and its descrambled all-ones input. */
++                            uint16_t w = (uint16_t) s->mp_timing_stream[candidate];
++                            uint16_t q = 0x0991;
++                            int best_errors = 16;
++                            int rotation;
++                            for (rotation = 0;  rotation < 16;  rotation++)
++                            {
++                                int errors = __builtin_popcount((unsigned) (w ^ q));
++                                if (errors < best_errors)
++                                    best_errors = errors;
++                                /*endif*/
++                                q = (uint16_t) ((q << 1) | (q >> 15));
++                            }
++                            if (best_errors <= 5)
++                                s->mp_timing_count[candidate]++;
++                            else if (s->mp_timing_count[candidate] > 0)
++                                s->mp_timing_count[candidate]--;
++                            /*endif*/
++                            if (s->mp_timing_count[candidate] >= 8)
++                            {
++                                s->mp_timing_lock = candidate;
++                                s->mp_dibit_xor = variant & 3;
++                                s->mp_dibit_swap = (variant & 4) != 0;
++                                s->scrambler_tap = descrambler_tap;
++                                s->scramble_reg = s->mp_timing_scramble[candidate];
++                                s->bitstream = s->mp_timing_stream[candidate];
++                                s->last_sample = symbol;
++                                s->j_signal_seen = true;
++                                span_log(s->logging, SPAN_LOG_FLOW,
++                                         "Rx - J sequence detected at phase %d/10, xor=%d swap=%d tap=%d\n",
++                                         candidate%10, s->mp_dibit_xor,
++                                         s->mp_dibit_swap, s->scrambler_tap);
++                            }
++                            /*endif*/
++                            dibit >>= 1;
++                            continue;
++                        }
++                        /*endif*/
+                         if ((s->mp_timing_stream[candidate] & 0x7FFFE) == 0x7FFFC)
+                         {
+                             s->mp_timing_crc[candidate] = 0xFFFF;
+@@ -2994,7 +3053,9 @@
+     float qq;
+     float v;
+ 
+-    if (s->stage == V34_RX_STAGE_CC  &&  s->duplex)
++    if (s->duplex
++        &&  (s->stage == V34_RX_STAGE_CC
++             || s->stage == V34_RX_STAGE_PRIMARY_CHANNEL))
+         return duplex_mp_rx(s, amp, len);
+     /*endif*/
+ 

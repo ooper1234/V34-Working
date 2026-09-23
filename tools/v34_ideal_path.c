@@ -329,6 +329,16 @@ int main(int argc, char **argv)
             tx_syms[n_tx++] = bits[j];
     }
 
+    {
+        const char *fx = getenv("V34_IDEAL_FIXED");
+        if (fx)
+        {
+            /* Deterministic diagnostic pattern: a four-symbol marker repeated. */
+            static const int16_t pat[8] = {128, 128, 384, -384, -128, -128, -384, 384};
+            for (i = 0; i < n_tx; i++)
+                tx_syms[i] = pat[i & 7];
+        }
+    }
     /* Synthesize the data-mode waveform with the same polyphase RRC, carrier
        and gain as tx_v34_modulation (circular filter read, as fixed). */
     num = tx->tx.parms.samples_per_symbol_numerator;
@@ -430,6 +440,15 @@ int main(int argc, char **argv)
             rx->rx.data_rx_scale = (float) atof(sc);
     }
     last_symbol_count = 0;
+    {
+        const char *rd = getenv("V34_RX_ROTDEG");
+        if (rd)
+        {
+            double a = atof(rd)*M_PI/180.0;
+            rx->rx.data_rx_rot_re = (float) cos(a);
+            rx->rx.data_rx_rot_im = (float) sin(a);
+        }
+    }
 
     /* Feed in small chunks so no collected frame is missed.
        If V34_IDEAL_TIMSweep is set, sweep the initial sampling phase and
@@ -441,6 +460,14 @@ int main(int argc, char **argv)
         const char *ts = getenv("V34_IDEAL_TIMSweep");
         int tph;
 
+        {
+            const char *tp = getenv("V34_IDEAL_TPH");
+            if (tp)
+            {
+                tph0 = atoi(tp);
+                tph1 = tph0;
+            }
+        }
         if (ts)
         {
             tstep = atoi(ts);
@@ -452,6 +479,11 @@ int main(int argc, char **argv)
             rx_bits = 0;
             mismatches = 0;
             n_rx = 0;
+            /* Each trial compares against the receiver reference from the
+               start, exactly as the first trial does. Without this reset the
+               reference stays advanced from the previous trial and every
+               result after the first is meaningless. */
+            prbs_state_rx = 1;
             v34_restart(rx, baud, bps, true);
             rx->rx.current_demodulator = V34_MODULATION_V34;
             rx->rx.stage = V34_RX_STAGE_PRIMARY_CHANNEL;
@@ -468,6 +500,15 @@ int main(int argc, char **argv)
                     rx->rx.data_rx_scale = (float) atof(sc);
             }
             rx->rx.eq_put_step = tph;
+            {
+                const char *rd = getenv("V34_RX_ROTDEG");
+                if (rd)
+                {
+                    double a = atof(rd)*M_PI/180.0;
+                    rx->rx.data_rx_rot_re = (float) cos(a);
+                    rx->rx.data_rx_rot_im = (float) sin(a);
+                }
+            }
             last_symbol_count = 0;
             for (i = 0; i < n_wave; i += 8)
             {

@@ -1,3 +1,594 @@
+--- v34tx.c.orig
++++ v34tx.c
+@@ -322,8 +322,12 @@
+ static void s_not_s_baud_init(v34_state_t *s);
+ static void pp_baud_init(v34_state_t *s);
+ static void trn_baud_init(v34_state_t *s);
++static complex_sig_t get_train_wait_baud(v34_state_t *s);
++static void phase4_preamble_init(v34_state_t *s);
++static complex_sig_t get_phase4_s_baud(v34_state_t *s);
+ static void mp_or_mph_baud_init(v34_state_t *s);
+ static void e_baud_init(v34_state_t *s);
++static void data_baud_init(v34_state_t *s);
+ 
+ /* Control channel startup routines */
+ static void pph_baud_init(v34_state_t *s);
+@@ -1436,6 +1440,11 @@
+             y4321 = conv_encode_input[subsets[0]][subsets[1]];
+             /* Table 11/V.34 step 9, 9.6.3.1/V.34 and 9.6.3.2/V.34 */
+             s->y0 = s->state & 1;
++            if (getenv("V34_TRACE_CONV"))
++                fprintf(stderr, "TXCONV %d %d %d %d %d %d\n",
++                        s->data_frame*4 + (s->step_2d >> 1), s->state, y4321,
++                        subsets[0], subsets[1], s->y0);
++            /*endif*/
+             s->state = (*s->conv_encode_table)[s->state][y4321];
+ //printf("Y4321 %d %d - %d %d %d\n", subsets[0], subsets[1], y4321, s->y0, s->state);
+ //printf("WWW 0x%x 0x%x -> 0x%x\n", v0, y4321, s->state);
+@@ -2126,9 +2135,16 @@
+     if (s->tx.txptr >= s->tx.txbits)
+     {
+         if (s->tx.calling_party)
+-            tx_silence_init(s, 30000);
++        {
++            if (s->rx.s_signal_seen)
++                s_not_s_baud_init(s);
++            else
++                return zero;
++        }
+         else
++        {
+             s_not_s_baud_init(s);
++        }
+         /*endif*/
+     }
+     /*endif*/
+@@ -2174,12 +2190,18 @@
+     {
+         if (s->tx.calling_party)
+         {
+-// printf("info 1 Tx silence\n");
+-            tx_silence_init(s, 30000);
++            /* Wait for the answerer's S signal, then send our own S/!S
++               (V.34 phase 3). The S detector in the receiver latches the
++               event. Stay on the current modulator returning zero, so this
++               generator keeps being called while we wait: a silence
++               modulator would never re-check the event. */
++            if (s->rx.s_signal_seen)
++                s_not_s_baud_init(s);
++            else
++                return zero;
+         }
+         else
+         {
+-// printf("info 1 Tx S !S\n");
+             s_not_s_baud_init(s);
+         }
+         /*endif*/
+@@ -2239,10 +2261,13 @@
+     switch (s->tx.stage)
+     {
+     case V34_TX_STAGE_FIRST_S:
+-        if (++s->tx.tone_duration < 180)
++        /* V.34 11.3.1.2.1: after INFO1a the answer modem transmits silence for
++           70 +/- 5 ms, then S for 128T and !S for 16T. The silence is a time,
++           not a symbol count, so it is computed from the symbol rate. */
++        if (++s->tx.tone_duration < (int) (exact_baud_rate(s->tx.baud_rate)*0.070))
+             return zero;
+         /*endif*/
+-        if (s->tx.tone_duration == (128 + 180))
++        if (s->tx.tone_duration == (128 + (int) (exact_baud_rate(s->tx.baud_rate)*0.070)))
+         {
+             s->tx.lastbit.re = -s->tx.lastbit.re;
+             s->tx.stage = V34_TX_STAGE_FIRST_NOT_S;
+@@ -2254,7 +2279,9 @@
+         if (++s->tx.tone_duration == 16)
+         {
+             s->tx.lastbit.re = -s->tx.lastbit.re;
+-            if (s->tx.duplex  &&  s->tx.info1c.md)
++            /* V.34 11.3.1.2.1: the answer modem's own MD duration is the one
++               it sent in INFO1a (zero here, so the second S/!S is skipped). */
++            if (s->tx.duplex  &&  s->tx.info1a.md)
+                 s->tx.stage = V34_TX_STAGE_SECOND_S;
+             else
+                 pp_baud_init(s);
+@@ -2292,6 +2319,33 @@
+ static void s_not_s_baud_init(v34_state_t *s)
+ {
+     span_log(&s->logging, SPAN_LOG_FLOW, "Tx - s_not_s_baud_init()\n");
++    /* Phase 3 and the data phase are transmitted at the carrier advertised
++       for the working rate in our own INFO1c. The engine previously kept the
++       high carrier fixed at restart, which made the training and data go out
++       on the wrong carrier whenever the low carrier was negotiated. */
++    /* Symbol rate selection (V.34 11.2.1.2.1): the call modem's INFO1a gives
++       the rate it transmits (baud_rate_a_to_c) and the rate it asks us to
++       transmit (baud_rate_c_to_a). Apply both before the phase-3 signals. */
++    /* BISECT: rate selection disabled */
++    {
++        const char *f = getenv("V34_FORCE_CARRIER");
++        if (f)
++            s->tx.high_carrier = (f[0] == 'h'  ||  f[0] == 'H');
++        else
++            s->tx.high_carrier = s->tx.info1c.rate_data[s->tx.baud_rate].use_high_carrier;
++        /*endif*/
++    }
++    s->tx.v34_carrier_phase_rate = dds_phase_ratef(carrier_frequency(s->tx.baud_rate, s->tx.high_carrier));
++    span_log(&s->logging, SPAN_LOG_FLOW,
++             "Tx - phase 3 symbol rates: tx %d, rx %d, carrier %s\n",
++             s->tx.baud_rate, s->rx.baud_rate, s->tx.high_carrier  ?  "high"  :  "low");
++    span_log(&s->logging, SPAN_LOG_FLOW, "Tx - phase 3 carrier: %s\n",
++             s->tx.high_carrier  ?  "high"  :  "low");
++    /* Phase 3 is also where the receiver must start: the far end's S/PP/TRN
++       arrive now, and the primary front end has to process them so the timing
++       and carrier loops can acquire and the S event can drive the transmit
++       sequence. The control-channel exchange after the post-J TRN switches
++       the receiver back (see trn_baud_init). */
+     s->tx.lastbit = complex_sig_set(TRAINING_SCALE(TRAINING_AMP), TRAINING_SCALE(0.0f));
+     s->tx.tone_duration = 0;
+     s->tx.current_modulator = V34_MODULATION_V34;
+@@ -2326,6 +2380,74 @@
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
++static complex_sig_t get_train_wait_baud(v34_state_t *s)
++{
++    /* V.34 11.3.1.2.4 to 11.3.1.2.6: after detecting the call modem's S-to-!S
++       transition the answer modem transmits silence while receiving PP, the
++       first 512T of TRN, and J.  J correlation is still TODO, so use a short
++       bounded acquisition interval covering PP (288T), 512T of TRN, and the
++       line/packet delay.  Keep it adjustable for hardware measurements. */
++    int wait_ms = 300;
++    const char *w = getenv("V34_ANSWER_TRAIN_WAIT_MS");
++    int wait_symbols;
++
++    if (w  &&  atoi(w) > 0)
++        wait_ms = atoi(w);
++    /*endif*/
++    wait_symbols = (int) (exact_baud_rate(s->tx.baud_rate)*wait_ms/1000.0);
++
++    if (++s->tx.tone_duration >= wait_symbols)
++        phase4_preamble_init(s);
++    /*endif*/
++    return zero;
++}
++/*- End of function --------------------------------------------------------*/
++
++static complex_sig_t get_phase4_s_baud(v34_state_t *s)
++{
++    float x;
++
++    /* V.34 11.4.1.2.1: the answer modem transmits S for 128T and !S for 16T,
++       followed by TRN. */
++    switch (s->tx.stage)
++    {
++    case V34_TX_STAGE_PHASE4_S:
++        if (++s->tx.tone_duration == 128)
++        {
++            s->tx.lastbit.re = -s->tx.lastbit.re;
++            s->tx.stage = V34_TX_STAGE_PHASE4_NOT_S;
++            s->tx.tone_duration = 0;
++        }
++        /*endif*/
++        break;
++    case V34_TX_STAGE_PHASE4_NOT_S:
++        if (++s->tx.tone_duration == 16)
++        {
++            s->tx.trn_after_j = true;
++            trn_baud_init(s);
++        }
++        /*endif*/
++        break;
++    }
++    /*endswitch*/
++    x = s->tx.lastbit.re;
++    s->tx.lastbit.re = s->tx.lastbit.im;
++    s->tx.lastbit.im = x;
++    return s->tx.lastbit;
++}
++/*- End of function --------------------------------------------------------*/
++
++static void phase4_preamble_init(v34_state_t *s)
++{
++    span_log(&s->logging, SPAN_LOG_FLOW, "Tx - phase 4 preamble (S/!S/TRN)\n");
++    s->tx.lastbit = complex_sig_set(TRAINING_SCALE(TRAINING_AMP), TRAINING_SCALE(0.0f));
++    s->tx.tone_duration = 0;
++    s->tx.current_modulator = V34_MODULATION_V34;
++    s->tx.stage = V34_TX_STAGE_PHASE4_S;
++    s->tx.current_getbaud = get_phase4_s_baud;
++}
++/*- End of function --------------------------------------------------------*/
++
+ static complex_sig_t get_trn_baud(v34_state_t *s)
+ {
+     static const uint16_t j_pattern[2] =
+@@ -2344,10 +2466,25 @@
+         bit = scramble(&s->tx, 1);
+         bit = (scramble(&s->tx, 1) << 1) | bit;
+         /* In half-duplex modem the length of the training comes from the INFOh message, in 35ms increments */
++        /* V.34 11.3.1.2.3 / 11.4.1.2.2: in duplex operation TRN is transmitted
++           for at least 512T and no longer than 2000 ms plus a round trip
++           delay. A real call (3am Systems annotated spectrogram and our own
++           captures) shows the training blocks lasting of the order of one to
++           two seconds, so the far end expects to train for that long. The
++           answerer, whose own receiver is not trained yet, uses the standard's
++           full training allowance. */
+         if ((!s->tx.duplex  &&  ++s->tx.tone_duration >= s->rx.infoh.length_of_trn*35*s->rx.infoh.baud_rate/1000)
+             ||
+             (s->tx.duplex  &&  ++s->tx.tone_duration >= 512))
+         {
++            if (s->tx.trn_after_j)
++            {
++                /* The post-J TRN of phase 4 is followed by MP/MPH */
++                s->tx.trn_after_j = false;
++                mp_or_mph_baud_init(s);
++                break;
++            }
++            /*endif*/
+             s->tx.stage = V34_TX_STAGE_J;
+             s->tx.persistence2 = j_pattern[0];
+             s->tx.tone_duration = 0;
+@@ -2364,18 +2501,25 @@
+         {
+             if (s->tx.duplex)
+             {
+-                if (s->rx.received_event == V34_EVENT_S)
++                if (s->rx.s_not_s_seen)
+                 {
+                     if (s->tx.calling_party)
+                     {
+-                        /* Change to J' */
++                        /* V.34 11.3.1.1.3: after receiving J the call modem may
++                           wait up to 500 ms, then transmits S 128T and !S 16T
++                           (and then PP). Change to J'. */
+                         s->tx.stage = V34_TX_STAGE_J_DASHED;
+                         s->tx.persistence2 = j_pattern[0];
+                         s->tx.tone_duration = 0;
+                     }
+                     else
+                     {
+-                        /* Send silence */
++                        /* Receive the caller's PP/TRN/J while transmitting
++                           silence, then begin the answerer's Phase 4. */
++                        s->rx.current_demodulator = V34_MODULATION_V34;
++                        s->rx.stage = V34_RX_STAGE_PRIMARY_CHANNEL;
++                        s->tx.tone_duration = 0;
++                        s->tx.current_getbaud = get_train_wait_baud;
+                     }
+                     /*endif*/
+                 }
+@@ -2403,6 +2547,9 @@
+         s->tx.persistence2 >>= 1;
+         if (++s->tx.tone_duration >= 16)
+         {
++            /* J' is followed by the post-J TRN (V.34 phase 4) */
++            s->tx.trn_after_j = true;
++            trn_baud_init(s);
+         }
+         /*endif*/
+         break;
+@@ -2418,6 +2565,16 @@
+     s->tx.tone_duration = 0;
+     s->tx.stage = V34_TX_STAGE_TRN;
+     s->tx.current_getbaud = get_trn_baud;
++    if (s->tx.trn_after_j)
++    {
++        /* The far end is sending its post-J TRN and then MP/MPH on the V.34
++           carrier's control channel. Follow it with the receiver. */
++        s->rx.current_demodulator = V34_MODULATION_CC;
++        s->rx.stage = V34_RX_STAGE_CC;
++        s->rx.mp_seen = 0;
++        s->rx.mp_count = -1;
++    }
++    /*endif*/
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
+@@ -2429,26 +2586,40 @@
+     bit = (scramble(&s->tx, get_data_bit(&s->tx)) << 1) | bit;
+     if (s->tx.txptr >= s->tx.txbits)
+     {
+-        if (1)
++        if (!s->tx.mp.mp_acknowledged)
+         {
+-            if (s->tx.duplex)
++            /* MP has been sent. Once the far end's MP has been received we
++               can acknowledge it (the MP' phase); otherwise repeat MP. */
++            if (++s->tx.mp_tx_count >= 2  &&  s->rx.mp_seen >= 1)
+             {
+-                /* See if we need to set the acknowledge bit, so MP becomes MP' */
+-                if (1)
+-                {
+-                    s->tx.mp.mp_acknowledged = 1;
+-                    /* We need to rebuild the message we send */
+-                    s->tx.txbits = mp_sequence_tx(&s->tx, &s->tx.mp);
+-                }
+-                /*endif*/
++                span_log(&s->logging, SPAN_LOG_FLOW, "Tx - far MP received, sending MP'\n");
++                s->tx.mp.mp_acknowledged = 1;
++                s->tx.txbits = mp_sequence_tx(&s->tx, &s->tx.mp);
++                s->tx.txptr = 0;
++                s->tx.mp_tx_count = 0;
++            }
++            else
++            {
++                s->tx.txptr = 0;
+             }
+             /*endif*/
+-            /* Restart the message */
+-            s->tx.txptr = 0;
+         }
+         else
+         {
+-            e_baud_init(s);
++            /* V.34 11.4.1.2.3: keep sending MP' until we have both sent an
++               MP' and received MP' (or E) from the far end.  Sending E after
++               an arbitrary two copies races a real modem that is still
++               completing its unacknowledged MP sequence. */
++            ++s->tx.mp_tx_count;
++            if (s->tx.mp_tx_count >= 1  &&  s->rx.mp_acknowledged_seen)
++            {
++                span_log(&s->logging, SPAN_LOG_FLOW, "Tx - far MP' received, sending E\n");
++                e_baud_init(s);
++                s->tx.diff = (s->tx.diff + bit) & 3;
++                return training_constellation_4[s->tx.diff];
++            }
++            /*endif*/
++            s->tx.txptr = 0;
+         }
+         /*endif*/
+     }
+@@ -2461,7 +2632,41 @@
+ static void mp_or_mph_baud_init(v34_state_t *s)
+ {
+     span_log(&s->logging, SPAN_LOG_FLOW, "Tx - mp_baud_init()\n");
+-    s->tx.current_modulator = V34_MODULATION_V34;
++    /* The MP/MPH exchange is carried on the control channel, which the
++       receiver decodes in its CC demodulator. */
++    s->tx.current_modulator = V34_MODULATION_CC;
++    s->tx.mp_tx_count = 0;
++    /* Fill in the MP/MPH message. Upstream never initialised these fields, so
++       the message went out announcing zero bit rates and an empty symbol rate
++       mask, which no far end can accept. The rates are this modem's working
++       parameters; the symbol rate mask lists every symbol rate this engine
++       supports (bits 0..5 for the six V.34 symbol rates). */
++    if (s->tx.duplex)
++    {
++        s->tx.mp.type = 0;
++        s->tx.mp.bit_rate_a_to_c = s->rx.parms.bit_rate/2400;
++        s->tx.mp.bit_rate_c_to_a = s->tx.parms.bit_rate/2400;
++        s->tx.mp.aux_channel_supported = 0;
++        s->tx.mp.trellis_size = V34_TRELLIS_16;
++        s->tx.mp.use_non_linear_encoder = false;
++        s->tx.mp.expanded_shaping = false;
++        /* Advertise only rates up to the selected maximum. Real modems reject
++           an MP whose capability mask contradicts its maximum-rate fields. */
++        s->tx.mp.signalling_rate_mask = (1U << (s->tx.parms.bit_rate/2400)) - 1U;
++        s->tx.mp.asymmetric_rates_allowed = false;
++    }
++    else
++    {
++        s->tx.mph.type = 0;
++        s->tx.mph.max_data_rate = s->tx.parms.bit_rate/2400;
++        s->tx.mph.control_channel_2400 = 0;
++        s->tx.mph.trellis_size = V34_TRELLIS_16;
++        s->tx.mph.use_non_linear_encoder = false;
++        s->tx.mph.expanded_shaping = false;
++        s->tx.mph.signalling_rate_mask = (1U << (s->tx.parms.bit_rate/2400)) - 1U;
++        s->tx.mph.asymmetric_rates_allowed = false;
++    }
++    /*endif*/
+     if (s->tx.duplex)
+     {
+         s->tx.txbits = mp_sequence_tx(&s->tx, &s->tx.mp);
+@@ -2478,6 +2683,59 @@
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
++/* Primary-channel data generator (our addition).
++
++   The mapping engine (v34_get_mapping_frame) consumes data bits and produces
++   one mapping frame: eight 2D symbols in Q9.7 format. This generator serves
++   those symbols one per baud through the primary-channel modulator. */
++static complex_sig_t get_data_baud(v34_state_t *s)
++{
++    int i;
++    complex_sig_t z;
++
++    if (s->tx.data_baud_pos >= 8)
++    {
++        v34_get_mapping_frame(&s->tx, s->tx.data_bits);
++        s->tx.data_baud_pos = 0;
++        /* Enable V34_SYM_TRACE to log the first four frames of each
++           superframe, for comparing against a waveform capture. */
++        if (getenv("V34_SYM_TRACE")  &&  s->tx.super_frame < 2  &&  s->tx.data_frame < 8)
++            span_log(&s->logging, SPAN_LOG_FLOW, "SYM %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
++                     s->tx.data_frame,
++                     s->tx.data_bits[0], s->tx.data_bits[1], s->tx.data_bits[2], s->tx.data_bits[3],
++                     s->tx.data_bits[4], s->tx.data_bits[5], s->tx.data_bits[6], s->tx.data_bits[7],
++                     s->tx.data_bits[8], s->tx.data_bits[9], s->tx.data_bits[10], s->tx.data_bits[11],
++                     s->tx.data_bits[12], s->tx.data_bits[13], s->tx.data_bits[14], s->tx.data_bits[15]);
++    }
++    /*endif*/
++    i = s->tx.data_baud_pos++;
++    /* Q9.7 to the modulator's signal units.  Training symbols use
++       TRAINING_AMP as one constellation unit; applying only the Q9.7
++       conversion made B1/data about 20 dB quieter than TRN, violating
++       10.1.3 and causing the far modem to lose carrier at B1. */
++    z.re = (float) s->tx.data_bits[2*i]*(0.7071068f*TRAINING_AMP)/128.0f;
++    z.im = (float) s->tx.data_bits[2*i + 1]*(0.7071068f*TRAINING_AMP)/128.0f;
++    return z;
++}
++/*- End of function --------------------------------------------------------*/
++
++static void data_baud_init(v34_state_t *s)
++{
++    span_log(&s->logging, SPAN_LOG_FLOW, "Tx - data_baud_init()\n");
++    s->tx.tone_duration = 0;
++    s->tx.stage = V34_TX_STAGE_DATA;
++    s->tx.current_modulator = V34_MODULATION_V34;
++    s->tx.current_getbaud = get_data_baud;
++    s->tx.data_baud_pos = 8;
++    /* No timing reset here. The control-channel modulator keeps its own baud
++       phase and filter buffer, so the primary channel's symbol grid and
++       pulse-shaping history are exactly as the training sequence left them,
++       and the data phase continues that grid. The receiver, which also keeps
++       its primary timing through the control exchanges, therefore finds the
++       data on the grid it trained on. */
++}
++/*- End of function --------------------------------------------------------*/
++
+ static complex_sig_t get_e_baud(v34_state_t *s)
+ {
+     static const uint16_t e_pattern[2] =
+@@ -2487,14 +2745,28 @@
+     };
+     int bit;
+ 
++    if (s->tx.duplex)
++    {
++        /* In duplex mode E is 20 ones in the descrambled control-channel
++           bit stream: pass constant ones through the scrambler, as the
++           receiver looks for 20 consecutive ones after descrambling. */
++        bit = scramble(&s->tx, 1);
++        bit = (scramble(&s->tx, 1) << 1) | bit;
++        s->tx.diff = (s->tx.diff + bit) & 3;
++        if (++s->tx.tone_duration >= 10)
++        {
++            /* The E sequence ends the control channel exchange. The primary
++               channel data mode begins (B1 is part of the first data frame
++               in this implementation). */
++            data_baud_init(s);
++        }
++        /*endif*/
++        return training_constellation_4[s->tx.diff];
++    }
++    /*endif*/
+     bit = (e_pattern[0] >> s->tx.tone_duration) & 1;
+     if (++s->tx.tone_duration == 16)
+     {
+-        //if (s->tx.duplex)
+-            /* CC comes next */
+-        //else
+-            /* B1 comes next */
+-        ///*endif*/
+     }
+     /*endif*/
+     return training_constellation_4[bit];
+@@ -2506,6 +2778,7 @@
+     span_log(&s->logging, SPAN_LOG_FLOW, "Tx - e_baud_init()\n");
+     s->tx.tone_duration = 0;
+     s->tx.stage = V34_TX_STAGE_HDX_E;
++    s->tx.current_modulator = V34_MODULATION_CC;
+     s->tx.current_getbaud = get_e_baud;
+ }
+ /*- End of function --------------------------------------------------------*/
+@@ -2721,12 +2994,18 @@
+         /* Root raised cosine pulse shaping at baseband */
+ #if defined(SPANDSP_USE_FIXED_POINT)
+         x = complex_seti32(0, 0);
+-        for (i = 0;  i < V34_TX_FILTER_STEPS;  i++)
+         {
+-            x.re += (int32_t) shaper[num - 1 - s->tx.baud_phase][i]*(int32_t) s->tx.rrc_filter[i + s->tx.rrc_filter_step].re;
+-            x.im += (int32_t) shaper[num - 1 - s->tx.baud_phase][i]*(int32_t) s->tx.rrc_filter[i + s->tx.rrc_filter_step].im;
++            int k = s->tx.rrc_filter_step;
++
++            for (i = 0;  i < V34_TX_FILTER_STEPS;  i++)
++            {
++                x.re += (int32_t) shaper[num - 1 - s->tx.baud_phase][i]*(int32_t) s->tx.rrc_filter_re[k];
++                x.im += (int32_t) shaper[num - 1 - s->tx.baud_phase][i]*(int32_t) s->tx.rrc_filter_im[k];
++                if (++k >= V34_TX_FILTER_STEPS)
++                    k = 0;
++            }
++            /*endfor*/
+         }
+-        /*endfor*/
+         /* Now create and modulate the carrier */
+         x.re >>= 4;
+         x.im >>= 4;
+@@ -2736,12 +3015,23 @@
+         amp[sample] = (int16_t) ((i*s->tx.gain) >> 15);
+ #else
+         x = zero;
+-        for (i = 0;  i < V34_TX_FILTER_STEPS;  i++)
+         {
+-            x.re += shaper[num - 1 - s->tx.baud_phase][i]*s->tx.rrc_filter_re[i + s->tx.rrc_filter_step];
+-            x.im += shaper[num - 1 - s->tx.baud_phase][i]*s->tx.rrc_filter_im[i + s->tx.rrc_filter_step];
++            /* The pulse shaping buffer is V34_TX_FILTER_STEPS long and read
++               circularly (the same semantics as vec_circular_dot_prod*,
++               which the control-channel modulator uses). Upstream indexed it
++               linearly, reading past the end of the buffer for every symbol
++               after the first, which corrupted the data-mode waveform. */
++            int k = s->tx.rrc_filter_step;
++
++            for (i = 0;  i < V34_TX_FILTER_STEPS;  i++)
++            {
++                x.re += shaper[num - 1 - s->tx.baud_phase][i]*s->tx.rrc_filter_re[k];
++                x.im += shaper[num - 1 - s->tx.baud_phase][i]*s->tx.rrc_filter_im[k];
++                if (++k >= V34_TX_FILTER_STEPS)
++                    k = 0;
++            }
++            /*endfor*/
+         }
+-        /*endfor*/
+         /* Now create and modulate the carrier */
+         z = dds_complexf(&(s->tx.carrier_phase), s->tx.v34_carrier_phase_rate);
+         /* Don't bother saturating. We should never clip. */
+@@ -2773,30 +3063,30 @@
+        half-duplex control channel. */
+     for (sample = 0;  sample < max_len;  sample++)
+     {
+-        if ((s->tx.baud_phase += 3) >= 40)
++        if ((s->tx.cc_baud_phase += 3) >= 40)
+         {
+-            s->tx.baud_phase -= 40;
++            s->tx.cc_baud_phase -= 40;
+             v = s->tx.current_getbaud(s);
+-            s->tx.rrc_filter_re[s->tx.rrc_filter_step] = v.re;
+-            s->tx.rrc_filter_im[s->tx.rrc_filter_step] = v.im;
++            s->tx.cc_rrc_filter_re[s->tx.cc_rrc_filter_step] = v.re;
++            s->tx.cc_rrc_filter_im[s->tx.cc_rrc_filter_step] = v.im;
+ // printf("CC baud %10.5f %10.5f - %10.5f\n",
+ //        s->tx.rrc_filter_re[s->tx.rrc_filter_step],
+ //        s->tx.rrc_filter_im[s->tx.rrc_filter_step],
+ //        s->tx.gain);
+-            if (++s->tx.rrc_filter_step >= V34_INFO_TX_FILTER_STEPS)
+-                s->tx.rrc_filter_step = 0;
++            if (++s->tx.cc_rrc_filter_step >= V34_INFO_TX_FILTER_STEPS)
++                s->tx.cc_rrc_filter_step = 0;
+             /*endif*/
+         }
+         /*endif*/
+         /* Root raised cosine pulse shaping at baseband */
+ #if defined(SPANDSP_USE_FIXED_POINT)
+-        x.re = vec_circular_dot_prodi16(s->tx.rrc_filter_re, tx_pulseshaper[TX_PULSESHAPER_COEFF_SETS - 1 - s->tx.baud_phase], V34_INFO_TX_FILTER_STEPS, s->tx.rrc_filter_step) >> 4;
+-        x.im = vec_circular_dot_prodi16(s->tx.rrc_filter_im, tx_pulseshaper[TX_PULSESHAPER_COEFF_SETS - 1 - s->tx.baud_phase], V34_INFO_TX_FILTER_STEPS, s->tx.rrc_filter_step) >> 4;
++        x.re = vec_circular_dot_prodi16(s->tx.cc_rrc_filter_re, tx_pulseshaper[TX_PULSESHAPER_COEFF_SETS - 1 - s->tx.cc_baud_phase], V34_INFO_TX_FILTER_STEPS, s->tx.cc_rrc_filter_step) >> 4;
++        x.im = vec_circular_dot_prodi16(s->tx.cc_rrc_filter_im, tx_pulseshaper[TX_PULSESHAPER_COEFF_SETS - 1 - s->tx.cc_baud_phase], V34_INFO_TX_FILTER_STEPS, s->tx.cc_rrc_filter_step) >> 4;
+         /* Now create and modulate the carrier */
+         z = dds_complexi(&s->tx.carrier_phase, s->tx.cc_carrier_phase_rate);
+         /* Don't bother saturating. We should never clip. */
+         iamp = (x.re*z.re - x.im*z.im) >> 15;
+-        if (s->tx.guard_phase_rate  &&  (s->tx.rrc_filter[s->tx.rrc_filter_step].re != 0  ||  s->tx.rrc_filter[s->tx.rrc_filter_step].im != 0))
++        if (s->tx.guard_phase_rate  &&  (s->tx.cc_rrc_filter_re[s->tx.cc_rrc_filter_step] != 0  ||  s->tx.cc_rrc_filter_im[s->tx.cc_rrc_filter_step] != 0))
+         {
+             /* Add the guard tone */
+             iamp += dds_mod(&s->tx.guard_phase, s->tx.guard_phase_rate, s->tx.cjo, 0);
+@@ -2804,12 +3094,12 @@
+         /*endif*/
+         amp[sample] = (int16_t) (((int32_t) iamp*s->tx.gain) >> 15);
+ #else
+-        x.re = vec_circular_dot_prodf(s->tx.rrc_filter_re, tx_pulseshaper[TX_PULSESHAPER_COEFF_SETS - 1 - s->tx.baud_phase], V34_INFO_TX_FILTER_STEPS, s->tx.rrc_filter_step);
+-        x.im = vec_circular_dot_prodf(s->tx.rrc_filter_im, tx_pulseshaper[TX_PULSESHAPER_COEFF_SETS - 1 - s->tx.baud_phase], V34_INFO_TX_FILTER_STEPS, s->tx.rrc_filter_step);
++        x.re = vec_circular_dot_prodf(s->tx.cc_rrc_filter_re, tx_pulseshaper[TX_PULSESHAPER_COEFF_SETS - 1 - s->tx.cc_baud_phase], V34_INFO_TX_FILTER_STEPS, s->tx.cc_rrc_filter_step);
++        x.im = vec_circular_dot_prodf(s->tx.cc_rrc_filter_im, tx_pulseshaper[TX_PULSESHAPER_COEFF_SETS - 1 - s->tx.cc_baud_phase], V34_INFO_TX_FILTER_STEPS, s->tx.cc_rrc_filter_step);
+         /* Now create and modulate the carrier */
+         z = dds_complexf(&s->tx.carrier_phase, s->tx.cc_carrier_phase_rate);
+         famp = x.re*z.re - x.im*z.im;
+-        if (s->tx.guard_phase_rate  &&  (s->tx.rrc_filter_re[s->tx.rrc_filter_step] != 0.0f  ||  s->tx.rrc_filter_im[s->tx.rrc_filter_step] != 0.0f))
++        if (s->tx.guard_phase_rate  &&  (s->tx.cc_rrc_filter_re[s->tx.cc_rrc_filter_step] != 0.0f  ||  s->tx.cc_rrc_filter_im[s->tx.cc_rrc_filter_step] != 0.0f))
+         {
+             /* Add the guard tone */
+             famp += dds_modf(&s->tx.guard_phase, s->tx.guard_phase_rate, s->tx.guard_level, 0);
 --- v34rx.c.orig
 +++ v34rx.c
 @@ -165,7 +165,10 @@
@@ -11,7 +602,131 @@
  
  static int descramble(v34_rx_state_t *s, int in_bit)
  {
-@@ -1189,6 +1192,7 @@
+@@ -611,51 +614,69 @@
+ 
+ static void viterbi_calculate_branch_errors(viterbi_t *s, complexi16_t xy[2][4], int invert)
+ {
+-    static const uint8_t kk[8][4] =
+-    {
+-        {0, 0, 2, 2},
+-        {0, 1, 2, 3},
+-        {0, 2, 2, 0},
+-        {0, 3, 2, 1},
+-        {1, 1, 3, 3},
+-        {1, 2, 3, 0},
+-        {1, 3, 3, 1},
+-        {1, 0, 3, 2}
+-    };
+-    int br;
+-    int n;
+-    int inv;
+-    int error0;
+-    int error1;
+-    int smaller;
+     int k0;
+     int k1;
++    int br;
++    int a;
++    int b;
++    int err;
++    complexi16_t p;
+ 
+-    inv = (invert)  ?  4  :  0;
+-    for (br = 0;  br < 8;  br++)
+-    {
+-        n = br ^ inv;
+-        error0 = s->error[0][kk[n][0]] + s->error[1][kk[n][1]];
+-        error1 = s->error[0][kk[n][2]] + s->error[1][kk[n][3]];
+-        if (error0 < error1)
+-        {
+-            smaller = error0;
+-            k0 = kk[n][0];
+-            k1 = kk[n][1];
++    /* The trellis transition depends only on the low two bits of the encoder
++       input selected by Table 13/V.34 from the two 2D subset labels of the
++       symbol pair, so there are four branch metrics. Deriving the branch from
++       the candidates' actual 2D subset labels is essential: quantize_n_ways()
++       orders its candidates by position relative to the received point, not by
++       subset, so fixed candidate indices cannot identify a subset. */
++    for (br = 0;  br < 4;  br++)
++    {
++        s->branch_error[br] = 0x7FFF;
++        s->vit[s->ptr].branch_error_x[br] = 0x7FFF;
++    }
++    /*endfor*/
++    for (k0 = 0;  k0 < 4;  k0++)
++    {
++        p.re = xy[0][k0].re >> 7;
++        p.im = xy[0][k0].im >> 7;
++        a = get_binary_subset_label(&p);
++        for (k1 = 0;  k1 < 4;  k1++)
++        {
++            p.re = xy[1][k1].re >> 7;
++            p.im = xy[1][k1].im >> 7;
++            b = get_binary_subset_label(&p);
++            br = conv_encode_input[a][b] & 3;
++            if (invert)
++                br ^= 2;
++            /*endif*/
++            err = s->error[0][k0] + s->error[1][k1];
++            if (err < s->branch_error[br])
++            {
++                s->branch_error[br] = err;
++                s->vit[s->ptr].branch_error_x[br] = err;
++                s->vit[s->ptr].bb[0][br] = xy[0][k0];
++                s->vit[s->ptr].bb[1][br] = xy[1][k1];
++            }
++            /*endif*/
+         }
+-        else
++        /*endfor*/
++    }
++    /*endfor*/
++    if (getenv("V34_TRACE_CONV"))
++    {
++        static int rx_conv_step;
++        fprintf(stderr, "RXCONV %d", rx_conv_step++);
++        for (br = 0;  br < 4;  br++)
++            fprintf(stderr, " %d", s->branch_error[br]);
++        /*endfor*/
++        for (br = 0;  br < 4;  br++)
+         {
+-            smaller = error1;
+-            k0 = kk[n][2];
+-            k1 = kk[n][3];
++            fprintf(stderr, " c0%d=%d,%d", br, xy[0][br].re, xy[0][br].im);
++            fprintf(stderr, " c1%d=%d,%d", br, xy[1][br].re, xy[1][br].im);
+         }
+-        /*endif*/
+-        s->branch_error[br] = smaller;
+-        s->vit[s->ptr].branch_error_x[br] = smaller;
+-        s->vit[s->ptr].bb[0][br] = xy[0][k0];
+-        s->vit[s->ptr].bb[1][br] = xy[1][k1];
++        /*endfor*/
++        fprintf(stderr, "\n");
+     }
+-    /*endfor*/
++    /*endif*/
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
+@@ -741,15 +762,6 @@
+ //printf(" %2d", next_state);
+     }
+     /*endfor*/
+-    for (i = 0;  i < 8;  i++)
+-    {
+-        if (s->vit[last_baud].branch_error_x[i] == 0)
+-        {
+-            branch = i;
+-            break;
+-        }
+-    }
+-    /*endfor*/
+     branch = s->vit[last_baud].pts[next_state];
+ //printf(" (%d)\n", branch);
+ 
+@@ -1189,6 +1201,7 @@
                  /* The next info message will be INFO1a */
                  s->target_bits = 70 - (4 + 8 + 4);
                  s->stage = V34_RX_STAGE_INFO1A;
@@ -19,7 +734,7 @@
                  break;
              default:
                  span_log(s->logging, SPAN_LOG_FLOW, "Rx - reversal 1 in tone A\n");
-@@ -1340,6 +1344,111 @@
+@@ -1340,6 +1353,241 @@
  }
  /*- End of function --------------------------------------------------------*/
  
@@ -40,9 +755,56 @@
 +{
 +    float fc;
 +
++    /* The S signal and the phase-3 training are transmitted by the far end on
++       the carrier it advertised for the working rate in its INFO1 message. */
++    {
++        const char *f = getenv("V34_FORCE_CARRIER");
++        if (f)
++            s->high_carrier = (f[0] == 'h'  ||  f[0] == 'H');
++        else
++            s->high_carrier = (s->calling_party)  ?  s->info1c.rate_data[s->baud_rate].use_high_carrier
++                                                 :  s->info1a.use_high_carrier;
++        /*endif*/
++    }
++    s->v34_carrier_phase_rate = dds_phase_ratef(carrier_frequency(s->baud_rate, s->high_carrier));
 +    fc = carrier_frequency(s->baud_rate, s->high_carrier);
 +    s->s_det_phase_fc = 0;
 +    s->s_det_rate_fc = dds_phase_ratef(fc);
++    /* Second candidate carrier: the far end's phase-3 carrier has been seen
++       to differ from the one its INFO1 message suggests, so the detector
++       checks both and adopts the one that hits. */
++    s->s_det_fc2_high = !s->high_carrier;
++    s->s_det_phase_fc2 = 0;
++    s->s_det_rate_fc2 = dds_phase_ratef(carrier_frequency(s->baud_rate, s->s_det_fc2_high));
++    s->s_det_acc_a2_re = 0.0f;
++    s->s_det_acc_a2_im = 0.0f;
++    {
++        /* Candidate carriers: both carriers of every supported baud rate. The
++           far end's phase-3 symbol rate, and therefore its carrier, is not
++           known at S detection time (real-line capture shows a 2400 baud
++           training from a modem whose INFO1 exchanges list other rates). */
++        int b;
++        int hh;
++        s->s_det_multi_count = 0;
++        for (b = 0;  b < 6;  b++)
++        {
++            for (hh = 0;  hh < 2;  hh++)
++            {
++                int idx = s->s_det_multi_count;
++                s->s_det_multi_baud[idx] = b;
++                s->s_det_multi_high[idx] = hh;
++                s->s_det_phase_multi[idx] = 0;
++                s->s_det_rate_multi[idx] = dds_phase_ratef(carrier_frequency(b, hh));
++                s->s_det_acc_multi_re[idx] = 0.0f;
++                s->s_det_acc_multi_im[idx] = 0.0f;
++                s->s_det_multi_count++;
++            }
++            /*endfor*/
++        }
++        /*endfor*/
++    }
++    s->s_det_multi_carrier_high = false;
++    s->s_det_multi_baud_rate = 0;
 +    /* The second correlator runs at this side's control-channel carrier. The
 +       phase-1 A/B tones and the INFO messages are coherent there, while the
 +       S signal is not, so this acts as a rejection filter. */
@@ -75,6 +837,21 @@
 +        s->s_det_acc_a_re += x*z.re;
 +        s->s_det_acc_a_im -= x*z.im;
 +        dds_advancef(&s->s_det_phase_fc, s->s_det_rate_fc);
++        z = dds_lookup_complexf(s->s_det_phase_fc2);
++        s->s_det_acc_a2_re += x*z.re;
++        s->s_det_acc_a2_im -= x*z.im;
++        dds_advancef(&s->s_det_phase_fc2, s->s_det_rate_fc2);
++        {
++            int ci;
++            for (ci = 0;  ci < s->s_det_multi_count;  ci++)
++            {
++                z = dds_lookup_complexf(s->s_det_phase_multi[ci]);
++                s->s_det_acc_multi_re[ci] += x*z.re;
++                s->s_det_acc_multi_im[ci] -= x*z.im;
++                dds_advancef(&s->s_det_phase_multi[ci], s->s_det_rate_multi[ci]);
++            }
++            /*endfor*/
++        }
 +        z = dds_lookup_complexf(s->s_det_phase_nyq);
 +        s->s_det_acc_b_re += x*z.re;
 +        s->s_det_acc_b_im -= x*z.im;
@@ -83,13 +860,17 @@
 +        if (++s->s_det_count >= V34_S_DET_BLOCK)
 +        {
 +            float a;
++            float a2;
 +            float b;
 +            float rms;
 +            float an;
++            float an2;
 +            float bn;
 +            float rn;
++            float best_ratio = 0.0f;
 +
 +            a = sqrtf(s->s_det_acc_a_re*s->s_det_acc_a_re + s->s_det_acc_a_im*s->s_det_acc_a_im);
++            a2 = sqrtf(s->s_det_acc_a2_re*s->s_det_acc_a2_re + s->s_det_acc_a2_im*s->s_det_acc_a2_im);
 +            b = sqrtf(s->s_det_acc_b_re*s->s_det_acc_b_re + s->s_det_acc_b_im*s->s_det_acc_b_im);
 +            rms = sqrtf(s->s_det_power);
 +            /* Normalised statistics, measured on the real waveform: the
@@ -99,24 +880,88 @@
 +               Detect: coherent carrier energy present, control-channel tone
 +               absent, sustained over consecutive blocks. */
 +            an = a/V34_S_DET_BLOCK;
++            an2 = a2/V34_S_DET_BLOCK;
 +            bn = b/V34_S_DET_BLOCK;
 +            rn = rms/sqrtf(V34_S_DET_BLOCK);
-+            if (rn > 3000.0f  &&  an > 0.20f*rn  &&  bn < 0.15f*rn)
-+                s->s_det_hits++;
-+            else
-+                s->s_det_hits = 0;
-+            /*endif*/
-+            span_log(s->logging, SPAN_LOG_FLOW, "Rx - S detector: an/rn=%.3f bn/rn=%.3f rn=%.0f hits=%d\n",
-+                     an/rn, bn/rn, rn, s->s_det_hits);
++            {
++                /* Multi-carrier evaluation. Thresholds are from real-line
++                   measurements: the far end's phase-3 bursts peak at 0.38 to
++                   0.53 normalised coherence with a block RMS around 1200 to
++                   1700, while the line noise floor stays below 0.05 and the
++                   control-channel signal gives a high coherence at its own
++                   carrier only (rejected by the bn term when it is active). */
++                int ci;
++                int best_idx = -1;
++                for (ci = 0;  ci < s->s_det_multi_count;  ci++)
++                {
++                    float c;
++                    c = sqrtf(s->s_det_acc_multi_re[ci]*s->s_det_acc_multi_re[ci]
++                              + s->s_det_acc_multi_im[ci]*s->s_det_acc_multi_im[ci]);
++                    c /= V34_S_DET_BLOCK;
++                    if (rn > 0.0f  &&  c/rn > best_ratio)
++                    {
++                        best_ratio = c/rn;
++                        best_idx = ci;
++                    }
++                    /*endif*/
++                }
++                /*endfor*/
++                if (rn > 700.0f  &&  best_ratio > 0.25f  &&  bn < 0.25f*rn)
++                {
++                    s->s_det_hits++;
++                    if (best_idx >= 0)
++                    {
++                        s->s_det_multi_baud_rate = s->s_det_multi_baud[best_idx];
++                        s->s_det_multi_carrier_high = s->s_det_multi_high[best_idx];
++                    }
++                    /*endif*/
++                }
++                else if (rn > 3000.0f  &&  (an > 0.20f*rn  ||  an2 > 0.20f*rn)  &&  bn < 0.15f*rn)
++                {
++                    s->s_det_hits++;
++                    s->s_det_hit_high = (an2 > an)  ?  s->s_det_fc2_high  :  s->high_carrier;
++                }
++                else
++                {
++                    /* Packet and block boundaries can place a short window
++                       across the alternating S waveform's cancellation null.
++                       Decay confidence instead of discarding all prior signal
++                       evidence; acquisition still requires repeated coherent
++                       carrier blocks and rejects the control-channel tone. */
++                    if (s->s_det_hits > 0)
++                        s->s_det_hits--;
++                    /*endif*/
++                }
++                /*endif*/
++            }
++            span_log(s->logging, SPAN_LOG_FLOW, "Rx - S detector: an/rn=%.3f best=%.3f bn/rn=%.3f rn=%.0f hits=%d\n",
++                     an/rn, best_ratio, bn/rn, rn, s->s_det_hits);
 +            if (s->s_det_hits >= V34_S_DET_HITS  &&  !s->s_signal_seen)
 +            {
 +                s->s_signal_seen = true;
 +                s->received_event = V34_EVENT_S;
-+                span_log(s->logging, SPAN_LOG_FLOW, "Rx - S signal detected (V34_EVENT_S)\n");
++                /* INFO1 selected the Phase 3 rate and carrier. The strongest
++                   multi-rate S correlator bin can be an alias, so use it to
++                   detect S without replacing the negotiated parameters. */
++                s->v34_carrier_phase_rate = dds_phase_ratef(carrier_frequency(s->baud_rate, s->high_carrier));
++                span_log(s->logging, SPAN_LOG_FLOW,
++                         "Rx - S signal detected (V34_EVENT_S), baud code %d, carrier %s\n",
++                         s->baud_rate, s->high_carrier  ?  "high"  :  "low");
 +            }
 +            /*endif*/
 +            s->s_det_acc_a_re = 0.0f;
 +            s->s_det_acc_a_im = 0.0f;
++            s->s_det_acc_a2_re = 0.0f;
++            s->s_det_acc_a2_im = 0.0f;
++            {
++                int ci;
++                for (ci = 0;  ci < s->s_det_multi_count;  ci++)
++                {
++                    s->s_det_acc_multi_re[ci] = 0.0f;
++                    s->s_det_acc_multi_im[ci] = 0.0f;
++                }
++                /*endfor*/
++            }
 +            s->s_det_acc_b_re = 0.0f;
 +            s->s_det_acc_b_im = 0.0f;
 +            s->s_det_power = 0.0f;
@@ -131,7 +976,15 @@
  static int info_rx(v34_rx_state_t *s, const int16_t amp[], int len)
  {
      int i;
-@@ -1436,6 +1545,7 @@
+@@ -1414,7 +1662,6 @@
+         if (abs(angle - s->last_angles[1]) > DDS_PHASE(90.0f)  &&  s->blip_duration > 3)
+         {
+             put_info_bit(s, 1, i);
+-            s->duration = 0;
+             s->blip_duration = 0;
+         }
+         else
+@@ -1436,6 +1683,7 @@
          dds_advancef(&s->carrier_phase, s->cc_carrier_phase_rate);
      }
      /*endfor*/
@@ -139,7 +992,7 @@
      return 0;
  }
  /*- End of function --------------------------------------------------------*/
-@@ -1549,7 +1659,7 @@
+@@ -1549,7 +1797,7 @@
              i = -i;
          /*endif*/
          //printf("v = %10.5f %5d - %f %f %d %d\n", v, i, p, s->pri_ted.baud_phase, s->total_baud_timing_correction);
@@ -148,7 +1001,7 @@
          s->total_baud_timing_correction += i;
      }
      /*endif*/
-@@ -1572,7 +1682,7 @@
+@@ -1572,7 +1820,7 @@
              i = -i;
          /*endif*/
          //printf("v = %10.5f %5d - %f %f %d\n", v, i, p, s->pri_ted.baud_phase, s->total_baud_timing_correction);
@@ -157,7 +1010,7 @@
          s->total_baud_timing_correction += i;
      }
      /*endif*/
-@@ -1971,6 +2081,7 @@
+@@ -1971,6 +2219,7 @@
                  s->received_event = V34_EVENT_L2_SEEN;
                  s->current_demodulator = V34_MODULATION_TONES;
                  s->stage = (s->calling_party)  ?  V34_RX_STAGE_TONE_A  :  V34_RX_STAGE_INFO1C;
@@ -165,8 +1018,18 @@
              }
              /*endif*/
          }
-@@ -2042,7 +2153,29 @@
-                and the start of actual user data */
+@@ -2036,13 +2285,57 @@
+             continue;
+         }
+         /*endif*/
+-        if (s->mp_seen == 1  &&  (s->bitstream & 0xFFFFF) == 0xFFFFF)
++        if (s->mp_seen == 1  &&  !s->data_rx_active  &&  (s->bitstream & 0xFFFFF) == 0xFFFFF)
+         {
+             /* E is 20 consecutive ones, which signals the end of the MPh messages,
+-               and the start of actual user data */
++               and the start of actual user data. This must latch: the bitstream
++               window holds 20 ones for several more bits, and re-running the
++               switch would reset the data collection and the primary timing again. */
              if (s->duplex)
              {
 -                /* TODO: start data reception */
@@ -175,36 +1038,59 @@
 +                s->received_event = V34_EVENT_L2_SEEN;
 +                s->current_demodulator = V34_MODULATION_V34;
 +                s->stage = V34_RX_STAGE_PRIMARY_CHANNEL;
++                /* The primary channel is received at the carrier the far end
++                   advertised for the working rate in its INFO1 message. */
++                {
++                    const char *f = getenv("V34_FORCE_CARRIER");
++                    if (f)
++                        s->high_carrier = (f[0] == 'h'  ||  f[0] == 'H');
++                    else
++                        s->high_carrier = (s->calling_party)  ?  s->info1c.rate_data[s->baud_rate].use_high_carrier
++                                                             :  s->info1a.use_high_carrier;
++                    /*endif*/
++                }
++                s->v34_carrier_phase_rate = dds_phase_ratef(carrier_frequency(s->baud_rate, s->high_carrier));
++                create_godard_coeffs(&s->pri_ted,
++                                     carrier_frequency(s->baud_rate, s->high_carrier),
++                                     exact_baud_rate(s->baud_rate),
++                                     0.99f);
 +                s->data_rx_active = true;
 +                s->data_rx_count = 0;
-+                {
-+                    const char *p = getenv("V34_RX_INITPHASE");
-+                    /* Start the primary timing from the same clean state the
-+                       ideal-path test uses. The handshake leaves the sampling
-+                       phase, TED integrators and AGC wherever the control
-+                       channel left them, which is not aligned to the data
-+                       symbol grid. */
-+                    s->eq_put_step = p ? atoi(p) : 0;
-+                    memset(&s->pri_ted, 0, sizeof(s->pri_ted));
-+                    create_godard_coeffs(&s->pri_ted,
-+                                         carrier_frequency(s->baud_rate, s->high_carrier),
-+                                         exact_baud_rate(s->baud_rate),
-+                                         0.99f);
-+                    s->data_rx_agc_reset = true;
-+                }
++                span_log(s->logging, SPAN_LOG_FLOW, "Rx - primary carrier: %s\n",
++                         s->high_carrier  ?  "high"  :  "low");
++                if (getenv("V34_TRACE_DATA"))
++                    fprintf(stderr, "RXE %p eq_put_step=%d data_rx_symbol_count=%d step_2d=%d data_frame=%d super_frame=%d\n", (void *) s,
++                            s->eq_put_step, s->data_rx_symbol_count,
++                            s->step_2d, s->data_frame, s->super_frame);
++                /* Diagnostic only: force an initial sampling phase to measure
++                   whether symbol timing, rather than carrier phase, is the
++                   limit. Not part of the production path. */
++                if (getenv("V34_RX_INITPHASE"))
++                    s->eq_put_step = atoi(getenv("V34_RX_INITPHASE"));
++                /* No timing/carrier/equalizer reset here. The primary
++                   receiver's timing is frozen while the control channel is
++                   being demodulated, and the transmitter freezes its primary
++                   symbol grid for the same span, so resuming both here
++                   continues the grid on which the training sequence trained
++                   the timing, TED and equalizer. Resetting them discarded
++                   that convergence and re-acquired timing from an arbitrary
++                   sample with no training. */
 +                span_log(s->logging, SPAN_LOG_FLOW, "Rx - E seen, starting primary channel\n");
              }
              else
              {
-@@ -2325,12 +2458,55 @@
+@@ -2325,12 +2618,63 @@
  
      /* On alternate insertions we have a whole baud and must process it. */
      if ((s->baud_half ^= 1))
 +    {
          return;
 +    }
++    /*endif*/
++    if (!getenv("V34_NO_TED"))
++        pri_symbol_sync(s);
      /*endif*/
-     pri_symbol_sync(s);
+-    pri_symbol_sync(s);
  
      s->last_sample = *sample;
  
@@ -234,6 +1120,12 @@
 +            ri = re*s->data_rx_rot_im + im*s->data_rx_rot_re;
 +            s->data_rx_symbols[2*s->data_rx_count] = (int16_t) (rr*s->data_rx_scale);
 +            s->data_rx_symbols[2*s->data_rx_count + 1] = (int16_t) (ri*s->data_rx_scale);
++            if (getenv("V34_TRACE_DATA")  &&  s->data_rx_symbol_count < 256)
++                fprintf(stderr, "RXSYM %p %d %d %f %f %d %d\n", (void *) s,
++                        s->data_rx_symbol_count, (int) s->data_rx_count,
++                        rr, ri,
++                        s->data_rx_symbols[2*s->data_rx_count],
++                        s->data_rx_symbols[2*s->data_rx_count + 1]);
 +            if (++s->data_rx_count >= 8)
 +            {
 +                v34_put_mapping_frame(s, s->data_rx_symbols);
@@ -252,7 +1144,7 @@
  #if 0
      z = equalizer_get(s);
  
-@@ -2371,22 +2547,27 @@
+@@ -2371,22 +2715,27 @@
      float ii;
      float qq;
      float v;
@@ -289,7 +1181,113 @@
  // printf("XYX0 %d\n", len);
      for (i = 0;  i < len;  i++)
      {
-@@ -2694,6 +2875,30 @@
+@@ -2460,6 +2809,15 @@
+ #endif
+             zz.re = sample.re*z.re - sample.im*z.im;
+             zz.im = -sample.re*z.im - sample.im*z.re;
++            if (getenv("V34_TRACE_EMIT"))
++            {
++                static long emit_n;
++                if (emit_n < 48)
++                    fprintf(stderr, "EMIT %ld %.4f %.4f\n", emit_n, zz.re, zz.im);
++                /*endif*/
++                emit_n++;
++            }
++            /*endif*/
+             process_primary_half_baud(s, &zz);
+ 
+             //angle = arctan2(zz.im, zz.re);
+@@ -2491,14 +2849,30 @@
+     complexi16_t v;
+     complexi16_t y[2];
+ 
++    if (getenv("V34_TRACE_DEMAP"))
++    {
++        static long demap_n;
++        if (demap_n < 16)
++        {
++            fprintf(stderr, "DEMAPIN %ld", demap_n);
++            for (i = 0;  i < 16;  i++)
++                fprintf(stderr, " %d", bits[i]);
++            /*endfor*/
++            fprintf(stderr, "\n");
++        }
++        /*endif*/
++        demap_n++;
++    }
++    /*endif*/
++
+     /* Put the four 4D symbols (eight 2D symbols) of a mapping frame */
+-#define BYPASS_VITERBI
+     for (i = 0;  i < 8;  i++)
+     {
+         s->xt[0].re = bits[2*i];
+         s->xt[0].im = bits[2*i + 1];
+ //printf("AMZ %p [%6d, %6d] [%8.3f, %8.3f]\n", s, s->xt[0].re, s->xt[0].im, FP_Q9_7_TO_F(s->xt[0].re), FP_Q9_7_TO_F(s->xt[0].im));
+         s->yt = prediction_error_filter(s);
++        s->viterbi.vit[s->viterbi.ptr].rx_pt[i & 1] = s->yt;
+         quantize_n_ways(s->xy[i & 1], &s->yt);
+ //printf("CCC %p [%8.3f, %8.3f] [%8.3f, %8.3f] [%8.3f, %8.3f] [%8.3f, %8.3f]\n",
+ //       s,
+@@ -2548,6 +2922,57 @@
+             else
+             {
+                 viterbi_trace_back(&s->viterbi, y);
++                if (getenv("V34_TRACE_DEMAP"))
++                {
++                    static long y_n;
++                    if (y_n < 64)
++                        fprintf(stderr, "DEMAPY %ld %d %d %d %d\n", y_n, y[0].re, y[0].im, y[1].re, y[1].im);
++                    /*endif*/
++                    y_n++;
++                }
++                /*endif*/
++                {
++                    /* Decision directed carrier recovery. viterbi_trace_back()
++                       returns the symbols of the pipeline slot 15 steps back,
++                       and the received (prediction error filtered) points of
++                       that same slot were stored when it was processed, so the
++                       decision and the received point being paired belong to
++                       the same transmitted symbol time. */
++                    int lb = (s->viterbi.ptr - 15) & 0xF;
++                    const complexi16_t *rx_pt = s->viterbi.vit[lb].rx_pt;
++                    float cross_sum = 0.0f;
++                    float mag_sum = 0.0f;
++                    float err;
++                    int jj;
++
++                    for (jj = 0;  jj < 2;  jj++)
++                    {
++                        cross_sum += (float) (rx_pt[jj].im*y[jj].re - rx_pt[jj].re*y[jj].im);
++                        mag_sum += (float) (y[jj].re*y[jj].re + y[jj].im*y[jj].im);
++                    }
++                    /*endfor*/
++                    if (mag_sum > 0.0f)
++                    {
++                        /* sin(phase error), normalised so the loop gain does
++                           not depend on the symbol magnitude. */
++                        err = cross_sum/mag_sum;
++                        /* Adjust the one authoritative carrier oscillator that
++                           the primary receiver mixes with. The phase step is
++                           Kp radians per radian of error; Kp is small compared
++                           with the symbol rate, giving a loop time constant of
++                           tens of symbols. */
++                        s->carrier_phase -= (int32_t) (s->carrier_track_p*err*6.827e8f);
++                        s->v34_carrier_phase_rate -= (int32_t) (s->carrier_track_i*err);
++                        s->carrier_updates++;
++                        s->carrier_abs_error_sum += (err < 0.0f)  ?  -(double) err  :  (double) err;
++                        s->carrier_last_error = err;
++                        if (getenv("V34_CARRIER_DD")  &&  (s->carrier_updates%128) == 0)
++                            fprintf(stderr, "V34_CARRIER_DD %ld err=%9.5f phase=%10u rate=%d\n",
++                                    s->carrier_updates, err, s->carrier_phase, s->v34_carrier_phase_rate);
++                        /*endif*/
++                    }
++                    /*endif*/
++                }
+ #endif
+                 /* We now have two points in y to be decoded. They are in Q9.7 format. */
+ //printf("AAA %p [%8.3f, %8.3f] [%8.3f, %8.3f]\n",
+@@ -2694,6 +3119,30 @@
      s->rx.baud_rate = baud_rate;
      s->rx.bit_rate = bit_rate;
      s->rx.high_carrier = high_carrier;
@@ -320,8 +1318,35 @@
  
      s->rx.v34_carrier_phase_rate = dds_phase_ratef(carrier_frequency(s->rx.baud_rate, s->rx.high_carrier));
      s->rx.cc_carrier_phase_rate = dds_phase_ratef((s->calling_party)  ?  2400.0f  :  1200.0f);
-@@ -2713,9 +2918,13 @@
-     s->rx.carrier_track_p = 40000.0f;
+@@ -2709,13 +3158,38 @@
+     s->rx.agc_scaling_save = 0.0f;
+     s->rx.agc_scaling = 0.0017f/V34_RX_PULSESHAPER_GAIN;
+     //equalizer_reset(&s->rx);
+-    s->rx.carrier_track_i = 5000.0f;
+-    s->rx.carrier_track_p = 40000.0f;
++    /* Carrier tracking loop gains for the primary channel. The phase error is
++       normalised (sin of the error), so the proportional gain is the fraction
++       of the phase error corrected per update. The integral gain likewise
++       corrects the oscillator rate by this fraction of the error per update.
++       A proportional gain of 0.02 gives an acquisition time constant of the
++       order of 50 symbol updates; the integral gain is small enough to stay
++       stable at this update rate and to correct the small clock differences
++       between the two ends of a real connection. */
++    s->rx.carrier_track_i = 1.0e-5f;
++    s->rx.carrier_track_p = 2.0e-2f;
++    {
++        /* Diagnostic override, so a run can be repeated with the carrier loop
++           disabled (zero gains) to separate loop behaviour from other
++           effects. */
++        const char *kp = getenv("V34_CARRIER_KP");
++        const char *ki = getenv("V34_CARRIER_KI");
++        if (kp)
++            s->rx.carrier_track_p = (float) atof(kp);
++        /*endif*/
++        if (ki)
++            s->rx.carrier_track_i = (float) atof(ki);
++        /*endif*/
++    }
  
      /* Create a default symbol sync filter */
 +    /* The band-edge filters must be centred on the actual V.34 carrier and
@@ -336,350 +1361,3 @@
                           0.99f);
      create_godard_coeffs(&s->rx.cc_ted,
                           (s->calling_party)  ?  2400.0f  :  1200.0f,
---- v34tx.c.orig
-+++ v34tx.c
-@@ -324,6 +324,7 @@
- static void trn_baud_init(v34_state_t *s);
- static void mp_or_mph_baud_init(v34_state_t *s);
- static void e_baud_init(v34_state_t *s);
-+static void data_baud_init(v34_state_t *s);
- 
- /* Control channel startup routines */
- static void pph_baud_init(v34_state_t *s);
-@@ -2126,9 +2127,16 @@
-     if (s->tx.txptr >= s->tx.txbits)
-     {
-         if (s->tx.calling_party)
--            tx_silence_init(s, 30000);
-+        {
-+            if (s->rx.s_signal_seen)
-+                s_not_s_baud_init(s);
-+            else
-+                return zero;
-+        }
-         else
-+        {
-             s_not_s_baud_init(s);
-+        }
-         /*endif*/
-     }
-     /*endif*/
-@@ -2174,12 +2182,18 @@
-     {
-         if (s->tx.calling_party)
-         {
--// printf("info 1 Tx silence\n");
--            tx_silence_init(s, 30000);
-+            /* Wait for the answerer's S signal, then send our own S/!S
-+               (V.34 phase 3). The S detector in the receiver latches the
-+               event. Stay on the current modulator returning zero, so this
-+               generator keeps being called while we wait: a silence
-+               modulator would never re-check the event. */
-+            if (s->rx.s_signal_seen)
-+                s_not_s_baud_init(s);
-+            else
-+                return zero;
-         }
-         else
-         {
--// printf("info 1 Tx S !S\n");
-             s_not_s_baud_init(s);
-         }
-         /*endif*/
-@@ -2348,6 +2362,14 @@
-             ||
-             (s->tx.duplex  &&  ++s->tx.tone_duration >= 512))
-         {
-+            if (s->tx.trn_after_j)
-+            {
-+                /* The post-J TRN of phase 4 is followed by MP/MPH */
-+                s->tx.trn_after_j = false;
-+                mp_or_mph_baud_init(s);
-+                break;
-+            }
-+            /*endif*/
-             s->tx.stage = V34_TX_STAGE_J;
-             s->tx.persistence2 = j_pattern[0];
-             s->tx.tone_duration = 0;
-@@ -2364,7 +2386,7 @@
-         {
-             if (s->tx.duplex)
-             {
--                if (s->rx.received_event == V34_EVENT_S)
-+                if (s->rx.received_event == V34_EVENT_S  ||  s->rx.s_signal_seen)
-                 {
-                     if (s->tx.calling_party)
-                     {
-@@ -2375,7 +2397,10 @@
-                     }
-                     else
-                     {
--                        /* Send silence */
-+                        /* Answerer: after the caller's S is seen, the
-+                           post-J TRN follows (V.34 phase 4). */
-+                        s->tx.trn_after_j = true;
-+                        trn_baud_init(s);
-                     }
-                     /*endif*/
-                 }
-@@ -2403,6 +2428,9 @@
-         s->tx.persistence2 >>= 1;
-         if (++s->tx.tone_duration >= 16)
-         {
-+            /* J' is followed by the post-J TRN (V.34 phase 4) */
-+            s->tx.trn_after_j = true;
-+            trn_baud_init(s);
-         }
-         /*endif*/
-         break;
-@@ -2418,6 +2446,16 @@
-     s->tx.tone_duration = 0;
-     s->tx.stage = V34_TX_STAGE_TRN;
-     s->tx.current_getbaud = get_trn_baud;
-+    if (s->tx.trn_after_j)
-+    {
-+        /* The far end is sending its post-J TRN and then MP/MPH on the V.34
-+           carrier's control channel. Follow it with the receiver. */
-+        s->rx.current_demodulator = V34_MODULATION_CC;
-+        s->rx.stage = V34_RX_STAGE_CC;
-+        s->rx.mp_seen = 0;
-+        s->rx.mp_count = -1;
-+    }
-+    /*endif*/
- }
- /*- End of function --------------------------------------------------------*/
- 
-@@ -2429,26 +2467,36 @@
-     bit = (scramble(&s->tx, get_data_bit(&s->tx)) << 1) | bit;
-     if (s->tx.txptr >= s->tx.txbits)
-     {
--        if (1)
-+        if (!s->tx.mp.mp_acknowledged)
-         {
--            if (s->tx.duplex)
-+            /* MP has been sent. Once the far end's MP has been received we
-+               can acknowledge it (the MP' phase); otherwise repeat MP. */
-+            if (s->rx.mp_seen >= 1)
-             {
--                /* See if we need to set the acknowledge bit, so MP becomes MP' */
--                if (1)
--                {
--                    s->tx.mp.mp_acknowledged = 1;
--                    /* We need to rebuild the message we send */
--                    s->tx.txbits = mp_sequence_tx(&s->tx, &s->tx.mp);
--                }
--                /*endif*/
-+                span_log(&s->logging, SPAN_LOG_FLOW, "Tx - far MP received, sending MP'\n");
-+                s->tx.mp.mp_acknowledged = 1;
-+                s->tx.txbits = mp_sequence_tx(&s->tx, &s->tx.mp);
-+                s->tx.txptr = 0;
-+            }
-+            else
-+            {
-+                s->tx.txptr = 0;
-             }
-             /*endif*/
--            /* Restart the message */
--            s->tx.txptr = 0;
-         }
-         else
-         {
--            e_baud_init(s);
-+            /* MP' is sent twice, then the E sequence ends the control
-+               channel exchange. */
-+            if (++s->tx.mp_tx_count >= 2)
-+            {
-+                span_log(&s->logging, SPAN_LOG_FLOW, "Tx - MP' sent twice, sending E\n");
-+                e_baud_init(s);
-+                s->tx.diff = (s->tx.diff + bit) & 3;
-+                return training_constellation_4[s->tx.diff];
-+            }
-+            /*endif*/
-+            s->tx.txptr = 0;
-         }
-         /*endif*/
-     }
-@@ -2461,7 +2509,10 @@
- static void mp_or_mph_baud_init(v34_state_t *s)
- {
-     span_log(&s->logging, SPAN_LOG_FLOW, "Tx - mp_baud_init()\n");
--    s->tx.current_modulator = V34_MODULATION_V34;
-+    /* The MP/MPH exchange is carried on the control channel, which the
-+       receiver decodes in its CC demodulator. */
-+    s->tx.current_modulator = V34_MODULATION_CC;
-+    s->tx.mp_tx_count = 0;
-     if (s->tx.duplex)
-     {
-         s->tx.txbits = mp_sequence_tx(&s->tx, &s->tx.mp);
-@@ -2478,6 +2529,54 @@
- }
- /*- End of function --------------------------------------------------------*/
- 
-+/* Primary-channel data generator (our addition).
-+
-+   The mapping engine (v34_get_mapping_frame) consumes data bits and produces
-+   one mapping frame: eight 2D symbols in Q9.7 format. This generator serves
-+   those symbols one per baud through the primary-channel modulator. */
-+static complex_sig_t get_data_baud(v34_state_t *s)
-+{
-+    int i;
-+    complex_sig_t z;
-+
-+    if (s->tx.data_baud_pos >= 8)
-+    {
-+        v34_get_mapping_frame(&s->tx, s->tx.data_bits);
-+        s->tx.data_baud_pos = 0;
-+        /* Enable V34_SYM_TRACE to log the first four frames of each
-+           superframe, for comparing against a waveform capture. */
-+        if (getenv("V34_SYM_TRACE")  &&  s->tx.super_frame < 33  &&  s->tx.data_frame < 4)
-+            span_log(&s->logging, SPAN_LOG_FLOW, "SYM %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
-+                     s->tx.data_frame,
-+                     s->tx.data_bits[0], s->tx.data_bits[1], s->tx.data_bits[2], s->tx.data_bits[3],
-+                     s->tx.data_bits[4], s->tx.data_bits[5], s->tx.data_bits[6], s->tx.data_bits[7],
-+                     s->tx.data_bits[8], s->tx.data_bits[9], s->tx.data_bits[10], s->tx.data_bits[11],
-+                     s->tx.data_bits[12], s->tx.data_bits[13], s->tx.data_bits[14], s->tx.data_bits[15]);
-+    }
-+    /*endif*/
-+    i = s->tx.data_baud_pos++;
-+    /* Q9.7 to signal units (one constellation unit is 1.0). */
-+    z.re = (float) s->tx.data_bits[2*i]/128.0f;
-+    z.im = (float) s->tx.data_bits[2*i + 1]/128.0f;
-+    return z;
-+}
-+/*- End of function --------------------------------------------------------*/
-+
-+static void data_baud_init(v34_state_t *s)
-+{
-+    span_log(&s->logging, SPAN_LOG_FLOW, "Tx - data_baud_init()\n");
-+    s->tx.tone_duration = 0;
-+    s->tx.stage = V34_TX_STAGE_DATA;
-+    s->tx.current_modulator = V34_MODULATION_V34;
-+    s->tx.current_getbaud = get_data_baud;
-+    s->tx.data_baud_pos = 8;
-+    /* The actual timing/filter reset happens at the first primary-modulator
-+       call (see tx_v34_modulation), so that the control-channel modulator
-+       can finish the final E symbol with its own phase. */
-+    s->tx.data_first_baud = true;
-+}
-+/*- End of function --------------------------------------------------------*/
-+
- static complex_sig_t get_e_baud(v34_state_t *s)
- {
-     static const uint16_t e_pattern[2] =
-@@ -2487,14 +2586,28 @@
-     };
-     int bit;
- 
-+    if (s->tx.duplex)
-+    {
-+        /* In duplex mode E is 20 ones in the descrambled control-channel
-+           bit stream: pass constant ones through the scrambler, as the
-+           receiver looks for 20 consecutive ones after descrambling. */
-+        bit = scramble(&s->tx, 1);
-+        bit = (scramble(&s->tx, 1) << 1) | bit;
-+        s->tx.diff = (s->tx.diff + bit) & 3;
-+        if (++s->tx.tone_duration >= 10)
-+        {
-+            /* The E sequence ends the control channel exchange. The primary
-+               channel data mode begins (B1 is part of the first data frame
-+               in this implementation). */
-+            data_baud_init(s);
-+        }
-+        /*endif*/
-+        return training_constellation_4[s->tx.diff];
-+    }
-+    /*endif*/
-     bit = (e_pattern[0] >> s->tx.tone_duration) & 1;
-     if (++s->tx.tone_duration == 16)
-     {
--        //if (s->tx.duplex)
--            /* CC comes next */
--        //else
--            /* B1 comes next */
--        ///*endif*/
-     }
-     /*endif*/
-     return training_constellation_4[bit];
-@@ -2506,6 +2619,7 @@
-     span_log(&s->logging, SPAN_LOG_FLOW, "Tx - e_baud_init()\n");
-     s->tx.tone_duration = 0;
-     s->tx.stage = V34_TX_STAGE_HDX_E;
-+    s->tx.current_modulator = V34_MODULATION_CC;
-     s->tx.current_getbaud = get_e_baud;
- }
- /*- End of function --------------------------------------------------------*/
-@@ -2701,6 +2815,23 @@
- 
-     /* The V.34 modulator. */
- // printf("ZZZ baud rate %d\n", s->tx.baud_rate);
-+    if (s->tx.data_first_baud)
-+    {
-+        /* First call of the primary modulator after E. The control-channel
-+           modulator left baud_phase in 0..39 (its symbol is 40 samples),
-+           but this modulator's polyphase table has only num (e.g. 10)
-+           phases and indexes it with num-1-baud_phase. Without this reset
-+           the shaper is indexed out of bounds and the data-mode waveform is
-+           garbage. Clear the pulse-shaping history too: it holds
-+           control-channel symbols. The reset was deferred to here so the
-+           final E symbol is transmitted correctly by the CC modulator. */
-+        s->tx.data_first_baud = false;
-+        s->tx.baud_phase = 0;
-+        memset(s->tx.rrc_filter_re, 0, sizeof(s->tx.rrc_filter_re));
-+        memset(s->tx.rrc_filter_im, 0, sizeof(s->tx.rrc_filter_im));
-+        s->tx.rrc_filter_step = 0;
-+    }
-+    /*endif*/
-     num = s->tx.parms.samples_per_symbol_numerator;
-     den = s->tx.parms.samples_per_symbol_denominator;
-     shaper = v34_tx_shapers[s->tx.baud_rate];
-@@ -2721,12 +2852,18 @@
-         /* Root raised cosine pulse shaping at baseband */
- #if defined(SPANDSP_USE_FIXED_POINT)
-         x = complex_seti32(0, 0);
--        for (i = 0;  i < V34_TX_FILTER_STEPS;  i++)
-         {
--            x.re += (int32_t) shaper[num - 1 - s->tx.baud_phase][i]*(int32_t) s->tx.rrc_filter[i + s->tx.rrc_filter_step].re;
--            x.im += (int32_t) shaper[num - 1 - s->tx.baud_phase][i]*(int32_t) s->tx.rrc_filter[i + s->tx.rrc_filter_step].im;
-+            int k = s->tx.rrc_filter_step;
-+
-+            for (i = 0;  i < V34_TX_FILTER_STEPS;  i++)
-+            {
-+                x.re += (int32_t) shaper[num - 1 - s->tx.baud_phase][i]*(int32_t) s->tx.rrc_filter_re[k];
-+                x.im += (int32_t) shaper[num - 1 - s->tx.baud_phase][i]*(int32_t) s->tx.rrc_filter_im[k];
-+                if (++k >= V34_TX_FILTER_STEPS)
-+                    k = 0;
-+            }
-+            /*endfor*/
-         }
--        /*endfor*/
-         /* Now create and modulate the carrier */
-         x.re >>= 4;
-         x.im >>= 4;
-@@ -2736,12 +2873,23 @@
-         amp[sample] = (int16_t) ((i*s->tx.gain) >> 15);
- #else
-         x = zero;
--        for (i = 0;  i < V34_TX_FILTER_STEPS;  i++)
-         {
--            x.re += shaper[num - 1 - s->tx.baud_phase][i]*s->tx.rrc_filter_re[i + s->tx.rrc_filter_step];
--            x.im += shaper[num - 1 - s->tx.baud_phase][i]*s->tx.rrc_filter_im[i + s->tx.rrc_filter_step];
-+            /* The pulse shaping buffer is V34_TX_FILTER_STEPS long and read
-+               circularly (the same semantics as vec_circular_dot_prod*,
-+               which the control-channel modulator uses). Upstream indexed it
-+               linearly, reading past the end of the buffer for every symbol
-+               after the first, which corrupted the data-mode waveform. */
-+            int k = s->tx.rrc_filter_step;
-+
-+            for (i = 0;  i < V34_TX_FILTER_STEPS;  i++)
-+            {
-+                x.re += shaper[num - 1 - s->tx.baud_phase][i]*s->tx.rrc_filter_re[k];
-+                x.im += shaper[num - 1 - s->tx.baud_phase][i]*s->tx.rrc_filter_im[k];
-+                if (++k >= V34_TX_FILTER_STEPS)
-+                    k = 0;
-+            }
-+            /*endfor*/
-         }
--        /*endfor*/
-         /* Now create and modulate the carrier */
-         z = dds_complexf(&(s->tx.carrier_phase), s->tx.v34_carrier_phase_rate);
-         /* Don't bother saturating. We should never clip. */

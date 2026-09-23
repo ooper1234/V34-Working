@@ -93,9 +93,30 @@ gen/make_modem_filter -m V.34_3429 -r > include/v34_rx_3429_rrc.h
 gen/make_modem_filter -m V.34_3429 -t > include/v34_tx_3429_rrc.h
 
 echo "== patching sources (leftover debug printfs)"
+# Always regenerate the working copies.  Reapplying with patch -N can silently
+# retain stale code after a patch is edited, and ignoring a malformed patch can
+# produce a seemingly successful archive containing the unpatched sources.
 cp "$SRC/v34rx.c" "$SRC/v34tx.c" .
-patch -p0 -s -N < "$SRC/spandsp-v34-debug-printfs.patch" || true
-patch -p0 -s -N < "$SRC/spandsp-v34-phase3.patch" || true
+patch -p0 -s < "$SRC/spandsp-v34-debug-printfs.patch"
+patch -p0 -s < "$SRC/spandsp-v34-phase3.patch"
+patch -p0 -s < "$SRC/spandsp-v34-duplex-mp.patch"
+patch -p0 -s < "$SRC/spandsp-v34-mp-demod.patch"
+patch -p0 -s < "$SRC/spandsp-v34-j-detect.patch"
+patch -p0 -s < "$SRC/spandsp-v34-sbar-detect.patch"
+patch -p0 -s < "$SRC/spandsp-v34-s-sbar.patch"
+patch -p0 -s < "$SRC/spandsp-v34-cc-switch.patch"
+patch -p0 -s < "$SRC/spandsp-v34-j-diff.patch"
+patch -p0 -s < "$SRC/spandsp-v34-j-length.patch"
+patch -p0 -s < "$SRC/spandsp-v34-mp-crc-tx.patch"
+patch -p0 -s < "$SRC/spandsp-v34-mp-crc-rx.patch"
+patch -p0 -s < "$SRC/spandsp-v34-mp-ack.patch"
+patch -p0 -s < "$SRC/spandsp-v34-e-channel.patch"
+patch -p0 -s < "$SRC/spandsp-v34-b1.patch"
+patch -p0 -s < "$SRC/spandsp-v34-j-gate.patch"
+# INFO1c power reduction goes last: its site (top of v34_tx) is untouched by
+# the patches above, and composing it against their output avoids the
+# context collision the old placement had with s-sbar's hunk 2.
+patch -p0 -s < "$SRC/spandsp-v34-power.patch"
 
 echo "== compiling"
 rm -f *.o

@@ -1,0 +1,1293 @@
+//! A whole V.32 call, over a line that behaves like a two-wire one.
+//!
+//! Each modem hears the far end attenuated by the network and its own signal
+//! reflected off the hybrid, the second louder than the first. That is the
+//! situation V.32 is designed for and the reason it carries an echo canceller
+//! at all: with both directions in the one band, no filter can tell the two
+//! apart, and there is nothing to fall back on.
+
+use datapump::v32::startup::{
+    Modem, Rates, Role, Status, UNSATISFACTORY_GAP, rate_signal,
+};
+
+const FS: f64 = 16_000.0;
+
+/// Reflection off the hybrid: 12 dB down, which is ordinary.
+const ECHO: f64 = 0.251;
+/// The far end after crossing the network: 20 dB down, so eight decibels
+/// quieter than our own reflection.
+const FAR: f64 = 0.1;
+
+/// Run a call and return the two modems along with when they both connected.
+fn call(seconds: f64, echo: f64) -> (Modem, Modem, f64) {
+    let offer = rate_signal(Rates { at_4800: true, ..Rates::default() });
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let (mut from_calling, mut from_answering) = (0.0, 0.0);
+    let mut at = f64::NAN;
+
+    for i in 0..(seconds * FS) as usize {
+        let (a, b) = (from_calling, from_answering);
+        from_calling = calling.step(b * FAR + a * echo);
+        from_answering = answering.step(a * FAR + b * echo);
+        if at.is_nan()
+            && matches!(calling.status(), Status::Connected(_))
+            && matches!(answering.status(), Status::Connected(_))
+        {
+            at = i as f64 / FS;
+        }
+    }
+    (calling, answering, at)
+}
+
+#[test]
+fn a_call_completes_over_a_hybrid() {
+    let (calling, answering, at) = call(30.0, ECHO);
+    assert_eq!(
+        calling.status(),
+        Status::Connected(4800),
+        "the calling end stopped at {} ({:?})",
+        calling.phase(),
+        calling.status()
+    );
+    assert_eq!(
+        answering.status(),
+        Status::Connected(4800),
+        "the answering end stopped at {} ({:?})",
+        answering.phase(),
+        answering.status()
+    );
+    assert!(at.is_finite(), "never both connected at once");
+    println!(
+        "connected after {at:.2} s, echo return loss {:.1} and {:.1} dB",
+        calling.echo_return_loss(),
+        answering.echo_return_loss()
+    );
+}
+
+#[test]
+fn the_echo_canceller_learns_during_the_training_segment() {
+    // Note 3 to 5.4.2: the TRN segment "is suitable for training the echo
+    // canceller in the transmitting modem". It is the one stretch of the
+    // start-up where the far end is required to be silent, so it is the only
+    // stretch where what comes back can be assumed to be all our own.
+    let (calling, answering, _) = call(30.0, ECHO);
+    for (name, loss) in [
+        ("calling", calling.echo_return_loss()),
+        ("answering", answering.echo_return_loss()),
+    ] {
+        assert!(
+            loss > 15.0,
+            "the {name} end is removing only {loss:.1} dB of its own echo"
+        );
+    }
+}
+
+#[test]
+fn data_flows_in_both_directions_once_connected() {
+    let offer = rate_signal(Rates { at_4800: true, ..Rates::default() });
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let (mut from_calling, mut from_answering) = (0.0, 0.0);
+    let (to_host, to_caller) = (b"login: cactus\r\n", b"Password:");
+    let (mut sent, mut settled) = (false, f64::NAN);
+    let (mut at_host, mut at_caller) = (Vec::new(), Vec::new());
+
+    for i in 0..(40.0 * FS) as usize {
+        let (a, b) = (from_calling, from_answering);
+        from_calling = calling.step(b * FAR + a * ECHO);
+        from_answering = answering.step(a * FAR + b * ECHO);
+        at_caller.extend(calling.take_bytes());
+        at_host.extend(answering.take_bytes());
+
+        let up = matches!(calling.status(), Status::Connected(_))
+            && matches!(answering.status(), Status::Connected(_));
+        if up && settled.is_nan() {
+            settled = i as f64 / FS;
+        }
+        // Give both receivers a moment on scrambled ones before speaking:
+        // there is an equaliser to converge and a descrambler to synchronise.
+        if up && !sent && i as f64 / FS > settled + 1.0 {
+            sent = true;
+            calling.send(to_host);
+            answering.send(to_caller);
+        }
+    }
+
+    assert!(sent, "never connected, so nothing was sent");
+    assert!(
+        contains_at_any_bit_offset(&at_host, to_host),
+        "the answering end did not receive what was typed"
+    );
+    assert!(
+        contains_at_any_bit_offset(&at_caller, to_caller),
+        "the calling end did not receive the host's reply"
+    );
+}
+
+#[test]
+fn without_an_echo_the_call_still_works() {
+    // The canceller must not be doing harm on a line that has nothing for it
+    // to cancel, which is the case a leased four-wire circuit presents.
+    let (calling, answering, at) = call(30.0, 0.0);
+    assert_eq!(calling.status(), Status::Connected(4800));
+    assert_eq!(answering.status(), Status::Connected(4800));
+    assert!(at.is_finite());
+}
+
+/// Find `needle` at any bit offset, since the receiver has no way to know
+/// where the far end considered a byte to begin.
+fn contains_at_any_bit_offset(haystack: &[u8], needle: &[u8]) -> bool {
+    let bits: Vec<bool> = haystack
+        .iter()
+        .flat_map(|b| (0..8).rev().map(move |i| b & (1 << i) != 0))
+        .collect();
+    let want: Vec<bool> = needle
+        .iter()
+        .flat_map(|b| (0..8).rev().map(move |i| b & (1 << i) != 0))
+        .collect();
+    bits.windows(want.len()).any(|w| w == want.as_slice())
+}
+
+#[test]
+#[ignore]
+fn trace() {
+    let offer = rate_signal(Rates { at_4800: true, ..Rates::default() });
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let (mut a, mut b) = (0.0, 0.0);
+    let (mut cp, mut ap) = ("", "");
+    for i in 0..(20.0 * FS) as usize {
+        let (pa, pb) = (a, b);
+        a = calling.step(pb * FAR + pa * ECHO);
+        b = answering.step(pa * FAR + pb * ECHO);
+        if calling.phase() != cp || answering.phase() != ap {
+            cp = calling.phase();
+            ap = answering.phase();
+            println!(
+                "{:>7.3}s  call {cp:>12} (err {:.2}, echo {:>5.1} dB)   answer {ap:>12} (err {:.2}, echo {:>5.1} dB)",
+                i as f64 / FS,
+                calling.residual_error(), calling.echo_return_loss(),
+                answering.residual_error(), answering.echo_return_loss()
+            );
+        }
+    }
+    println!(
+        "round trip: call {} answer {}; echo loss {:.1} / {:.1} dB",
+        calling.round_trip(), answering.round_trip(),
+        calling.echo_return_loss(), answering.echo_return_loss()
+    );
+}
+
+/// Reflection off the far end, which comes back a whole round trip later.
+///
+/// A hybrid at each end of a connection means two reflections, not one, and
+/// the second is as far away as the line is long. It is the reason V.32
+/// measures the round trip at all.
+const TALKER: f64 = 0.15;
+
+/// A line with length: what goes down it takes time to arrive, what the near
+/// hybrid returns comes back at once, and what the far hybrid returns comes
+/// back a whole trip later.
+struct Line {
+    a: std::collections::VecDeque<f64>,
+    b: std::collections::VecDeque<f64>,
+    delay: usize,
+}
+
+impl Line {
+    fn new(delay: usize) -> Self {
+        let empty = || std::collections::VecDeque::from(vec![0.0; 2 * delay + 1]);
+        Self {
+            a: empty(),
+            b: empty(),
+            delay,
+        }
+    }
+
+    /// Give each end what the other said, plus both reflections of its own.
+    fn step(&mut self, from_a: f64, from_b: f64) -> (f64, f64) {
+        self.a.pop_back();
+        self.a.push_front(from_a);
+        self.b.pop_back();
+        self.b.push_front(from_b);
+        let there_and_back = 2 * self.delay;
+        (
+            ECHO * self.a[0] + FAR * self.b[self.delay] + TALKER * self.a[there_and_back],
+            ECHO * self.b[0] + FAR * self.a[self.delay] + TALKER * self.b[there_and_back],
+        )
+    }
+}
+
+/// Run a call over a line of the given one-way delay in samples.
+fn long_call(seconds: f64, delay: usize) -> (Modem, Modem, f64) {
+    let offer = rate_signal(Rates { at_4800: true, ..Rates::default() });
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let mut line = Line::new(delay);
+    let (mut from_calling, mut from_answering) = (0.0, 0.0);
+    let mut at = f64::NAN;
+
+    for i in 0..(seconds * FS) as usize {
+        let (to_calling, to_answering) = line.step(from_calling, from_answering);
+        from_calling = calling.step(to_calling);
+        from_answering = answering.step(to_answering);
+        if at.is_nan()
+            && matches!(calling.status(), Status::Connected(_))
+            && matches!(answering.status(), Status::Connected(_))
+        {
+            at = i as f64 / FS;
+        }
+    }
+    (calling, answering, at)
+}
+
+/// Twenty milliseconds each way, which is a few hundred miles of it.
+const DELAY: usize = 320;
+
+#[test]
+fn a_call_completes_over_a_line_with_length() {
+    let (calling, answering, at) = long_call(40.0, DELAY);
+    println!(
+        "connected after {at:.2} s; round trip {} and {} symbols; \
+         echo return loss {:.1} and {:.1} dB",
+        calling.round_trip(),
+        answering.round_trip(),
+        calling.echo_return_loss(),
+        answering.echo_return_loss(),
+    );
+    for (name, modem) in [("calling", &calling), ("answering", &answering)] {
+        println!("{name} found {:?}", modem.reflection());
+        assert_eq!(
+            modem.status(),
+            Status::Connected(4800),
+            "the {name} end stopped at {} ({:?})",
+            modem.phase(),
+            modem.status()
+        );
+    }
+    assert!(at.is_finite(), "never both connected at once");
+}
+
+#[test]
+fn the_far_hybrid_is_found_where_it_actually_is() {
+    // The point of measuring the round trip. What comes back off the far end
+    // arrives a whole trip later, and taps placed anywhere else model nothing.
+    let (calling, answering, _) = long_call(40.0, DELAY);
+    for (name, modem) in [("calling", &calling), ("answering", &answering)] {
+        let found = modem
+            .reflection()
+            .unwrap_or_else(|| panic!("the {name} end found no reflection at all"));
+        let off = found.delay as i64 - 2 * DELAY as i64;
+        assert!(
+            off.abs() <= 8,
+            "the {name} end put the far hybrid {off} samples from where it is"
+        );
+        assert!(
+            found.strength > 0.3,
+            "the {name} end found it at only {:.2} of what arrives",
+            found.strength
+        );
+    }
+}
+
+#[test]
+fn the_second_run_of_taps_is_what_makes_the_long_line_work() {
+    // The whole case for the split canceller. Both ends are cancelling the
+    // near hybrid either way; the difference is whether the far one is left
+    // on the line, and on this line it is eight decibels below the far modem.
+    let (calling, answering, _) = long_call(40.0, DELAY);
+    for (name, modem) in [("calling", &calling), ("answering", &answering)] {
+        let loss = modem.echo_return_loss();
+        assert!(
+            loss > 20.0,
+            "the {name} end removed only {loss:.1} dB of its own echo, which \
+             is about what the near taps manage on their own"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_cable() {
+    // The sound-card loopback at the data pump level, where the receiver can
+    // be seen: both modems summed onto one wire and heard by both, delayed.
+    use std::collections::VecDeque;
+    let crossing: usize = std::env::var("V32_CROSSING")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(700);
+    const HEADROOM: f64 = 0.45;
+    let offer = rate_signal(Rates { at_4800: true, ..Rates::default() });
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let mut wire: VecDeque<f64> = VecDeque::from(vec![0.0; crossing]);
+    let (mut cp, mut ap) = ("", "");
+    for i in 0..(25.0 * FS) as usize {
+        let heard = wire.pop_front().unwrap_or(0.0);
+        let a = calling.step(heard);
+        let b = answering.step(heard);
+        wire.push_back((a + b) * HEADROOM);
+        let changed = calling.phase() != cp || answering.phase() != ap;
+        if changed || i % (FS as usize / 2) == 0 {
+            cp = calling.phase();
+            ap = answering.phase();
+            println!(
+                "{:>7.3}s  call {cp:>12} err {:>6.3}   answer {ap:>12} err {:>6.3}",
+                i as f64 / FS,
+                calling.residual_error(),
+                answering.residual_error(),
+            );
+        }
+    }
+}
+
+/// Run a call with an offer at each end and report what happened.
+///
+/// Returns the rate agreed, the bits per second the calling end actually
+/// recovered once settled, and what each terminal received.
+fn exchange(calling: u16, answering: u16, payload: &[u8]) -> (u32, f64, Vec<u8>, Vec<u8>) {
+    let mut caller = Modem::new(Role::Calling, calling, FS);
+    let mut host = Modem::new(Role::Answering, answering, FS);
+    let (mut from_caller, mut from_host) = (0.0, 0.0);
+    let (mut at_caller, mut at_host) = (Vec::new(), Vec::new());
+    let (mut sent, mut settled) = (false, f64::NAN);
+    let (mut counting_from, mut counted) = (f64::NAN, 0usize);
+
+    for i in 0..(40.0 * FS) as usize {
+        let (a, b) = (from_caller, from_host);
+        from_caller = caller.step(b * FAR + a * ECHO);
+        from_host = host.step(a * FAR + b * ECHO);
+        let now = i as f64 / FS;
+
+        // One drain, used for both jobs: take_bits and take_bytes share a
+        // buffer, so calling both leaves the second with nothing.
+        let arrived = caller.take_bytes();
+        let bits = arrived.len() * 8;
+        at_caller.extend(arrived);
+        at_host.extend(host.take_bytes());
+
+        let up = matches!(caller.status(), Status::Connected(_))
+            && matches!(host.status(), Status::Connected(_));
+        if up && settled.is_nan() {
+            settled = now;
+        }
+        // Count over a whole second, starting once both ends have settled and
+        // are sending scrambled ones, which run at the agreed rate like data.
+        if up && now > settled + 0.5 {
+            if counting_from.is_nan() {
+                counting_from = now;
+            } else if now < counting_from + 1.0 {
+                counted += bits;
+            }
+        }
+        if up && !sent && now > settled + 1.5 {
+            sent = true;
+            caller.send(payload);
+            host.send(payload);
+        }
+    }
+
+    let rate = match caller.status() {
+        Status::Connected(r) => r,
+        other => panic!("the call did not connect: {other:?}"),
+    };
+    (rate, counted as f64, at_caller, at_host)
+}
+
+#[test]
+fn nine_thousand_six_hundred_carries_four_bits_to_the_symbol() {
+    // 2.4.1.1: the scrambled stream in groups of four, two differentially
+    // encoded into the quadrant and two choosing a point inside it. Twice the
+    // data at the same 2400 baud, which is the whole of what the extra twelve
+    // points buy.
+    let both = rate_signal(Rates { at_4800: true, at_9600: true, ..Rates::default() });
+    let payload = b"the quick brown fox jumps over the lazy dog, 0123456789";
+    let (rate, bits, at_caller, at_host) = exchange(both, both, payload);
+
+    assert_eq!(rate, 9600, "the two ends did not settle on the faster rate");
+    assert!(
+        (9000.0..10_200.0).contains(&bits),
+        "the line carried {bits:.0} bit/s, which is not 9600"
+    );
+    assert!(
+        contains_at_any_bit_offset(&at_host, payload),
+        "the answering end did not receive what was sent at 9600"
+    );
+    assert!(
+        contains_at_any_bit_offset(&at_caller, payload),
+        "the calling end did not receive what was sent at 9600"
+    );
+}
+
+#[test]
+fn a_far_end_that_can_only_do_4800_gets_4800() {
+    // 5.3: each rate signal narrows what the last one offered, and R3 settles
+    // it. The E that follows has to carry what was settled rather than what
+    // was offered -- Table 7 says its rate bits "relate to the transmission of
+    // scrambled binary ones immediately following signal E" -- because it is
+    // the E that tells the far end how to demodulate what comes next. A modem
+    // that put its whole offer in E would tell this one to read 9600 off a
+    // line carrying 4800.
+    let payload = b"login: cactus";
+    let (rate, bits, at_caller, at_host) =
+        exchange(rate_signal(Rates { at_4800: true, at_9600: true, ..Rates::default() }), rate_signal(Rates { at_4800: true, ..Rates::default() }), payload);
+
+    assert_eq!(rate, 4800, "the faster end did not come down to the slower");
+    assert!(
+        (4400.0..5200.0).contains(&bits),
+        "the line carried {bits:.0} bit/s, which is not 4800"
+    );
+    assert!(contains_at_any_bit_offset(&at_host, payload));
+    assert!(contains_at_any_bit_offset(&at_caller, payload));
+}
+
+/// As `long_call`, but with the two reflections given rather than fixed.
+fn custom_call(
+    seconds: f64,
+    delay: usize,
+    echo: f64,
+    far: f64,
+) -> (Modem, Modem, f64) {
+    let offer = rate_signal(Rates { at_4800: true, ..Rates::default() });
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let mut a = std::collections::VecDeque::from(vec![0.0; 2 * delay + 1]);
+    let mut b = std::collections::VecDeque::from(vec![0.0; 2 * delay + 1]);
+    let (mut from_calling, mut from_answering) = (0.0, 0.0);
+    let mut at = f64::NAN;
+    for i in 0..(seconds * FS) as usize {
+        a.pop_back();
+        a.push_front(from_calling);
+        b.pop_back();
+        b.push_front(from_answering);
+        let there_and_back = 2 * delay;
+        let to_calling = echo * a[0] + far * b[delay] + TALKER * a[there_and_back];
+        let to_answering = echo * b[0] + far * a[delay] + TALKER * b[there_and_back];
+        from_calling = calling.step(to_calling);
+        from_answering = answering.step(to_answering);
+        if at.is_nan() && matches!(calling.status(), Status::Connected(_)) {
+            at = i as f64 / FS;
+        }
+    }
+    (calling, answering, at)
+}
+
+#[test]
+fn a_call_survives_the_round_trip_a_packet_network_adds() {
+    // The line this was written against is a hybrid twenty milliseconds away.
+    // A call carried over VoIP is nothing like that: the round trip is
+    // hundreds of milliseconds, most of it jitter buffer, and V.32 measures
+    // the round trip in clause 5.4 precisely because it has to place the
+    // canceller's second run of taps at the far hybrid.
+    for round_trip_ms in [40.0, 125.0, 200.0, 300.0, 400.0] {
+        let one_way = (round_trip_ms / 2.0 / 1000.0 * FS) as usize;
+        let (calling, _, at) = custom_call(30.0, one_way, ECHO, FAR);
+        assert!(
+            matches!(calling.status(), Status::Connected(4800)),
+            "a {round_trip_ms:.0} ms round trip left the call at {:?}",
+            calling.status()
+        );
+        assert!(at < 20.0, "{round_trip_ms:.0} ms took {at:.1} s to connect");
+    }
+}
+
+#[test]
+fn a_call_survives_an_echo_as_loud_as_what_was_sent() {
+    // What one virtual cable returns, measured on a recorded call: our own
+    // transmit came back at +0.26 dB, where a hybrid would have given -12, and
+    // the far end arrived only 5 dB below it. There is no hybrid in a cable --
+    // what is written to it is what comes back -- so the canceller is doing all
+    // the work rather than finishing what a transformer started.
+    //
+    // It manages, and it is worth knowing that it manages, because it means a
+    // V.32 call that will not come up on such a line is not failing for want of
+    // a quieter transmitter.
+    const CABLE_ECHO: f64 = 1.03;
+    const TRUNK_FAR: f64 = 0.575;
+    for round_trip_ms in [40.0, 200.0, 400.0] {
+        let one_way = (round_trip_ms / 2.0 / 1000.0 * FS) as usize;
+        let (calling, _, at) = custom_call(30.0, one_way, CABLE_ECHO, TRUNK_FAR);
+        assert!(
+            matches!(calling.status(), Status::Connected(4800)),
+            "an echo at unity over {round_trip_ms:.0} ms left the call at {:?}",
+            calling.status()
+        );
+        assert!(at < 20.0, "took {at:.1} s to connect");
+    }
+}
+
+/// The far hybrid is found however loud the near one is.
+///
+/// A cable returns this end's signal whole, and the far hybrid's reflection
+/// sits 16.7 dB below that. The search for it was scored against everything
+/// arriving, near echo and all, so it read 0.12 against a bar of 0.15 and
+/// was never given taps: the answering end cancelled 18.5 dB, which with the
+/// far end another 20 dB down left its own echo as loud as the calling
+/// modem's conditioning signal, and it waited in R1 for one it could not
+/// hear until the calling end gave up and started again. Scored against what
+/// the near taps leave, it reads 0.49 and the call comes up.
+#[test]
+fn a_far_hybrid_is_found_behind_an_echo_at_full_strength() {
+    const CABLE_ECHO: f64 = 1.03;
+    let (calling, answering, at) = custom_call(20.0, DELAY, CABLE_ECHO, FAR);
+    for (name, modem) in [("calling", &calling), ("answering", &answering)] {
+        let found = modem
+            .reflection()
+            .unwrap_or_else(|| panic!("the {name} end found no far hybrid"));
+        let off = found.delay as i64 - 2 * DELAY as i64;
+        assert!(off.abs() <= 8, "the {name} end put it {off} samples out");
+        let loss = modem.echo_return_loss();
+        assert!(loss > 30.0, "the {name} end removed only {loss:.1} dB");
+    }
+    assert!(
+        matches!(calling.status(), Status::Connected(4800)),
+        "the call stopped with the calling end at {} and the answering end at {}",
+        calling.phase(),
+        answering.phase()
+    );
+    assert!(at < 15.0, "took {at:.1} s to connect");
+}
+
+/// A call where the answering modem does not start until `quiet_ms` in.
+///
+/// Which is every real call: the calling modem goes off hook, the network
+/// takes its time, and the far end answers when it answers.
+///
+/// Returns every phase each end went through, calling end first.
+fn late_call(
+    seconds: f64,
+    delay: usize,
+    echo: f64,
+    far: f64,
+    quiet_ms: f64,
+) -> (Vec<&'static str>, Vec<&'static str>) {
+    let offer = rate_signal(Rates { at_4800: true, ..Rates::default() });
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let mut a = std::collections::VecDeque::from(vec![0.0; 2 * delay + 1]);
+    let mut b = std::collections::VecDeque::from(vec![0.0; 2 * delay + 1]);
+    let (mut from_calling, mut from_answering) = (0.0, 0.0);
+    let (mut calling_went, mut answering_went) = (Vec::new(), Vec::new());
+    let starts = (quiet_ms / 1000.0 * FS) as usize;
+    for i in 0..(seconds * FS) as usize {
+        a.pop_back();
+        a.push_front(from_calling);
+        b.pop_back();
+        b.push_front(from_answering);
+        let there_and_back = 2 * delay;
+        let to_calling = echo * a[0] + far * b[delay] + TALKER * a[there_and_back];
+        let to_answering = echo * b[0] + far * a[delay] + TALKER * b[there_and_back];
+        from_calling = calling.step(to_calling);
+        // The far end is not on the line yet.
+        from_answering = if i < starts { answering.step(0.0) * 0.0 } else { answering.step(to_answering) };
+        for (modem, went) in [(&calling, &mut calling_went), (&answering, &mut answering_went)] {
+            if went.last() != Some(&modem.phase()) {
+                went.push(modem.phase());
+            }
+        }
+    }
+    (calling_went, answering_went)
+}
+
+#[test]
+fn a_quiet_far_end_is_heard_through_an_echo_at_full_strength() {
+    // The stage a calling modem used to sit in forever on a virtual cable.
+    //
+    // In AA it transmits state A, which puts everything at the carrier and
+    // nothing at the sidebands, and listens at the sidebands for the far end
+    // to reverse its alternation. It is meant to be deaf to its own reflection
+    // by construction. It was not: the tone detectors were a single pole, which
+    // falls away at six decibels an octave, so a twentieth of the carrier still
+    // reached the sideband detector 1200 Hz away. Behind a hybrid that is
+    // twelve decibels down already and does not matter; on a cable the echo
+    // comes back whole, and a twentieth of it is a steady phasor large enough
+    // that the far end reversing its phase barely moved the sum.
+    //
+    // The modem waited for a reversal it could no longer see, which is exactly
+    // what it looked like from the outside: sometimes it does not detect the
+    // answering modem and the call never starts.
+    //
+    // Asked of what each end went through rather than of where the calling
+    // end is when the time runs out, which this used to be and which stopped
+    // meaning it. It passed on a call that was stuck in CC, with the answering
+    // end in CA unable to hear the reversal it was waiting for: its detector
+    // had spent three seconds on the skirt of its own answering tone coming
+    // back off the cable, and still thought 1800 Hz was a tone turning fast.
+    // That end hears it now. And a start-up that fails anywhere later goes
+    // back to AA by 5.4.1's own rule, which the old question could not tell
+    // from never having left.
+    const CABLE_ECHO: f64 = 1.03;
+    for quiet_ms in [0.0, 500.0, 2000.0] {
+        let (calling, answering) = late_call(12.0, 320, CABLE_ECHO, 0.1, quiet_ms);
+        assert!(
+            calling.contains(&"AA to CC"),
+            "after a {quiet_ms:.0} ms pause the calling modem never heard the far end \
+             turn over: {calling:?}"
+        );
+        assert!(
+            answering.contains(&"CA to AC"),
+            "after a {quiet_ms:.0} ms pause the answering modem never heard the calling \
+             modem answer: {answering:?}"
+        );
+    }
+}
+
+/// Play an answering tone at `db` and report the loudest thing we said back.
+///
+/// `reversal_s` is how often the tone turns its phase over, which is what
+/// separates V.25's answering tone from V.8's, and `am` whether it also carries
+/// V.8's fifteen hertz of amplitude modulation.
+fn answered_with(reversal_s: f64, am: bool, db: f64) -> (f64, &'static str) {
+    let offer = rate_signal(Rates { at_4800: true, ..Rates::default() });
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let level = 0.3 * 10.0f64.powf(db / 20.0);
+    let mut peak = 0.0f64;
+    let mut phase = 0.0f64;
+    for i in 0..(FS * 4.0) as usize {
+        let t = i as f64 / FS;
+        let flips = if reversal_s > 0.0 { (t / reversal_s) as u64 } else { 0 };
+        let sign = if flips % 2 == 0 { 1.0 } else { -1.0 };
+        let envelope = if am {
+            1.0 + 0.2 * (std::f64::consts::TAU * 15.0 * t).sin()
+        } else {
+            1.0
+        };
+        phase += std::f64::consts::TAU * 2100.0 / FS;
+        let out = calling.step(level * envelope * sign * phase.sin());
+        // After the second 5.4.1 requires, and a little to spare.
+        if t > 1.5 {
+            peak = peak.max(out.abs());
+        }
+    }
+    (peak, calling.phase())
+}
+
+#[test]
+fn a_modern_answering_tone_still_gets_answered() {
+    // 5.4.1: having heard the answering tone for a second, the calling modem
+    // "shall repetitively transmit carrier state A". It starts talking off the
+    // answering tone alone, before any 600 or 3000 Hz tone has arrived.
+    //
+    // V.25's answering tone is a plain 2100 Hz. V.8's -- which is what every
+    // answering modem made since 1994 sends -- is the same tone with a phase
+    // reversal every 450 ms, and the reversals are the entire point of it:
+    // they are how the far end says it can do V.8.
+    //
+    // A reversal takes a tone detector's phasor through zero, so measured on
+    // the phasor the tone stops existing for a few milliseconds twice a
+    // second. The second it has to be heard for arrived in 450 ms instalments
+    // and the counter went back to nought at every one, so the calling modem
+    // stayed mute -- and the far end, hearing nothing, took it for something
+    // that was not a V.32 modem and moved on. From the outside, a call that
+    // never starts and a modem that never transmits.
+    //
+    // Judged on the envelope instead, a reversal is a ripple.
+    for db in [0.0, -6.0, -12.0, -20.0, -26.0] {
+        for (what, reversal, am) in [
+            ("V.25, plain", 0.0, false),
+            ("V.8 ANSam, reversals", 0.450, false),
+            ("V.8 ANSam, reversals and AM", 0.450, true),
+        ] {
+            let (peak, phase) = answered_with(reversal, am, db);
+            assert!(
+                peak > 1.0e-3,
+                "{what} at {db:.0} dB left us silent, still in {phase}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_line_with_nothing_on_it_is_not_answered() {
+    // The other half of it. Riding through a reversal must not turn into
+    // hearing a tone that was never there: 5.4.1 has the calling modem silent
+    // until the far end speaks, and a modem that transmits into silence would
+    // be talking over the answering tone it is supposed to be waiting for.
+    let (peak, phase) = answered_with(0.0, false, -120.0);
+    assert!(peak < 1.0e-6, "transmitted into a silent line, reaching {phase}");
+    assert_eq!(phase, "listening");
+}
+
+
+/// A whole call at 9600 with the trellis coding, negotiated rather than set.
+///
+/// Both ends offer 4800 and 9600, and both set B8 because both have 2.4.1.2.
+/// The rate exchange has to settle on 9600 *and* on the coding, the E sequence
+/// has to say so, and the two constellations have to change over at the same
+/// place in the stream -- which is the part no unit test of the code itself
+/// can reach.
+#[test]
+fn a_call_at_9600_settles_on_trellis_coding_and_carries_data() {
+    let offer = rate_signal(Rates { at_4800: true, at_9600: true, ..Rates::default() });
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let (mut from_calling, mut from_answering) = (0.0, 0.0);
+    let (to_host, to_caller) = (b"nine thousand six hundred\r\n", b"trellis coded");
+    let (mut sent, mut settled) = (false, f64::NAN);
+    let (mut at_host, mut at_caller) = (Vec::new(), Vec::new());
+
+    for i in 0..(40.0 * FS) as usize {
+        let (a, b) = (from_calling, from_answering);
+        from_calling = calling.step(b * FAR + a * ECHO);
+        from_answering = answering.step(a * FAR + b * ECHO);
+        at_caller.extend(calling.take_bytes());
+        at_host.extend(answering.take_bytes());
+
+        let up = matches!(calling.status(), Status::Connected(_))
+            && matches!(answering.status(), Status::Connected(_));
+        if up && settled.is_nan() {
+            settled = i as f64 / FS;
+        }
+        if up && !sent && i as f64 / FS > settled + 1.0 {
+            sent = true;
+            calling.send(to_host);
+            answering.send(to_caller);
+        }
+    }
+
+    assert_eq!(
+        calling.status(),
+        Status::Connected(9600),
+        "the calling end stopped at {}",
+        calling.phase()
+    );
+    assert_eq!(answering.status(), Status::Connected(9600));
+    assert!(sent, "never connected, so nothing was sent");
+    assert!(
+        contains_at_any_bit_offset(&at_host, to_host),
+        "the answering end did not receive what was typed"
+    );
+    assert!(
+        contains_at_any_bit_offset(&at_caller, to_caller),
+        "the calling end did not receive the host's reply"
+    );
+}
+
+/// A retrain, and the call carrying on afterwards (V.32bis 7).
+///
+/// The thing this exists to catch: a modem that has decided the line is no
+/// longer good enough goes back to the beginning of the start-up, and the far
+/// end has to notice. It has nothing to go on but the tone -- 7.1 and 7.2 give
+/// the two ends the same trigger the start-up gives them, which is the point:
+/// the signal a modem sends to say "again" is the signal it sent to say
+/// "hello".
+///
+/// So this asks one end to retrain, and requires that the other follow it back
+/// through the whole handshake and that data cross afterwards. A modem that
+/// ignores the tone sits there demodulating a conditioning signal as though it
+/// were data, which is what a real far end doing this looked like from here.
+#[test]
+fn a_retrain_is_followed_by_the_far_end_and_the_call_carries_on() {
+    // Up to 9600 and no further, so that the only retrain in this call is the
+    // one it asks for. This line does not hold 14 400 -- what is left after
+    // the canceller has taken out an echo eight decibels louder than the far
+    // end is a third of the distance between neighbouring points, and the
+    // modem now says so and steps down, which is
+    // `a_rate_that_cannot_be_read_is_given_up` below.
+    let offer = rate_signal(Rates::between(4800, 9600));
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let (mut from_calling, mut from_answering) = (0.0, 0.0);
+    let (before, after) = (b"before the retrain\r\n", b"and after it\r\n");
+    let (mut at_host, mut at_caller) = (Vec::new(), Vec::new());
+
+    let mut connected_at = f64::NAN;
+    let mut asked = false;
+    let mut crossed = false;
+    let mut retrained_at = f64::NAN;
+    let mut back_at = f64::NAN;
+    let mut sent_after = false;
+    let mut saw_retraining = (false, false);
+
+    for i in 0..(90.0 * FS) as usize {
+        let now = i as f64 / FS;
+        let (a, b) = (from_calling, from_answering);
+        from_calling = calling.step(b * FAR + a * ECHO);
+        from_answering = answering.step(a * FAR + b * ECHO);
+        at_caller.extend(calling.take_bytes());
+        at_host.extend(answering.take_bytes());
+
+        let up = matches!(calling.status(), Status::Connected(_))
+            && matches!(answering.status(), Status::Connected(_));
+        if up && connected_at.is_nan() {
+            connected_at = now;
+            calling.send(before);
+        }
+        // Only once what was sent has actually crossed: a retrain throws away
+        // whatever the line was carrying, so asking for one on a timer would
+        // be testing how fast the line is rather than whether the retrain
+        // works.
+        // Looked for now and then rather than every sample: the search is
+        // over every bit offset of everything received so far, and doing that
+        // sixteen thousand times a second of line is slower than the line.
+        if up && !asked && i % (FS as usize / 20) == 0 {
+            crossed = crossed || contains_at_any_bit_offset(&at_host, before);
+            if crossed {
+                asked = true;
+                answering.ask_for_retrain();
+            }
+        }
+        if asked {
+            saw_retraining.0 |= calling.status() == Status::Retraining;
+            saw_retraining.1 |= answering.status() == Status::Retraining;
+        }
+        if asked && retrained_at.is_nan() && !up {
+            retrained_at = now;
+        }
+        // And back again, which is the whole question.
+        if asked && retrained_at.is_finite() && back_at.is_nan() && up {
+            back_at = now;
+        }
+        if back_at.is_finite() && !sent_after && now > back_at + 1.0 {
+            sent_after = true;
+            answering.send(after);
+        }
+    }
+
+    assert!(connected_at.is_finite(), "never connected in the first place");
+    assert!(asked, "never got far enough to ask");
+    assert!(
+        retrained_at.is_finite(),
+        "the retrain never took: calling is {} and answering is {}",
+        calling.phase(),
+        answering.phase()
+    );
+    // The end that did not ask has to have noticed. That is the bug this is
+    // here for: without it, it stays "connected" and demodulates a handshake.
+    assert!(
+        saw_retraining.0,
+        "the calling end never noticed the far end had gone back to the start"
+    );
+    assert!(saw_retraining.1, "the asking end did not report a retrain");
+    assert!(
+        back_at.is_finite(),
+        "it went back through the start-up and never came out: calling is {} \
+         and answering is {}",
+        calling.phase(),
+        answering.phase()
+    );
+    assert!(
+        matches!(calling.status(), Status::Connected(_)),
+        "the calling end ended at {}",
+        calling.phase()
+    );
+    assert_eq!(calling.retrains(), 1, "the calling end counted its retrains wrong");
+    assert_eq!(answering.retrains(), 1);
+
+    assert!(
+        contains_at_any_bit_offset(&at_host, before),
+        "what was sent before the retrain did not arrive"
+    );
+    assert!(sent_after, "never came back up in time to send anything");
+    assert!(
+        contains_at_any_bit_offset(&at_caller, after),
+        "the call did not carry data after the retrain"
+    );
+    println!(
+        "  connected at {connected_at:.1} s, retrained at {retrained_at:.1}, \
+         back at {back_at:.1}, {} bit/s",
+        match calling.status() {
+            Status::Connected(rate) => rate,
+            _ => 0,
+        }
+    );
+}
+
+/// And the far end's own tone is enough: nothing is asked for here, the
+/// calling modem simply hears what an answering modem sends when it starts
+/// again.
+#[test]
+fn the_retrain_tone_alone_is_enough_to_follow() {
+    let offer = rate_signal(Rates::between(4800, 9600));
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let (mut from_calling, mut from_answering) = (0.0, 0.0);
+    let mut connected_at = f64::NAN;
+    let mut noticed = false;
+
+    for i in 0..(60.0 * FS) as usize {
+        let now = i as f64 / FS;
+        let (a, b) = (from_calling, from_answering);
+        from_calling = calling.step(b * FAR + a * ECHO);
+        from_answering = answering.step(a * FAR + b * ECHO);
+        let _ = (calling.take_bytes(), answering.take_bytes());
+
+        if connected_at.is_nan() && matches!(calling.status(), Status::Connected(_)) {
+            connected_at = now;
+        }
+        if connected_at.is_finite() && now > connected_at + 1.0 {
+            answering.ask_for_retrain();
+        }
+        if calling.status() == Status::Retraining {
+            noticed = true;
+            break;
+        }
+    }
+    assert!(connected_at.is_finite(), "never connected");
+    assert!(
+        noticed,
+        "the calling end sat through the answering end's retrain tone: {}",
+        calling.phase()
+    );
+}
+
+/// One call retrained `attempts` times by `asker`, each a second or so after
+/// the last one came back and a little later into that second each time.
+///
+/// Returns how long each took, or where the two ends were left if one did not
+/// come back at all.
+fn retrain_again_and_again(
+    asker: Role,
+    echo: f64,
+    far: f64,
+    delay: usize,
+    attempts: usize,
+) -> Result<Vec<f64>, String> {
+    let offer = rate_signal(Rates::between(4800, 9600));
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let mut to_answering = std::collections::VecDeque::from(vec![0.0; delay]);
+    let mut to_calling = std::collections::VecDeque::from(vec![0.0; delay]);
+    let (mut from_calling, mut from_answering) = (0.0, 0.0);
+    let mut step = |calling: &mut Modem, answering: &mut Modem| {
+        to_answering.push_front(from_calling);
+        to_calling.push_front(from_answering);
+        let (heard_by_calling, heard_by_answering) = (
+            to_calling.pop_back().unwrap_or(0.0),
+            to_answering.pop_back().unwrap_or(0.0),
+        );
+        let (a, b) = (from_calling, from_answering);
+        from_calling = calling.step(heard_by_calling * far + a * echo);
+        from_answering = answering.step(heard_by_answering * far + b * echo);
+        let _ = (calling.take_bytes(), answering.take_bytes());
+    };
+    let up = |calling: &Modem, answering: &Modem| {
+        matches!(calling.status(), Status::Connected(_))
+            && matches!(answering.status(), Status::Connected(_))
+    };
+
+    for _ in 0..(40.0 * FS) as usize {
+        if up(&calling, &answering) {
+            break;
+        }
+        step(&mut calling, &mut answering);
+    }
+    if !up(&calling, &answering) {
+        return Err(format!("never connected: {} and {}", calling.phase(), answering.phase()));
+    }
+    let mut took = Vec::new();
+    for attempt in 0..attempts {
+        // Where the retrain lands in what the line is carrying is the whole
+        // variable, so it moves by a prime number of samples each time.
+        for _ in 0..FS as usize + attempt * 113 {
+            step(&mut calling, &mut answering);
+        }
+        match asker {
+            Role::Calling => calling.ask_for_retrain(),
+            Role::Answering => answering.ask_for_retrain(),
+        }
+        let mut samples = 0;
+        // Take it out of data first, which the check below would otherwise
+        // see as having come back before it left.
+        while up(&calling, &answering) && samples < FS as usize {
+            step(&mut calling, &mut answering);
+            samples += 1;
+        }
+        while !up(&calling, &answering) && samples < (20.0 * FS) as usize {
+            step(&mut calling, &mut answering);
+            samples += 1;
+        }
+        if !up(&calling, &answering) {
+            return Err(format!(
+                "retrain {attempt} never came back: calling end in {}, answering end in {}",
+                calling.phase(),
+                answering.phase()
+            ));
+        }
+        took.push(samples as f64 / FS);
+    }
+    Ok(took)
+}
+
+/// A retrain comes back whenever it is asked for, and whichever end asks.
+///
+/// Where it lands was the whole of it. The far end is still sending data
+/// when a retrain begins, and goes on sending it until it has heard enough of
+/// the retrain to follow; the end that asked was treating that data as the
+/// tone it had to hear first, and treating the step from the data to the tone
+/// as the reversal it was waiting for. Or its reversal detector had spent the
+/// wait on the data and refused the real reversal when it came. Either way
+/// the two ends each ended up waiting for something the other had already
+/// sent, and stayed that way until a minute's patience ran out.
+///
+/// So it depended on the moment, and on the line. Asked for from the calling
+/// end it stuck in 18 retrains of 30 on a direct line, 19 of 20 once that line
+/// had a 100 ms round trip, and all 20 over a hybrid with a 200 ms one; from
+/// the answering end, 2 of 30, 3 of 20 and 7 of 20. On a call it looked like a
+/// retrain that worked followed by a line that carried nothing, and was found
+/// as exactly that: V.42 connected, data typed, nothing arriving.
+#[test]
+fn a_retrain_comes_back_whenever_it_is_asked_for_and_whoever_asks() {
+    // The far end at full strength with nothing else on the line, as two
+    // modems joined directly give, and a hybrid. Both with a round trip,
+    // because the answering end's half of this needs one: its far end's data
+    // has to still be arriving once it has begun listening for state A.
+    let lines = [
+        ("a direct line with a 100 ms round trip", 0.0, 1.0, 800),
+        ("a hybrid with a 200 ms round trip", ECHO, FAR, 1600),
+    ];
+    for (line, echo, far, delay) in lines {
+        for asker in [Role::Calling, Role::Answering] {
+            match retrain_again_and_again(asker, echo, far, delay, 4) {
+                Ok(took) => println!("  {line}, asked by {asker:?}: back after {took:.2?} s"),
+                Err(stuck) => panic!("on {line}, asked for by the {asker:?} end: {stuck}"),
+            }
+        }
+    }
+}
+
+/// The margins around 5.4.1's S sequence, over a line with length.
+///
+/// Returned in symbol intervals: how long the calling modem's S lasted, and
+/// how much of it was left on the line when the answering modem finished
+/// waiting out 5.4.2's MT and looked for it again.
+fn s_and_its_margin(delay: usize) -> (i64, i64, u64, u64) {
+    let offer = rate_signal(Rates { at_4800: true, ..Rates::default() });
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let mut line = Line::new(delay);
+    let (mut from_calling, mut from_answering) = (0.0, 0.0);
+    let (mut began, mut ended, mut looked) = (None, None, None);
+
+    for i in 0..(40.0 * FS) as usize {
+        let (to_calling, to_answering) = line.step(from_calling, from_answering);
+        from_calling = calling.step(to_calling);
+        from_answering = answering.step(to_answering);
+        if began.is_none() && calling.phase() == "S pre-roll" {
+            began = Some(i);
+        }
+        if began.is_some() && ended.is_none() && calling.phase() == "S bar" {
+            ended = Some(i);
+        }
+        if looked.is_none() && answering.phase() == "awaiting R2" {
+            looked = Some(i);
+        }
+    }
+    let (began, ended, looked) = (
+        began.expect("the calling end never sent an S"),
+        ended.expect("the calling end never finished its S"),
+        looked.expect("the answering end never waited out MT"),
+    );
+    let symbols = |samples: i64| (samples as f64 * datapump::v32::BAUD / FS) as i64;
+    (
+        symbols((ended - began) as i64),
+        // The S the answering end is looking for left this end a one-way
+        // delay ago, so that is where the two clocks meet.
+        symbols(ended as i64 + delay as i64 - looked as i64),
+        calling.counted(),
+        answering.counted(),
+    )
+}
+
+#[test]
+fn the_s_sequence_is_still_going_when_the_far_end_looks_for_it_again() {
+    // 5.4.1 has the calling modem send S "for a period NT already estimated by
+    // the counter/timer" and then for 256 symbol intervals more. 5.4.2 has the
+    // answering modem hear that S, cease transmitting, "wait for a period MT
+    // already estimated by the counter/timer" and then go on only "if an
+    // incoming S sequence persists".
+    //
+    // So the two ends meet on the strength of NT and MT being the same
+    // measurement, which they are: symmetric clocks over one line, timing the
+    // procedure's own fixed delays as well as the line's, and what is on both
+    // sides cancels. The 256 symbols are the whole of the margin, and they are
+    // there to be spent on how long the far end's detector takes.
+    //
+    // Take anything off one side and the margin goes with it. On a recorded
+    // call to a real V.32bis modem, 166 symbols had been taken off NT; the far
+    // end spent 228 noticing the S; and when it looked again MT later the S
+    // had finished 30 ms earlier. It waited nearly five seconds for one to
+    // reappear, then started the call over from the answer tone. Twice.
+    let (length, margin, nt, mt) = s_and_its_margin(DELAY);
+    println!(
+        "S ran {length} symbols, {margin} of them still to come when the \
+         answering end looked; NT {nt}, MT {mt}"
+    );
+    assert!(
+        margin >= 128,
+        "only {margin} symbols of S left when the far end looked for it, \
+         and a far end slower to notice one than this would find none"
+    );
+    assert!(
+        length >= nt as i64 + 256,
+        "S ran {length} symbols, short of the NT of {nt} and the 256 more \
+         that 5.4.1 asks for"
+    );
+}
+
+
+#[test]
+fn r2_is_not_held_up_for_ever_when_no_r3_is_coming() {
+    // 5.4.1 says "Transmission of R2 shall continue until an incoming rate
+    // signal R3 is detected" and stops there. Read as written it is a wait
+    // with no end, and a far end that has given up and gone back to its own
+    // answer tone will never satisfy it.
+    //
+    // That is not a hypothetical either. On a recorded call the far end
+    // restarted twice, eight seconds of alternations each time, while this end
+    // sent R2 at it for twenty-three seconds and then let it hang up.
+    //
+    // What bounds the wait is the far end's own procedure: before R3 it sends
+    // a second conditioning signal, and 5.2 makes that 256 symbols of S, 16 of
+    // S-bar and a training segment 5.2.3 caps at 8192. Here the answering
+    // modem is taken off the line the moment this end starts R2, so no R3 is
+    // ever coming and the whole of that bound has to run out.
+    let offer = rate_signal(Rates { at_4800: true, ..Rates::default() });
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let (mut from_calling, mut from_answering) = (0.0, 0.0);
+    let (mut began_r2, mut gave_up) = (None, None);
+
+    for i in 0..(40.0 * FS) as usize {
+        let (a, b) = (from_calling, from_answering);
+        // Once this end is sending R2 the far end is gone, and what reaches
+        // this end is its own reflection off the hybrid and nothing else.
+        let heard = if began_r2.is_some() { 0.0 } else { b * FAR };
+        from_calling = calling.step(heard + a * ECHO);
+        from_answering = answering.step(a * FAR + b * ECHO);
+        if began_r2.is_none() && calling.phase() == "rate signal" {
+            began_r2 = Some(i);
+        }
+        if began_r2.is_some() && gave_up.is_none() && calling.phase() == "AA" {
+            gave_up = Some(i);
+            break;
+        }
+    }
+
+    let began_r2 = began_r2.expect("this end never got as far as R2");
+    let gave_up = gave_up.expect(
+        "this end was still sending R2 forty seconds later, at an answering \
+         modem that had been off the line for most of them",
+    );
+    let symbols = (gave_up - began_r2) as f64 * datapump::v32::BAUD / FS;
+    println!("gave up on R3 after {symbols:.0} symbols and went back to state A");
+    // 5.2's longest conditioning signal is 8464 symbols; anything much under
+    // that would be giving up on a far end still doing as it is told.
+    assert!(
+        symbols > 8464.0,
+        "gave up after only {symbols:.0} symbols, inside the 8464 a far end \
+         following 5.2 is allowed for its second conditioning signal"
+    );
+    assert!(
+        symbols < 12000.0,
+        "took {symbols:.0} symbols to notice, which on a real call is nine \
+         seconds of talking to nobody"
+    );
+    assert!(
+        !matches!(calling.status(), Status::Connected(_)),
+        "connected to a modem that was not there"
+    );
+}
+
+
+#[test]
+fn a_rate_that_cannot_be_read_is_given_up() {
+    // 7 begins a retrain on "detection of unsatisfactory signal reception" and
+    // leaves each implementation to say what that is. Saying it as a distance
+    // does not work: normalised the same way, neighbouring points are 1.41
+    // apart at 4800 and 0.22 at 14 400, so one number is a quarter of the gap
+    // at one end of the range and one and a half gaps at the other -- further
+    // than a symbol can land from the nearest point, which made the test
+    // unreachable exactly where it was needed.
+    //
+    // On a real call that came up at 14 400 and never decoded a byte, the
+    // equaliser sat at a third of a gap for thirty-seven seconds and nothing
+    // fired. Here the same thing happens on a line whose residual echo will
+    // not carry a hundred and twenty-eight points, and the modem has to notice
+    // and come back somewhere it can read -- which means offering less, since
+    // the rate exchange has no memory and would otherwise arrive back where it
+    // started. 5.4.1 and 5.4.2 both ask for that: the rate signals "should
+    // also take account of the likely receiver performance with the particular
+    // GSTN connection".
+    let offer = rate_signal(Rates::between(4800, 14_400));
+    let mut calling = Modem::new(Role::Calling, offer, FS);
+    let mut answering = Modem::new(Role::Answering, offer, FS);
+    let (mut from_calling, mut from_answering) = (0.0, 0.0);
+    let mut first = None;
+    let mut settled = None;
+
+    for i in 0..(40.0 * FS) as usize {
+        let (a, b) = (from_calling, from_answering);
+        from_calling = calling.step(b * FAR + a * ECHO);
+        from_answering = answering.step(a * FAR + b * ECHO);
+        if let (Status::Connected(here), Status::Connected(there)) =
+            (calling.status(), answering.status())
+        {
+            if first.is_none() {
+                first = Some(here);
+            }
+            settled = Some((here, there, i as f64 / FS));
+        }
+    }
+
+    let first = first.expect("never connected at all");
+    let (here, there, _) = settled.expect("never connected at all");
+    println!(
+        "came up at {first}, ended at {here} after {} retrains, {:.3} of the gap",
+        calling.retrains(),
+        calling.residual_error() / calling.point_spacing(),
+    );
+    assert_eq!(first, 14_400, "did not start at the rate that cannot be read");
+    assert!(
+        here < first,
+        "stayed at {here} on a line it cannot read it on"
+    );
+    assert_eq!(here, there, "the two ends came back at different rates");
+    assert!(calling.retrains() >= 1, "went down without a retrain");
+    // And it is not still going down. A modem that steps once per second until
+    // it runs out of rates is no better than one that never steps at all.
+    assert!(
+        calling.residual_error() < UNSATISFACTORY_GAP * calling.point_spacing(),
+        "settled at {here} and is still not reading it: {:.3} of the gap",
+        calling.residual_error() / calling.point_spacing(),
+    );
+    assert!(
+        calling.retrains() <= 3,
+        "took {} retrains to find a rate it could read",
+        calling.retrains()
+    );
+}
+
+#[test]
+fn the_two_clocks_differ_by_the_one_wait_that_is_inside_only_one_of_them() {
+    // 5.4.1 starts the calling modem's counter on detecting the answering
+    // modem's reversal and stops it on detecting the answer, so both 64-symbol
+    // waits are inside it: this end's, before it turns over, and the far
+    // end's before it turns back. 5.4.2 starts the answering modem's counter
+    // as it begins transmitting its own reversal, so only the calling modem's
+    // wait is inside. NT is therefore MT plus exactly one of them.
+    //
+    // Which makes it a check on the clocks themselves. A counter that starts
+    // and stops on the same event -- one turnover reported twice by a detector
+    // that has not settled -- reads near zero and breaks the relation. That
+    // happened on a real call: 53 ms on a line whose round trip is 1.2
+    // seconds, and the start-up carried on with it while the far end, which
+    // had measured the same line properly, waited six seconds for a modem that
+    // thought the line was twenty times shorter than it is.
+    let (_, _, nt, mt) = s_and_its_margin(DELAY);
+    let trip = (2 * DELAY) as f64 * datapump::v32::BAUD / FS;
+    println!("NT {nt}, MT {mt}, and the line itself is {trip:.0} symbols");
+    assert_eq!(
+        nt,
+        mt + 64,
+        "NT should be MT and one 64-symbol wait, and is {nt} against {mt}"
+    );
+    // And both have to contain the line. A clock stopped by its own start
+    // reads less than the trip it is supposed to be measuring.
+    assert!(
+        (mt as f64) > trip + 64.0,
+        "MT of {mt} is under the {trip:.0} symbols of line plus the wait it \
+         contains, so it cannot have measured the round trip at all"
+    );
+}

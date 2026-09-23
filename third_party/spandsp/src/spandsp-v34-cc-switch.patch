@@ -1,0 +1,86 @@
+--- v34rx.c
++++ v34rx.c
+@@ -1553,8 +1553,14 @@
+                    multi-rate S correlator bin can be an alias, so use it to
+                    detect S without replacing the negotiated parameters. */
+                 s->v34_carrier_phase_rate = dds_phase_ratef(carrier_frequency(s->baud_rate, s->high_carrier));
++                /* Switch the RX demodulator to the primary channel so that
++                   duplex_mp_rx() can be reached from primary_channel_rx().
++                   Without this the receiver stays in CC mode and never
++                   processes the far-end MP/MP'/E on the primary carrier. */
++                s->current_demodulator = V34_MODULATION_V34;
++                s->carrier_phase = 0;
+                 span_log(s->logging, SPAN_LOG_FLOW,
+-                         "Rx - S signal detected (V34_EVENT_S), baud code %d, carrier %s\n",
++                         "Rx - S signal detected (V34_EVENT_S), baud code %d, carrier %s -> switching to primary channel\n",
+                          s->baud_rate, s->high_carrier  ?  "high"  :  "low");
+             }
+             /*endif*/
+@@ -2583,9 +2589,12 @@
+             zz.im = -sample.re*z.im - sample.im*z.re;
+             process_cc_half_baud(s, &zz);
+ 
+-            //angle = arctan2(zz.im, zz.re);
+-            //printf("XYX1 %10.5f %10.5f\n", atan2(zz.re, zz.im), sqrt(zz.re*zz.re + zz.im*zz.im));
+-            // printf("XYX2 %10.5f %10.5f\n", zz.re, zz.im);
++            /* If the demodulator switched (e.g. S detection triggered a
++               move to the primary channel), stop consuming samples here
++               so the v34_rx() dispatch loop sends the rest to the
++               correct handler (primary_channel_rx -> duplex_mp_rx). */
++            if (s->current_demodulator != V34_MODULATION_CC)
++                return i + 1;
+         }
+         /*endif*/
+ #if defined(SPANDSP_USE_FIXED_POINT)
+@@ -2785,6 +2794,7 @@
+         /*endfor*/
+         s->baud_half = 1;
+         s->mp_direct = true;
++        span_log(s->logging, SPAN_LOG_FLOW, "duplex_mp_rx: init, len=%d, baud=%.1f\n", len, baud);
+     }
+     /*endif*/
+ 
+@@ -2851,6 +2861,18 @@
+                     if (variant & 4)
+                         dibit = ((dibit & 1) << 1) | ((dibit >> 1) & 1);
+                     /*endif*/
++                    /* Log the first few symbols for each candidate to
++                       diagnose MP demodulation with a real modem. */
++                    if (s->mp_timing_count[candidate] <= 0
++                        && s->mp_timing_lock < 0
++                        && candidate == 0)
++                    {
++                        static int mp_sym_log = 0;
++                        if (mp_sym_log++ < 20)
++                            span_log(s->logging, SPAN_LOG_FLOW,
++                                     "duplex_mp_rx sym[%d]: re=%.2f im=%.2f a1=%08x a2=%08x dibit=%d\n",
++                                     candidate, symbol.re, symbol.im, a1, a2, dibit);
++                    }
+                     int b;
+                     int j;
+                     for (j = 0;  j < 2;  j++)
+@@ -2912,6 +2934,24 @@
+         }
+     }
+     /*endfor*/
++    {
++        static int mp_rx_count = 0;
++        if (mp_rx_count++ % 200 == 0)
++        {
++            /* Compute received signal power at the mix output. */
++            float power_i = 0.0f, power_q = 0.0f;
++            int n;
++            for (n = 0;  n < 81 && n < len;  n++)
++            {
++                power_i += s->mp_mix_i[n] * s->mp_mix_i[n];
++                power_q += s->mp_mix_q[n] * s->mp_mix_q[n];
++            }
++            span_log(s->logging, SPAN_LOG_FLOW,
++                     "duplex_mp_rx: processed %d samples, timing_lock=%d, stage=%d, mix_power=%.1f\n",
++                     i, s->mp_timing_lock, s->stage,
++                     (power_i + power_q) / 81.0f);
++        }
++    }
+     return i;
+ }
+ /*- End of function --------------------------------------------------------*/

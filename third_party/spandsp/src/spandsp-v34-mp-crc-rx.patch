@@ -1,0 +1,36 @@
+--- v34rx.c
++++ v34rx.c
+@@ -2363,17 +2363,17 @@
+         {
+             s->crc = 0xFFFF;
+             s->bit_count = 0;
+-            s->mp_count = 17;
++            s->mp_count = 17;
+             /* Check the type bit, and set the expected length accordingly. */
+             if (bits[i])
+             {
+-                s->mp_len = 186 + 1;
+-                s->mp_and_fill_len = 186 + 1 + 1;
++                s->mp_len = 186;
++                s->mp_and_fill_len = 187;
+             }
+             else
+             {
+-                s->mp_len = 84 + 1;
+-                s->mp_and_fill_len = 84 + 3 + 1;
++                s->mp_len = 84;
++                s->mp_and_fill_len = 87;
+             }
+             /*endif*/
+         }
+@@ -2892,8 +2892,8 @@
+                         if ((s->mp_timing_stream[candidate] & 0x7FFFE) == 0x7FFFC)
+                         {
+                             s->mp_timing_crc[candidate] = 0xFFFF;
+-                            s->mp_timing_count[candidate] = 17;
+-                            s->mp_timing_len[candidate] = b ? 187 : 85;
++                            s->mp_timing_count[candidate] = 17;
++                            s->mp_timing_len[candidate] = b ? 186 : 84;
+                         }
+                         /*endif*/
+                         if (s->mp_timing_count[candidate] >= 0)

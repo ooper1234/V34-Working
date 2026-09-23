@@ -60,12 +60,19 @@ add_library(softmodem STATIC
     src/serial/sm_async.c
     src/ast_socket/sm_ast_socket.c
     src/ppp/sm_pppd.c
+    src/bbs/bbs.c
+    src/bbs/doors/door_manager.c
+    src/bbs/doors/blackjack.c
+    src/bbs/doors/hangman.c
+    src/bbs/doors/space_trader.c
+    src/bbs/doors/dungeon.c
+    src/bbs/doors/speed_challenge.c
     src/call/sm_call.c
     src/sip/sm_sip.c
     ${SM_V8_SRC}
 )
 target_compile_definitions(softmodem PUBLIC ${SM_V8_DEFS})
-target_link_libraries(softmodem ${MATH_LIB} ${SM_V8_LIBS})
+target_link_libraries(softmodem ${MATH_LIB} ${SM_V8_LIBS} dl)
 
 # The answerer daemon
 add_executable(sm_daemon src/main/sm_daemon.c)
@@ -87,6 +94,12 @@ target_link_libraries(v22bs_helpers softmodem ${MATH_LIB})
 # V.22bis loopback test (modem vs modem in-process)
 add_executable(v22bis_loopback tests/v22bis_loopback.c)
 target_link_libraries(v22bis_loopback softmodem ${MATH_LIB})
+
+add_executable(replay_pcm tools/replay_pcm.c)
+target_link_libraries(replay_pcm softmodem ${MATH_LIB})
+
+add_executable(bbs_session_test tests/bbs_session.c)
+target_link_libraries(bbs_session_test softmodem ${MATH_LIB})
 
 # PTY byte transport test
 add_executable(v22bis_pty tests/v22bis_pty.c)
@@ -125,9 +138,46 @@ if(SPANDSP_V34_INC AND SPANDSP_V34_LIB)
     add_executable(v34_mapping tests/v34_mapping.c)
     target_include_directories(v34_mapping PRIVATE ${SPANDSP_V34_INC})
     target_link_libraries(v34_mapping ${SPANDSP_V34_LIB} softmodem ${MATH_LIB})
+    # V.34 answerer support inside the daemon (opt-in with --v34). V.34 is
+    # negotiated by V.8, so this needs the V.8 support as well.
+    if(SM_V8_SRC)
+        target_compile_definitions(softmodem PUBLIC SM_HAVE_V34)
+        target_include_directories(softmodem PUBLIC ${SPANDSP_V34_INC})
+        target_link_libraries(sm_daemon ${SPANDSP_V34_LIB})
+        target_link_libraries(sm_sip ${SPANDSP_V34_LIB})
+    endif()
 else()
     message(STATUS "V.34 engine not found - v34_loopback skipped "
                    "(build it with src/modem/v34/build_v34.sh)")
+endif()
+
+# BinModem V.34 answerer: the vendored Rust engine (third_party/BinModem,
+# upstream https://github.com/CasualArclamp/BinModem, GPL-3.0-or-later),
+# built with cargo into a static library and linked into the daemon for
+# --binmodem. Needs cargo (~/.cargo/bin is searched as well as PATH).
+find_program(CARGO cargo HINTS $ENV{HOME}/.cargo/bin)
+if(CARGO AND EXISTS "${CMAKE_SOURCE_DIR}/third_party/BinModem/Cargo.toml")
+    file(GLOB_RECURSE BM_RUST_SOURCES
+        "${CMAKE_SOURCE_DIR}/third_party/BinModem/crates/*.rs")
+    set(BM_LIB "${CMAKE_SOURCE_DIR}/third_party/BinModem/target/release/libbinmodemffi.a")
+    add_custom_command(
+        OUTPUT ${BM_LIB}
+        COMMAND ${CARGO} build --release -p binmodemffi
+                --manifest-path "${CMAKE_SOURCE_DIR}/third_party/BinModem/Cargo.toml"
+        DEPENDS ${BM_RUST_SOURCES}
+                "${CMAKE_SOURCE_DIR}/third_party/BinModem/Cargo.toml"
+                "${CMAKE_SOURCE_DIR}/third_party/BinModem/crates/ffi/Cargo.toml"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third_party/BinModem"
+        COMMENT "Building the BinModem answerer (cargo release)"
+        VERBATIM)
+    add_custom_target(binmodemffi ALL DEPENDS ${BM_LIB})
+    target_compile_definitions(softmodem PUBLIC SM_HAVE_BM)
+    target_link_libraries(softmodem ${BM_LIB} pthread dl m)
+    add_executable(bmodem_loopback tests/bmodem_loopback.c)
+    target_link_libraries(bmodem_loopback softmodem ${MATH_LIB})
+    message(STATUS "BinModem answerer enabled (${BM_LIB})")
+else()
+    message(STATUS "BinModem answerer disabled (cargo or third_party/BinModem missing)")
 endif()
 
 # Reference (spandsp) cross-interop test - optional. Needs spanDSP headers

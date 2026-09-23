@@ -1,0 +1,29 @@
+--- v34rx.c
++++ v34rx.c
+@@ -2879,11 +2879,16 @@
+         }
+         /*endfor*/
+         s->baud_half = 1;
++        s->j_rx_samples = 0;
+         s->mp_direct = true;
+         span_log(s->logging, SPAN_LOG_FLOW, "duplex_mp_rx: init, len=%d, baud=%.1f\n", len, baud);
+     }
+     /*endif*/
+ 
++    if (s->stage == V34_RX_STAGE_PRIMARY_CHANNEL)
++        s->j_rx_samples += len;
++    /*endif*/
++
+     for (i = 0;  i < len
+                 &&  (s->stage == V34_RX_STAGE_CC
+                      || s->stage == V34_RX_STAGE_PRIMARY_CHANNEL);  i++)
+@@ -3013,7 +3018,8 @@
+                             else if (s->mp_timing_count[candidate] > 0)
+                                 s->mp_timing_count[candidate]--;
+                             /*endif*/
+-                            if (s->mp_timing_count[candidate] >= 8)
++                            if (s->j_rx_samples >= (800*8000/2400)
++                                &&  s->mp_timing_count[candidate] >= 8)
+                             {
+                                 s->mp_timing_lock = candidate;
+                                 s->mp_dibit_xor = variant & 3;

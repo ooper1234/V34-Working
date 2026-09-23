@@ -36,7 +36,10 @@ typedef struct {
     int nbits;
     int byte;
     int prev;                         /* previous bit, for start edge detect */
-    uint8_t out[64];
+    /* Bursts land whole: bm_service hands up everything a 20 ms frame held
+       before the drain runs, which is 84 bytes at 33600 bit/s. The old 64
+       overflowed and the flush-on-full dropped every byte held. */
+    uint8_t out[4096];
     int out_len;
     uint64_t framing_errors;
     uint64_t bytes_out;

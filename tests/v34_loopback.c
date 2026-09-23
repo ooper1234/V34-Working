@@ -102,6 +102,8 @@ typedef struct
 {
     uint32_t state;
     uint8_t buf[400000];
+    uint8_t rx_buf[400000];
+    long rx_logged;
     int wr;
     int rd;
     long bits;
@@ -140,6 +142,8 @@ static void put_bit_a(void *user_data, int bit)
     }
     if (d->rd < d->wr && bit != d->buf[d->rd])
         rx_bad++;
+    if (d->rx_logged < (long) sizeof(d->rx_buf))
+        d->rx_buf[d->rx_logged++] = (uint8_t) bit;
     d->rd++;
     rx_bits++;
 }
@@ -446,6 +450,45 @@ int main(int argc, char **argv)
     }
 
     printf("final: rx_bits=%d rx_bad=%d\n", rx_bits, rx_bad);
+    {
+        /* Measure the decoder latency/alignment: scan offsets of the received
+           bit stream against the transmitted one and report the best. */
+        data_dir_t *dirs[2];
+        const char *names[2];
+        int dd;
+        dirs[0] = &dir_a;
+        dirs[1] = &dir_b;
+        names[0] = "a";
+        names[1] = "b";
+        for (dd = 0;  dd < 2;  dd++)
+        {
+            data_dir_t *d = dirs[dd];
+            long shift;
+            long best_shift = -1;
+            long best_bad = -1;
+            long n0 = 0;
+            long k;
+            for (shift = 0;  shift < 2000 && shift < d->wr;  shift++)
+            {
+                long bad = 0;
+                long n = 0;
+                for (k = 0;  k + shift < d->wr && k < d->rx_logged;  k++)
+                {
+                    if (d->rx_buf[k] != d->buf[k + shift])
+                        bad++;
+                    n++;
+                }
+                if (n > 2000  &&  (best_bad < 0  ||  (double) bad/n < (double) best_bad/n0))
+                {
+                    best_shift = shift;
+                    best_bad = bad;
+                    n0 = n;
+                }
+            }
+            printf("dir %s: tx_bits=%d rx_bits=%ld; best shift %ld -> %ld/%ld mismatches\n",
+                   names[dd], d->wr, d->rx_logged, best_shift, best_bad, n0);
+        }
+    }
     if (rx_bits > 0)
         printf("NOTE: the primary-channel receiver front end (timing lock, AGC,\n"
                "      level calibration) is not complete; received bits are not\n"

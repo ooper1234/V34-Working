@@ -1,0 +1,981 @@
+//! Drives the receiver and publishes telemetry.
+//!
+//! Today the sample source is a WAV file paced to real time. That is
+//! deliberate: the loop below has the same shape a WASAPI callback will have,
+//! so replacing the source with live audio changes where samples come from and
+//! nothing else.
+//!
+//! A 2-wire capture carries both directions summed, so two receivers run in
+//! parallel — one on each Bell 103 band — and the transcript shows both sides
+//! of the conversation separately.
+
+use std::collections::VecDeque;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use datapump::Bell103Rx;
+use datapump::v22bis::{Channel, Receiver as V22bisRx};
+use ec::hdlc::{Decoder, Fcs};
+use line::AudioSink;
+use dsp::Spectrum;
+use telemetry::{CallState, Direction, Leds, Publisher};
+
+pub const SCOPE_LEN: usize = 1024;
+pub const FFT_SIZE: usize = 1024;
+pub const SPECTRUM_BINS: usize = FFT_SIZE / 2;
+/// Symbols kept for the scope.
+///
+/// Eighty was enough when the largest constellation was sixteen points. It is
+/// not enough for thirty-two: two or three dots to a cluster does not show
+/// where a cluster is, let alone how tight it is, and a constellation that is
+/// slowly turning looks the same as one that is merely noisy. Five hundred and
+/// twelve is sixteen to a cluster at the widest, and still only a fifth of a
+/// second at 2400 baud -- recent enough that what is on the screen is what the
+/// line is doing now.
+pub const SYMBOL_HISTORY: usize = 512;
+
+/// Samples of PCM the pair scope keeps: two seconds at 8000 a second.
+pub const PCM_DEPTH: usize = 16_384;
+
+/// Points the scope keeps for a constellation of `states` points.
+///
+/// Sixteen a cluster is right for anything up to V.32bis's hundred and
+/// twenty-eight. V.34's data mode is another matter: 832 points at 31 200 and
+/// 1664 at 33 600, which five hundred symbols do not land on even once each,
+/// so what was drawn was a speckled disc rather than a constellation. A dozen
+/// a point, up to sixteen thousand -- which at 3429 baud is still only the
+/// last three to five seconds.
+pub fn scope_depth(states: usize) -> usize {
+    if states > 128 { (12 * states).min(16_384) } else { SYMBOL_HISTORY }
+}
+
+/// Which standard a capture holds, and whether we can yet demodulate it.
+///
+/// Running the Bell 103 receiver against a V.22bis capture produces confident
+/// nonsense: a plausible byte count, a plausible quality figure, and none of it
+/// real. Naming the standard up front means the display can say what it is
+/// actually doing rather than reporting noise as data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standard {
+    Bell103,
+    V22bis,
+    V32bis,
+    V34,
+    V90,
+    V92,
+    Unknown,
+}
+
+impl Standard {
+    /// Identify from the vector's file name.
+    pub fn from_name(name: &str) -> Self {
+        let n = name.to_ascii_lowercase();
+        if n.contains("bell103") {
+            Self::Bell103
+        } else if n.contains("v22bis") {
+            Self::V22bis
+        } else if n.contains("v32bis") {
+            Self::V32bis
+        } else if n.contains("v34") {
+            Self::V34
+        } else if n.contains("v90") {
+            Self::V90
+        } else if n.contains("v92") {
+            Self::V92
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// True only where a receiver actually exists.
+    pub fn has_receiver(self) -> bool {
+        matches!(self, Self::Bell103 | Self::V22bis)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bell103 => "Bell 103",
+            Self::V22bis => "V.22bis",
+            Self::V32bis => "V.32bis (no receiver)",
+            Self::V34 => "V.34 (no receiver)",
+            Self::V90 => "V.90 (no receiver)",
+            Self::V92 => "V.92 (no receiver)",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn bit_rate(self) -> Option<u32> {
+        match self {
+            Self::Bell103 => Some(300),
+            Self::V22bis => Some(2400),
+            Self::V32bis => Some(14400),
+            Self::V34 => Some(33600),
+            Self::V90 | Self::V92 => Some(56000),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// Shared controls the UI writes and the engine reads.
+#[derive(Debug)]
+pub struct Control {
+    pub running: AtomicBool,
+    pub restart: AtomicBool,
+    pub quit: AtomicBool,
+    /// Playback speed in percent, so a call can be slowed down to watch.
+    pub speed_pct: AtomicU32,
+}
+
+impl Default for Control {
+    fn default() -> Self {
+        Self {
+            running: AtomicBool::new(true),
+            restart: AtomicBool::new(false),
+            quit: AtomicBool::new(false),
+            speed_pct: AtomicU32::new(100),
+        }
+    }
+}
+
+/// Turns a recovered bit stream into something worth putting on the screen.
+///
+/// A V.22bis call may run error control or may not, and nothing in the
+/// modulation says which. Under V.42 the bits are HDLC frames whose contents
+/// are the only readable part; without it they are the characters themselves.
+/// Showing the wrong one fills the transcript with noise, so decide by
+/// evidence: hold the raw bytes back briefly, and if a frame check sequence
+/// holds in the meantime, throw them away and follow the frames instead. A
+/// call with no error control gives up nothing but that short wait.
+struct Sift {
+    decoder: Decoder,
+    framed: bool,
+    /// Raw bytes held while it is still an open question.
+    held: Vec<u8>,
+    /// Bits pending, most significant first, for the raw reading.
+    bits: Vec<bool>,
+}
+
+/// How long to wait for a frame before concluding there is no error control.
+/// A quarter of a second at 1200 bit/s, which is far longer than the gap
+/// between the flags that open a link.
+const SIFT_PATIENCE: usize = 40;
+
+impl Sift {
+    fn new() -> Self {
+        Self {
+            decoder: Decoder::new(Fcs::Bits16),
+            framed: false,
+            held: Vec::new(),
+            bits: Vec::new(),
+        }
+    }
+
+    /// Offer the bits recovered from one sample; append anything readable.
+    fn feed(&mut self, bits: Vec<bool>, out: &mut Vec<u8>) {
+        for bit in bits {
+            if let Some(Ok(frame)) = self.decoder.feed(bit) {
+                if !self.framed {
+                    // Error control is running after all: what was held back
+                    // was the handshake, and is not text.
+                    self.framed = true;
+                    self.held.clear();
+                    self.bits.clear();
+                }
+                // Address and control first, then the information field. Only
+                // frames that carry one have anything to show.
+                if frame.len() > 2 && frame[1] & 1 == 0 {
+                    out.extend_from_slice(&frame[2..]);
+                }
+            }
+            if self.framed {
+                continue;
+            }
+            self.bits.push(bit);
+            if self.bits.len() == 8 {
+                let byte = self
+                    .bits
+                    .drain(..)
+                    .fold(0u8, |acc, b| (acc << 1) | u8::from(b));
+                self.held.push(byte);
+            }
+        }
+        if !self.framed && self.held.len() >= SIFT_PATIENCE {
+            out.append(&mut self.held);
+        }
+    }
+}
+
+/// The pair of receivers for whichever modulation a capture holds.
+///
+/// A two-wire tap carries both directions at once, so each modulation needs one
+/// receiver per direction. Which band belongs to which end differs: Bell 103
+/// splits by tone pair and V.22bis by carrier, with the answering modem always
+/// on the higher of the two.
+enum Demod {
+    // Both boxed. A receiver carries filter state by the hundred taps, and the
+    // two modulations differ enough in size that an unboxed enum would be as
+    // large as its biggest arm whichever one is in use.
+    Bell103 { host: Box<Bell103Rx>, caller: Box<Bell103Rx> },
+    V22bis {
+        host: Box<V22bisRx>,
+        caller: Box<V22bisRx>,
+        host_sift: Box<Sift>,
+        caller_sift: Box<Sift>,
+    },
+}
+
+impl Demod {
+    fn new(standard: Standard, fs: f64) -> Option<Self> {
+        match standard {
+            Standard::Bell103 => Some(Self::Bell103 {
+                host: Box::new(Bell103Rx::with_tones(2025.0, 2225.0, fs)),
+                caller: Box::new(Bell103Rx::with_tones(1070.0, 1270.0, fs)),
+            }),
+            Standard::V22bis => Some(Self::V22bis {
+                // The answering modem transmits the high channel, so listening
+                // to it means presenting as the calling modem.
+                host: Box::new(V22bisRx::new(Channel::Calling, fs)),
+                caller: Box::new(V22bisRx::new(Channel::Answering, fs)),
+                host_sift: Box::new(Sift::new()),
+                caller_sift: Box::new(Sift::new()),
+            }),
+            _ => None,
+        }
+    }
+
+    fn feed(&mut self, x: f64, from_host: &mut Vec<u8>, from_caller: &mut Vec<u8>) {
+        match self {
+            Self::Bell103 { host, caller } => {
+                if let Some(b) = host.feed(x) {
+                    from_host.push(b);
+                }
+                if let Some(b) = caller.feed(x) {
+                    from_caller.push(b);
+                }
+            }
+            Self::V22bis { host, caller, host_sift, caller_sift } => {
+                host.feed(x);
+                caller.feed(x);
+                host_sift.feed(host.take_bits(), from_host);
+                caller_sift.feed(caller.take_bits(), from_caller);
+            }
+        }
+    }
+
+    /// One slicer margin per recovered bit, for the frequency-shift scope.
+    fn take_symbol(&mut self) -> Option<f32> {
+        match self {
+            Self::Bell103 { host, .. } => host.take_symbol().map(|v| v as f32),
+            Self::V22bis { .. } => None,
+        }
+    }
+
+    /// The latest constellation point, for the quadrature scope.
+    fn constellation(&self) -> Option<(f32, f32)> {
+        match self {
+            Self::Bell103 { .. } => None,
+            Self::V22bis { host, .. } => {
+                let (i, q) = host.constellation_point();
+                Some((i as f32, q as f32))
+            }
+        }
+    }
+
+    /// Carrier present, as (host, caller).
+    fn carriers(&self) -> (bool, bool) {
+        match self {
+            Self::Bell103 { host, caller } => (host.carrier(), caller.carrier()),
+            Self::V22bis { host, caller, .. } => (host.carrier(), caller.carrier()),
+        }
+    }
+
+    fn level(&self) -> f64 {
+        match self {
+            Self::Bell103 { host, caller } => host.amplitude().max(caller.amplitude()),
+            Self::V22bis { host, caller, .. } => host.level().max(caller.level()),
+        }
+    }
+
+    /// Mean distance from decisions, where the receiver can measure it.
+    fn residual(&self) -> Option<f32> {
+        match self {
+            Self::Bell103 { .. } => None,
+            Self::V22bis { host, .. } => Some(host.residual_error() as f32),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Bell103 { .. } => "2FSK",
+            Self::V22bis { .. } => "16QAM",
+        }
+    }
+
+    fn tones(&self) -> usize {
+        match self {
+            Self::Bell103 { .. } => 2,
+            Self::V22bis { .. } => 16,
+        }
+    }
+
+    /// The rate actually in use, which for V.22bis the receiver works out from
+    /// the constellation rather than being told.
+    fn bit_rate(&self) -> u32 {
+        match self {
+            Self::Bell103 { .. } => 300,
+            Self::V22bis { host, .. } => host.rate().bits_per_second(),
+        }
+    }
+}
+
+/// Groups received bytes into transcript lines.
+///
+/// Characters are published the instant they are decoded rather than held back
+/// until a terminator arrives. At 300 bps a line takes seconds to come in, and
+/// waiting for its end makes a live session look frozen.
+struct LineAssembler {
+    direction: Direction,
+    width: usize,
+}
+
+impl LineAssembler {
+    fn new(direction: Direction) -> Self {
+        Self { direction, width: 0 }
+    }
+
+    fn push(&mut self, byte: u8, tx: &Publisher) {
+        // Either terminator ends the line, and the paired one is swallowed so
+        // CRLF does not produce an empty second line.
+        if byte == b'\r' || byte == b'\n' {
+            self.end(tx);
+            return;
+        }
+        tx.log_partial(self.direction, &telemetry::render_bytes(&[byte]));
+        self.width += 1;
+        if self.width >= 160 {
+            self.end(tx);
+        }
+    }
+
+    fn end(&mut self, tx: &Publisher) {
+        if self.width > 0 {
+            tx.log_end(self.direction);
+            self.width = 0;
+        }
+    }
+}
+
+/// A fixed-capacity ring the scopes are drawn from.
+pub struct Ring {
+    pub data: Vec<f32>,
+    write: usize,
+}
+
+impl Ring {
+    pub fn new(len: usize) -> Self {
+        Self { data: vec![0.0; len], write: 0 }
+    }
+
+    #[inline]
+    pub fn push(&mut self, x: f32) {
+        self.data[self.write] = x;
+        self.write = (self.write + 1) % self.data.len();
+    }
+
+    /// Copy out oldest-first.
+    pub fn copy_into(&self, out: &mut [f32]) {
+        let n = self.data.len();
+        for (i, slot) in out.iter_mut().enumerate().take(n) {
+            *slot = self.data[(self.write + i) % n];
+        }
+    }
+}
+
+/// Start the engine on its own thread.
+/// The recording built into the program.
+///
+/// A scope with nothing to look at is not much of a scope, and the first thing
+/// anyone does with one of these is open it. Four hundred kilobytes buys a
+/// program that has something to show on a machine that has never seen this
+/// repository -- which is every machine but the one it was built on.
+const GOLDEN: &[u8] = include_bytes!("../../../tests/vectors/bell103-300.wav");
+
+/// Where the golden vector lives when it is asked for by name.
+pub const GOLDEN_NAME: &str = "bell103-300 (built in)";
+
+/// Read a capture, from the file named or from the one carried inside.
+pub fn capture(path: &Path) -> std::io::Result<line::wav::Wav> {
+    if path.as_os_str() == GOLDEN_NAME {
+        return line::wav::from_bytes(GOLDEN);
+    }
+    line::wav::read(path)
+}
+
+pub fn spawn(
+    path: &Path,
+    tx: Publisher,
+    control: Arc<Control>,
+    sink: Arc<AudioSink>,
+) -> std::io::Result<JoinHandle<()>> {
+    let wav = capture(path)?;
+    let samples = wav.mono();
+    let fs = wav.sample_rate as f64;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let standard = Standard::from_name(&name);
+    Ok(thread::spawn(move || {
+        run(samples, fs, name, standard, tx, control, sink);
+    }))
+}
+
+fn run(
+    samples: Vec<f32>,
+    fs: f64,
+    name: String,
+    standard: Standard,
+    tx: Publisher,
+    control: Arc<Control>,
+    sink: Arc<AudioSink>,
+) {
+    tx.log(Direction::Note, format!("loaded {name} ({:.1}s at {fs:.0} Hz)", samples.len() as f64 / fs));
+    if standard.has_receiver() {
+        tx.log(Direction::Note, "Bell 103: originate 1070/1270, answer 2025/2225");
+    } else {
+        tx.log(
+            Direction::Note,
+            format!(
+                "{} is not implemented yet - showing waterfall, spectrum and level only",
+                standard.label().split(" (").next().unwrap_or("this modulation")
+            ),
+        );
+    }
+    let decoding = standard.has_receiver();
+
+    // The originating modem hears the answering modem, and vice versa. Running
+    // both gives each direction of a 2-wire capture.
+    let mut demod = Demod::new(standard, fs);
+    let mut host_line = LineAssembler::new(Direction::FromLine);
+    let mut caller_line = LineAssembler::new(Direction::ToLine);
+
+    let mut spectrum = Spectrum::new(FFT_SIZE, fs);
+    let mut waveform = Ring::new(SCOPE_LEN);
+    let mut bins = vec![0.0f64; SPECTRUM_BINS];
+    let mut symbols: VecDeque<f32> = VecDeque::with_capacity(SYMBOL_HISTORY);
+    let mut points: VecDeque<(f32, f32)> = VecDeque::with_capacity(SYMBOL_HISTORY);
+    let mut host_bytes: Vec<u8> = Vec::with_capacity(64);
+    let mut caller_bytes: Vec<u8> = Vec::with_capacity(64);
+    // Batched once per tick rather than per sample, to keep the monitor off the
+    // hot loop.
+    let mut monitor_block: Vec<f32> = Vec::with_capacity(4096);
+    // Raw bytes for the terminal, kept separate from the rendered transcript.
+    let mut rx_block: Vec<u8> = Vec::with_capacity(256);
+
+    let mut pos = 0usize;
+    let mut rx_bytes = 0u64;
+    let mut tx_bytes = 0u64;
+    let mut connected_since: Option<Instant> = None;
+
+    // Publish at about 60 Hz; process in matching chunks.
+    let publish_every = Duration::from_millis(16);
+    let mut next_publish = Instant::now();
+    let mut clock = Instant::now();
+    let mut carry = 0.0f64;
+
+    while !control.quit.load(Ordering::Relaxed) {
+        if control.restart.swap(false, Ordering::Relaxed) {
+            pos = 0;
+            rx_bytes = 0;
+            tx_bytes = 0;
+            connected_since = None;
+            symbols.clear();
+            points.clear();
+            demod = Demod::new(standard, fs);
+            tx.log(Direction::Note, "restarted");
+            clock = Instant::now();
+            carry = 0.0;
+        }
+
+        if !control.running.load(Ordering::Relaxed) {
+            clock = Instant::now();
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+
+        // Work out how many samples real time has earned us since last round.
+        let speed = control.speed_pct.load(Ordering::Relaxed).max(1) as f64 / 100.0;
+        let elapsed = clock.elapsed().as_secs_f64();
+        clock = Instant::now();
+        let want = elapsed * fs * speed + carry;
+        let count = want.floor();
+        carry = want - count;
+        // Cap so a stall does not turn into a burst that outruns the display.
+        let count = (count as usize).min((fs * 0.25) as usize);
+
+        monitor_block.clear();
+        rx_block.clear();
+        for _ in 0..count {
+            if pos >= samples.len() {
+                break;
+            }
+            let x = samples[pos] as f64;
+            monitor_block.push(samples[pos]);
+            pos += 1;
+
+            // Only run the receiver where one exists for this modulation.
+            if let Some(d) = demod.as_mut() {
+                host_bytes.clear();
+                caller_bytes.clear();
+                d.feed(x, &mut host_bytes, &mut caller_bytes);
+                for &b in &host_bytes {
+                    rx_bytes += 1;
+                    host_line.push(b, &tx);
+                    rx_block.push(b);
+                }
+                for &b in &caller_bytes {
+                    tx_bytes += 1;
+                    caller_line.push(b, &tx);
+                }
+                // One entry per recovered bit, for the frequency-shift scope.
+                if let Some(sym) = d.take_symbol() {
+                    if symbols.len() == SYMBOL_HISTORY {
+                        symbols.pop_front();
+                    }
+                    symbols.push_back(sym);
+                }
+                // One point per symbol, for the quadrature scope. Only taken
+                // when it changes, so a motionless constellation is not filled
+                // with copies of a single point.
+                if let Some(p) = d.constellation()
+                    && points.back() != Some(&p) {
+                        if points.len() == SYMBOL_HISTORY {
+                            points.pop_front();
+                        }
+                        points.push_back(p);
+                    }
+            }
+
+            spectrum.push(x);
+            waveform.push(x as f32);
+        }
+
+        // Feed the monitor exactly what the demodulator saw, so what you hear
+        // is the signal being decoded rather than a separate playback path.
+        sink.push(&monitor_block);
+        tx.line_data(&rx_block);
+
+        if pos >= samples.len() {
+            host_line.end(&tx);
+            caller_line.end(&tx);
+            if control.running.swap(false, Ordering::Relaxed) {
+                tx.log(Direction::Note, "end of capture");
+            }
+        }
+
+        let (host_carrier, caller_carrier) =
+            demod.as_ref().map(Demod::carriers).unwrap_or((false, false));
+        let carrier = host_carrier || caller_carrier;
+        if carrier && connected_since.is_none() {
+            connected_since = Some(Instant::now());
+        }
+
+        if Instant::now() >= next_publish {
+            next_publish = Instant::now() + publish_every;
+            if spectrum.ready() {
+                spectrum.magnitudes_db(&mut bins);
+            }
+            // Without a receiver there is no band filter to take a level from,
+            // so measure the raw line instead.
+            let level = if let Some(d) = demod.as_ref() {
+                d.level()
+            } else {
+                let n = waveform.data.len();
+                (waveform.data.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()
+                    / n as f64)
+                    .sqrt()
+            };
+            let level_db = 20.0 * (level + 1e-9).log10();
+
+            tx.publish(|f| {
+                f.sample_rate = fs;
+                waveform.copy_into(&mut f.waveform);
+                for (slot, &v) in f.spectrum_db.iter_mut().zip(bins.iter()) {
+                    *slot = v as f32;
+                }
+                f.hz_per_bin = fs / FFT_SIZE as f64;
+                f.rx_level_db = level_db as f32;
+                f.carrier = carrier;
+                f.state = if pos >= samples.len() || !decoding {
+                    // With no receiver there is nothing to be connected to;
+                    // saying "negotiating" would imply progress that is not
+                    // happening.
+                    CallState::Idle
+                } else if carrier {
+                    CallState::Connected
+                } else {
+                    CallState::Negotiating
+                };
+                f.modulation = standard.label();
+                f.bit_rate = if carrier {
+                    // Report what the receiver found, not what the
+                    // capture's name promised.
+                    demod.as_ref().map(Demod::bit_rate).or_else(|| standard.bit_rate())
+                } else {
+                    None
+                };
+                f.rx_bytes = rx_bytes;
+                f.tx_bytes = tx_bytes;
+                f.tones = demod.as_ref().map(Demod::tones).unwrap_or(2);
+                f.symbol_label = demod.as_ref().map(Demod::label).unwrap_or("-");
+                f.snr_db = demod.as_ref().and_then(Demod::residual).map(|e| {
+                    // Report the decision margin as a decibel figure, so a
+                    // tighter constellation reads as a larger number.
+                    -20.0 * (e.max(1e-3)).log10()
+                });
+                f.symbols.clear();
+                f.symbols.extend(symbols.iter().copied());
+                f.constellation.clear();
+                f.constellation.extend(points.iter().copied());
+                f.leds = Leds {
+                    mr: true,
+                    tr: true,
+                    sd: caller_carrier,
+                    rd: host_carrier,
+                    cd: carrier,
+                    oh: pos < samples.len(),
+                    aa: false,
+                    // Bell 103 is 300 bps, so HS never lights: it means 9600+.
+                    hs: false,
+                    ec: false,
+                };
+            });
+        }
+
+        thread::sleep(Duration::from_millis(4));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// Everything up to V.32bis keeps what it always did, and V.34's data
+    /// mode keeps enough to land on each of its points a dozen times.
+    #[test]
+    fn the_scope_keeps_more_of_a_larger_constellation() {
+        assert_eq!(super::scope_depth(16), super::SYMBOL_HISTORY);
+        assert_eq!(super::scope_depth(128), super::SYMBOL_HISTORY);
+        assert_eq!(super::scope_depth(832), 9984);
+        assert_eq!(super::scope_depth(1664), 16_384);
+    }
+
+    /// The capture the program carries, opened the way a fresh machine opens
+    /// it.
+    ///
+    /// This used to be a path built from the directory the program was
+    /// compiled in, so it worked on one computer and reported a missing file
+    /// on every other -- which is a thing no test on the machine that built it
+    /// could ever have noticed.
+    #[test]
+    fn the_capture_built_in_is_a_capture() {
+        let wav = capture(Path::new(GOLDEN_NAME)).expect("the built-in vector");
+        assert_eq!(wav.sample_rate, 16_000);
+        assert!(wav.duration_secs() > 1.0, "only {:.2} s", wav.duration_secs());
+        let samples = wav.mono();
+        let rms = (samples.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+            / samples.len() as f64)
+            .sqrt();
+        assert!(rms > 0.01, "the built-in capture is silence: rms {rms:.5}");
+    }
+    use super::*;
+
+    /// Everything an encoder has queued.
+    fn drain(encoder: &mut ec::hdlc::Encoder) -> Vec<bool> {
+        std::iter::from_fn(|| encoder.next_bit()).collect()
+    }
+
+    /// Bits of one byte, most significant first.
+    fn bits_of(bytes: &[u8]) -> Vec<bool> {
+        bytes
+            .iter()
+            .flat_map(|b| (0..8).rev().map(move |i| b & (1 << i) != 0))
+            .collect()
+    }
+
+    #[test]
+    fn a_call_without_error_control_shows_its_characters() {
+        let mut sift = Sift::new();
+        let mut out = Vec::new();
+        // More than the patience, so the wait ends and the bytes appear.
+        let text = b"the quick brown fox jumps over the lazy dog, twice over";
+        sift.feed(bits_of(text), &mut out);
+        assert_eq!(out, text, "held back a call that was never framed");
+    }
+
+    #[test]
+    fn a_framed_call_shows_the_contents_of_its_frames() {
+        let mut encoder = ec::hdlc::Encoder::new(Fcs::Bits16);
+        encoder.idle(16);
+        // Address, then an information control field with the low bit clear.
+        let mut frame = vec![0x01u8, 0x00];
+        frame.extend_from_slice(b"Welcome to the host");
+        encoder.frame(&frame);
+        encoder.idle(16);
+
+        let mut sift = Sift::new();
+        let mut out = Vec::new();
+        sift.feed(drain(&mut encoder), &mut out);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "Welcome to the host",
+            "frame contents did not come through"
+        );
+    }
+
+    #[test]
+    fn the_handshake_before_a_frame_is_not_shown_as_text() {
+        // What precedes error control is a negotiation, not characters, and
+        // putting it on the screen is how the transcript filled with noise.
+        let mut encoder = ec::hdlc::Encoder::new(Fcs::Bits16);
+        let mut frame = vec![0x01u8, 0x00];
+        frame.extend_from_slice(b"readable");
+        encoder.frame(&frame);
+
+        let mut sift = Sift::new();
+        let mut out = Vec::new();
+        // Well under the patience, so nothing has been published yet.
+        sift.feed(bits_of(&[0x5a; 8]), &mut out);
+        assert!(out.is_empty(), "published {out:02x?} before deciding");
+        sift.feed(drain(&mut encoder), &mut out);
+        assert_eq!(String::from_utf8_lossy(&out), "readable");
+    }
+
+    #[test]
+    fn the_real_v22bis_call_reaches_the_transcript() {
+        // The whole path the screen sees: demodulate, deframe, and read. The
+        // receiver has its own vector test; this one is about what the two
+        // together put in front of the user, which before the deframing step
+        // was the scrambled contents of the handshake.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/vectors/v22bis-2400.wav"
+        );
+        let wav = line::wav::read(path).expect("read V.22bis vector");
+        let mut demod = Demod::new(Standard::V22bis, wav.sample_rate as f64)
+            .expect("V.22bis is demodulated");
+        let (mut host, mut caller) = (Vec::new(), Vec::new());
+        for s in wav.mono() {
+            demod.feed(s as f64, &mut host, &mut caller);
+        }
+        let text = String::from_utf8_lossy(&host).into_owned();
+        assert!(
+            text.contains("Welcome to phl6-dial1.popsite.net"),
+            "the host greeting never reached the transcript; got {text:?}"
+        );
+        assert_eq!(demod.bit_rate(), 1200, "both modems settle on 1200 bit/s");
+    }
+
+    #[test]
+    fn standards_are_identified_from_the_vector_name() {
+        for (name, want) in [
+            ("bell103-300.wav", Standard::Bell103),
+            ("v22bis-2400.wav", Standard::V22bis),
+            ("v32bis-14400.wav", Standard::V32bis),
+            ("v34-33600.wav", Standard::V34),
+            ("v90-56k.wav", Standard::V90),
+            ("v92-56k.wav", Standard::V92),
+            ("something-else.wav", Standard::Unknown),
+        ] {
+            assert_eq!(Standard::from_name(name), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_bis_variants_are_not_mistaken_for_their_base_standard() {
+        // "v32bis" contains neither "v34" nor a bare "v32" test, but the
+        // ordering of the checks still has to put the longer name first.
+        assert_eq!(Standard::from_name("v32bis-14400.wav"), Standard::V32bis);
+        assert_eq!(Standard::from_name("v22bis-2400.wav"), Standard::V22bis);
+    }
+
+    #[test]
+    fn only_implemented_modulations_claim_a_receiver() {
+        assert!(Standard::Bell103.has_receiver());
+        assert!(Standard::V22bis.has_receiver());
+        for s in [
+            Standard::V32bis,
+            Standard::V34,
+            Standard::V90,
+            Standard::V92,
+            Standard::Unknown,
+        ] {
+            assert!(!s.has_receiver(), "{s:?} should not claim a receiver");
+        }
+    }
+
+    #[test]
+    fn labels_say_plainly_when_there_is_no_receiver() {
+        // The display must not imply it is demodulating something it cannot,
+        // nor disclaim one it can.
+        assert_eq!(Standard::Bell103.label(), "Bell 103");
+        assert_eq!(Standard::V22bis.label(), "V.22bis");
+        for s in [Standard::V32bis, Standard::V34, Standard::V90, Standard::V92] {
+            assert!(
+                s.label().contains("no receiver"),
+                "{s:?} label {:?} does not say so",
+                s.label()
+            );
+        }
+        // Every label that disclaims a receiver must match a standard that
+        // really has none, and the other way round.
+        for s in [
+            Standard::Bell103,
+            Standard::V22bis,
+            Standard::V32bis,
+            Standard::V34,
+            Standard::V90,
+            Standard::V92,
+        ] {
+            assert_eq!(
+                s.has_receiver(),
+                !s.label().contains("no receiver"),
+                "{s:?} label and capability disagree"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+
+    #[test]
+    fn characters_appear_before_the_line_ends() {
+        // The point of the change: at 300 bps a line takes seconds, so it has
+        // to be visible while it is still arriving.
+        let (tx, rx) = telemetry::channel(8, 4, 16000.0);
+        let mut line = LineAssembler::new(Direction::FromLine);
+        for b in b"Welcome" {
+            line.push(*b, &tx);
+        }
+        let log = rx.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].text, "Welcome");
+        assert!(!log[0].complete, "line is still arriving");
+    }
+
+    #[test]
+    fn a_terminator_completes_the_line_without_starting_an_empty_one() {
+        let (tx, rx) = telemetry::channel(8, 4, 16000.0);
+        let mut line = LineAssembler::new(Direction::FromLine);
+        for b in b"login:\r\n" {
+            line.push(*b, &tx);
+        }
+        let log = rx.log();
+        assert_eq!(log.len(), 1, "CRLF should not produce a second, empty line");
+        assert_eq!(log[0].text, "login:");
+        assert!(log[0].complete);
+    }
+
+    #[test]
+    fn successive_lines_are_separate_entries() {
+        let (tx, rx) = telemetry::channel(8, 4, 16000.0);
+        let mut line = LineAssembler::new(Direction::FromLine);
+        for b in b"one\r\ntwo\r\n" {
+            line.push(*b, &tx);
+        }
+        let log = rx.log();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].text, "one");
+        assert_eq!(log[1].text, "two");
+    }
+
+    #[test]
+    fn an_over_long_line_is_broken_rather_than_growing_without_limit() {
+        let (tx, rx) = telemetry::channel(8, 4, 16000.0);
+        let mut line = LineAssembler::new(Direction::FromLine);
+        for _ in 0..400 {
+            line.push(b'x', &tx);
+        }
+        assert!(rx.log().len() >= 2, "a runaway line should be wrapped");
+    }
+}
+
+#[cfg(test)]
+mod demod_tests {
+    use super::*;
+
+    /// The scope showed an empty constellation while bytes were flowing, so
+    /// pin the path that feeds it.
+    #[test]
+    fn v22bis_produces_moving_constellation_points() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/vectors/v22bis-2400.wav");
+        let wav = line::wav::read(path).expect("vector");
+        let fs = wav.sample_rate as f64;
+        let mono = wav.mono();
+        let mut d = Demod::new(Standard::V22bis, fs).expect("V.22bis has a receiver");
+
+        let mut host_bytes = Vec::new();
+        let mut caller_bytes = Vec::new();
+        let mut points: Vec<(f32, f32)> = Vec::new();
+        // Well into the data, as the engine would be by then.
+        for &s in mono.iter().skip((6.0 * fs) as usize).take((4.0 * fs) as usize) {
+            host_bytes.clear();
+            caller_bytes.clear();
+            d.feed(s as f64, &mut host_bytes, &mut caller_bytes);
+            if let Some(p) = d.constellation()
+                && points.last() != Some(&p)
+            {
+                points.push(p);
+            }
+        }
+        assert!(!points.is_empty(), "no constellation points at all");
+        assert!(
+            points.len() > 1000,
+            "only {} points from four seconds of 600 baud",
+            points.len()
+        );
+        let spread = points
+            .iter()
+            .map(|p| (p.0 * p.0 + p.1 * p.1).sqrt())
+            .fold(0.0f32, f32::max);
+        assert!(spread > 0.1, "points are all at the origin: largest {spread}");
+    }
+
+    /// The scope starts at the beginning of the capture, not part way in: the
+    /// answer tone and the near-silence before it are part of what the receiver
+    /// has to survive.
+    #[test]
+    fn v22bis_points_stay_finite_from_the_start_of_a_capture() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/vectors/v22bis-2400.wav");
+        let wav = line::wav::read(path).expect("vector");
+        let fs = wav.sample_rate as f64;
+        let mono = wav.mono();
+        let mut d = Demod::new(Standard::V22bis, fs).expect("V.22bis has a receiver");
+
+        let mut host_bytes = Vec::new();
+        let mut caller_bytes = Vec::new();
+        let mut first_bad: Option<usize> = None;
+        for (n, &s) in mono.iter().enumerate() {
+            host_bytes.clear();
+            caller_bytes.clear();
+            d.feed(s as f64, &mut host_bytes, &mut caller_bytes);
+            if let Some(p) = d.constellation()
+                && (!p.0.is_finite() || !p.1.is_finite())
+                && first_bad.is_none()
+            {
+                first_bad = Some(n);
+            }
+        }
+        assert!(
+            first_bad.is_none(),
+            "constellation went non-finite at sample {} ({:.2}s in)",
+            first_bad.unwrap(),
+            first_bad.unwrap() as f64 / fs
+        );
+    }
+}

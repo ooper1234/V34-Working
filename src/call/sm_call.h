@@ -8,6 +8,7 @@
 #include "ast_socket/sm_ast_socket.h"
 
 #include <sys/types.h>
+#include <stdio.h>
 
 #ifdef SM_HAVE_V8
 #include "modem/v8/sm_v8.h"
@@ -15,6 +16,11 @@
 
 /* One dial-up call: AudioSocket PCM <-> V.22bis answerer <-> async serial
    <-> pty <-> pppd. */
+typedef enum {
+    SM_CALL_MODE_V22 = 0,
+    SM_CALL_MODE_V34
+} sm_call_mode_t;
+
 typedef enum {
     SM_CALL_IDLE = 0,
     SM_CALL_ANSWER_TONE,      /* sending 2100 Hz ANS */
@@ -38,10 +44,17 @@ typedef struct {
     const char *log_dir;
     const char *ip_up_script;
     const char *ip_down_script;
+    const char *bbs_db;
     int auth;
     int enable_ppp;
     int echo_data;                  /* loop data back instead of using pppd */
     int use_v8;                     /* run V.8 negotiation first */
+    int use_v34;                    /* offer V.34 in V.8 (opt-in; the V.34
+                                       receive data path is not finished yet) */
+    int use_binmodem;               /* answer with the vendored BinModem
+                                       engine (V.8 + V.34 in one object) */
+    int v34_baud;                   /* V.34 symbol rate for the engine */
+    int v34_rate;                   /* V.34 maximum bit rate for the engine */
     sm_log_level_t log_level;
 } sm_call_config_t;
 
@@ -50,7 +63,21 @@ typedef struct {
     int call_id;
 
     sm_ast_socket_t as;
-    v22bis_state_t modem;
+    FILE *cap_in;                   /* raw PCM capture of the far end (V34_CAPTURE) */
+    FILE *cap_out;                  /* raw PCM capture of our TX */
+    long cap_count;                 /* samples captured per direction */
+    sm_call_mode_t mode;
+    v22bis_state_t modem;           /* used when mode is SM_CALL_MODE_V22 */
+    void *v34;                      /* v34_state_t *, when mode is SM_CALL_MODE_V34 */
+    int v34_baud_rate;              /* negotiated V.34 symbol rate (for logs) */
+
+    /* BinModem answerer (bm_answerer_t *), when cfg.use_binmodem. NULL at
+       other times and once the engine has handed a V.22bis call back. */
+    void *bm;
+    void *bbs;                     /* bbs_session_t while selecting/BBS */
+    char bm_phase_seen[96];         /* last phase string logged */
+    int bm_ec_seen;                 /* last V.42 phase logged */
+    long bm_nocarrier;              /* samples since the far end's carrier */
 
     sm_bitq_t txbits;               /* pppd bytes -> modem TX bits */
     sm_deframer_t deframer;         /* modem RX bits -> pppd bytes */
@@ -62,7 +89,7 @@ typedef struct {
     double tone_phase_inc;
     double tone_amplitude;
 
-    /* pppd */
+    /* pppd (started only after the login menu picks PPP) */
     int ppp_fd;
     pid_t pppd_pid;
     int ppp_started;

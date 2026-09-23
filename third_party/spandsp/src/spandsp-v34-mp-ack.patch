@@ -1,0 +1,24 @@
+--- v34rx.c
++++ v34rx.c
+@@ -2390,5 +2390,21 @@
+                         if (s->duplex)
+                         {
+                             process_rx_mp(s, &mp, s->info_buf);
++                            if (mp.mp_acknowledged)
++                            {
++                                s->mp_acknowledged_seen = true;
++                                span_log(s->logging, SPAN_LOG_FLOW,
++                                         "Rx - valid far MP' received\n");
++                            }
++                            /*endif*/
+                             t = span_container_of(s, v34_state_t, rx);
++                            /* MP selects the data-mode shaping and non-linear
++                               encoder for our transmitter.  Startup had left
++                               the working parameters on expanded shaping even
++                               when the far modem requested minimum shaping. */
++                            v34_set_working_parameters(&t->tx.parms,
++                                                       t->tx.baud_rate,
++                                                       t->tx.bit_rate,
++                                                       mp.expanded_shaping);
++                            t->tx.use_non_linear_encoder = mp.use_non_linear_encoder;
+                             if (mp.type == 1)

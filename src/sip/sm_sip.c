@@ -343,6 +343,19 @@ struct sm_sip {
     int daemon_fd;
     sm_ast_socket_t daemon_as;
 
+    /* Paced audio pump: incoming RTP is queued and drained to the daemon on
+       a steady 20 ms clock, so the engine's sample clock -- and our own RTP
+       packet flow to the ATA -- never stall when packets are late or lost. */
+    struct {
+        int16_t pcm[SM_SIP_RTP_MAXPAY];
+        int nsamples;
+    } rxq[SM_SIP_RXQ];
+    int rxq_head, rxq_tail;
+    int tick_ns;               /* silence frame size while underrunning */
+    int rx_underruns;
+    int rx_drops;
+    struct timespec next_tick;
+
     /* Last 200 OK for INVITE retransmission. */
     uint8_t last_ok[SM_SIP_MAX_MSG];
     int last_ok_len;
@@ -404,7 +417,26 @@ static int build_response(const sip_msg_t *m, int status, const char *reason,
 static void send_raw(sm_sip_t *s, const struct sockaddr_in *to,
                      const uint8_t *data, int len)
 {
-    sendto(s->sip_fd, data, (size_t) len, 0, (const struct sockaddr *) to, sizeof(*to));
+    ssize_t sent = sendto(s->sip_fd, data, (size_t) len, 0,
+                          (const struct sockaddr *) to, sizeof(*to));
+
+    if (sent < 0)
+    {
+        sm_log_message(&s->log, SM_LOG_ERROR,
+                       "SIP send to %s:%d failed: %s",
+                       inet_ntoa(to->sin_addr), ntohs(to->sin_port), strerror(errno));
+    }
+    else if (sent != len)
+    {
+        sm_log_message(&s->log, SM_LOG_WARNING,
+                       "short SIP send to %s:%d: %zd/%d bytes",
+                       inet_ntoa(to->sin_addr), ntohs(to->sin_port), sent, len);
+    }
+    else if (getenv("SM_SIP_TRACE"))
+    {
+        fprintf(stderr, "[SIP TX %s:%d, %d bytes]\n%.*s\n",
+                inet_ntoa(to->sin_addr), ntohs(to->sin_port), len, len, data);
+    }
 }
 
 static void send_response(sm_sip_t *s, const sip_msg_t *m,
@@ -425,10 +457,15 @@ static void send_response(sm_sip_t *s, const sip_msg_t *m,
 
 static int daemon_connect(sm_sip_t *s)
 {
+    sm_log_message(&s->log, SM_LOG_FLOW, "connecting to daemon %s:%d", s->cfg.daemon_host, s->cfg.daemon_port);
     int fd = sm_ast_connect(s->cfg.daemon_host, s->cfg.daemon_port);
 
     if (fd < 0)
+    {
+        sm_log_message(&s->log, SM_LOG_ERROR, "daemon connect failed: %s", strerror(errno));
         return -1;
+    }
+    sm_log_message(&s->log, SM_LOG_FLOW, "daemon connect succeeded fd=%d", fd);
     {
         sm_ast_socket_t as;
         uint8_t uuid[16];
@@ -477,6 +514,7 @@ static void end_call(sm_sip_t *s)
     s->call_active = 0;
     s->media_active = 0;
     s->rtp_peer_known = 0;
+    s->rxq_head = s->rxq_tail = 0;
     s->call_id[0] = 0;
     s->last_ok_len = 0;
     s->calls_done++;
@@ -511,6 +549,149 @@ static void send_bye(sm_sip_t *s)
 }
 
 /* Process one RTP packet (PCMU). Returns 0 on success. */
+/* ------------------------------------------------------------------ */
+/* Paced audio pump                                                    */
+/* ------------------------------------------------------------------ */
+
+static void ts_add_ms(struct timespec *t, int ms)
+{
+    t->tv_nsec += (long) ms * 1000000L;
+    while (t->tv_nsec >= 1000000000L)
+    {
+        t->tv_nsec -= 1000000000L;
+        t->tv_sec++;
+    }
+}
+
+/* Milliseconds until t (negative if t is in the past). */
+static long ts_ms_until(const struct timespec *t, const struct timespec *now)
+{
+    return (t->tv_sec - now->tv_sec) * 1000 + (t->tv_nsec - now->tv_nsec) / 1000000;
+}
+
+static void enqueue_rx(sm_sip_t *s, const int16_t *pcm, int nsamples)
+{
+    int next;
+
+    if (nsamples <= 0)
+        return;
+    if (nsamples > SM_SIP_RTP_MAXPAY)
+        nsamples = SM_SIP_RTP_MAXPAY;
+    s->tick_ns = nsamples;
+    next = (s->rxq_head + 1) % SM_SIP_RXQ;
+    if (next == s->rxq_tail)
+    {
+        s->rxq_tail = (s->rxq_tail + 1) % SM_SIP_RXQ;    /* drop oldest */
+        if (s->rx_drops++ % 25 == 24)
+            sm_log_message(&s->log, SM_LOG_WARNING,
+                           "incoming audio queue full: dropping frames");
+    }
+    memcpy(s->rxq[s->rxq_head].pcm, pcm, (size_t) nsamples * sizeof(int16_t));
+    s->rxq[s->rxq_head].nsamples = nsamples;
+    s->rxq_head = next;
+}
+
+/* Write one frame to the daemon and forward the daemon's reply as RTP
+   (exactly one audio frame per received frame).  Returns -1 if the call
+   ended. */
+static int feed_daemon(sm_sip_t *s, const int16_t *pcm, int nsamples)
+{
+    uint8_t kind;
+    uint8_t buf[SM_AS_MAX_PAYLOAD];
+    uint8_t ulaw_out[SM_SIP_RTP_MAXPAY];
+    size_t plen;
+    int r;
+
+    if (sm_ast_write_audio(&s->daemon_as, pcm, (size_t) nsamples) < 0)
+    {
+        sm_log_message(&s->log, SM_LOG_WARNING, "daemon write failed");
+        if (s->rtp_peer_known)
+            send_bye(s);
+        end_call(s);
+        return -1;
+    }
+
+    for (;;)
+    {
+        r = sm_ast_read(&s->daemon_as, &kind, buf, sizeof(buf), &plen, 200);
+        if (r <= 0)
+            break;
+        if (kind == SM_AS_KIND_AUDIO && plen >= 2)
+        {
+            int ns = (int) plen / 2;
+            int out_len = ns < SM_SIP_RTP_MAXPAY ? ns : SM_SIP_RTP_MAXPAY;
+            uint8_t rtpbuf[12 + SM_SIP_RTP_MAXPAY];
+            int j;
+
+            for (j = 0; j < out_len; j++)
+                ulaw_out[j] = sm_ulaw_encode(((int16_t *) buf)[j]);
+            if (s->cap_tx)
+                fwrite(ulaw_out, 1, (size_t) out_len, s->cap_tx);
+            rtpbuf[0] = 0x80;
+            rtpbuf[1] = 0;              /* PT 0 PCMU */
+            rtpbuf[2] = (uint8_t) (s->rtp_seq >> 8);
+            rtpbuf[3] = (uint8_t) (s->rtp_seq & 0xFF);
+            rtpbuf[4] = (uint8_t) (s->rtp_ts >> 24);
+            rtpbuf[5] = (uint8_t) (s->rtp_ts >> 16);
+            rtpbuf[6] = (uint8_t) (s->rtp_ts >> 8);
+            rtpbuf[7] = (uint8_t) (s->rtp_ts & 0xFF);
+            rtpbuf[8] = (uint8_t) (s->local_ssrc >> 24);
+            rtpbuf[9] = (uint8_t) (s->local_ssrc >> 16);
+            rtpbuf[10] = (uint8_t) (s->local_ssrc >> 8);
+            rtpbuf[11] = (uint8_t) (s->local_ssrc & 0xFF);
+            memcpy(rtpbuf + 12, ulaw_out, (size_t) out_len);
+            sendto(s->rtp_fd, rtpbuf, (size_t) (12 + out_len), 0,
+                   (struct sockaddr *) &s->rtp_peer, sizeof(s->rtp_peer));
+            s->rtp_seq++;
+            s->rtp_ts += (uint32_t) out_len;
+            break;              /* one audio frame per received frame */
+        }
+        else if (kind == SM_AS_KIND_HANGUP)
+        {
+            sm_log_message(&s->log, SM_LOG_FLOW, "daemon asked to hang up");
+            if (s->rtp_peer_known)
+                send_bye(s);
+            end_call(s);
+            return -1;
+        }
+    }
+    if (r < 0)
+    {
+        sm_log_message(&s->log, SM_LOG_FLOW, "daemon closed connection");
+        if (s->rtp_peer_known)
+            send_bye(s);
+        end_call(s);
+        return -1;
+    }
+    return 0;
+}
+
+/* One 20 ms pump step: hand the daemon the next frame of received audio
+   (silence on underrun) and forward its reply.  Runs off a steady clock so
+   our RTP TX to the ATA never pauses, whatever the incoming packet timing
+   does. */
+static void audio_tick(sm_sip_t *s)
+{
+    int16_t pcm[SM_SIP_RTP_MAXPAY];
+    int ns;
+
+    if (s->rxq_head != s->rxq_tail)
+    {
+        ns = s->rxq[s->rxq_tail].nsamples;
+        memcpy(pcm, s->rxq[s->rxq_tail].pcm, (size_t) ns * sizeof(int16_t));
+        s->rxq_tail = (s->rxq_tail + 1) % SM_SIP_RXQ;
+    }
+    else
+    {
+        ns = s->tick_ns;
+        memset(pcm, 0, (size_t) ns * sizeof(int16_t));
+        if (s->rx_underruns++ % 50 == 49)
+            sm_log_message(&s->log, SM_LOG_FLOW,
+                           "incoming audio underrun: feeding silence");
+    }
+    feed_daemon(s, pcm, ns);
+}
+
 static int process_rtp(sm_sip_t *s, const uint8_t *pkt, int len)
 {
 
@@ -519,7 +700,6 @@ static int process_rtp(sm_sip_t *s, const uint8_t *pkt, int len)
     const uint8_t *payload;
     int payload_len;
     int16_t pcm[SM_SIP_RTP_MAXPAY];
-    uint8_t ulaw_out[SM_SIP_RTP_MAXPAY];
     int nsamples;
     int i;
 
@@ -561,77 +741,8 @@ static int process_rtp(sm_sip_t *s, const uint8_t *pkt, int len)
     for (i = 0; i < nsamples; i++)
         pcm[i] = sm_ulaw_decode(payload[i]);
 
-    /* Feed the daemon. */
-    if (sm_ast_write_audio(&s->daemon_as, pcm, (size_t) nsamples) < 0)
-    {
-        sm_log_message(&s->log, SM_LOG_WARNING, "daemon write failed");
-        if (s->rtp_peer_known)
-            send_bye(s);
-        end_call(s);
-        return -1;
-    }
-
-    /* Read the daemon's reply (exactly one frame; the daemon emits one audio
-       frame for each one it receives). */
-    {
-        uint8_t kind;
-        uint8_t buf[SM_AS_MAX_PAYLOAD];
-        size_t plen;
-        int r;
-
-        for (;;)
-        {
-            r = sm_ast_read(&s->daemon_as, &kind, buf, sizeof(buf), &plen, 200);
-            if (r <= 0)
-                break;
-            if (kind == SM_AS_KIND_AUDIO && plen >= 2)
-            {
-                int ns = (int) plen / 2;
-                int out_len = ns < SM_SIP_RTP_MAXPAY ? ns : SM_SIP_RTP_MAXPAY;
-                uint8_t rtpbuf[12 + SM_SIP_RTP_MAXPAY];
-                int j;
-
-                for (j = 0; j < out_len; j++)
-                    ulaw_out[j] = sm_ulaw_encode(((int16_t *) buf)[j]);
-                if (s->cap_tx)
-                    fwrite(ulaw_out, 1, (size_t) out_len, s->cap_tx);
-                rtpbuf[0] = 0x80;
-                rtpbuf[1] = 0;              /* PT 0 PCMU */
-                rtpbuf[2] = (uint8_t) (s->rtp_seq >> 8);
-                rtpbuf[3] = (uint8_t) (s->rtp_seq & 0xFF);
-                rtpbuf[4] = (uint8_t) (s->rtp_ts >> 24);
-                rtpbuf[5] = (uint8_t) (s->rtp_ts >> 16);
-                rtpbuf[6] = (uint8_t) (s->rtp_ts >> 8);
-                rtpbuf[7] = (uint8_t) (s->rtp_ts & 0xFF);
-                rtpbuf[8] = (uint8_t) (s->local_ssrc >> 24);
-                rtpbuf[9] = (uint8_t) (s->local_ssrc >> 16);
-                rtpbuf[10] = (uint8_t) (s->local_ssrc >> 8);
-                rtpbuf[11] = (uint8_t) (s->local_ssrc & 0xFF);
-                memcpy(rtpbuf + 12, ulaw_out, (size_t) out_len);
-                sendto(s->rtp_fd, rtpbuf, (size_t) (12 + out_len), 0,
-                       (struct sockaddr *) &s->rtp_peer, sizeof(s->rtp_peer));
-                s->rtp_seq++;
-                s->rtp_ts += (uint32_t) out_len;
-                break;              /* one audio frame per received frame */
-            }
-            else if (kind == SM_AS_KIND_HANGUP)
-            {
-                sm_log_message(&s->log, SM_LOG_FLOW, "daemon asked to hang up");
-                if (s->rtp_peer_known)
-                    send_bye(s);
-                end_call(s);
-                return -1;
-            }
-        }
-        if (r < 0)
-        {
-            sm_log_message(&s->log, SM_LOG_FLOW, "daemon closed connection");
-            if (s->rtp_peer_known)
-                send_bye(s);
-            end_call(s);
-            return -1;
-        }
-    }
+    /* Queue for paced playout on the 20 ms audio tick (audio_tick()). */
+    enqueue_rx(s, pcm, nsamples);
     return 0;
 }
 
@@ -647,9 +758,8 @@ static void handle_register(sm_sip_t *s, const sip_msg_t *m,
     sm_log_message(&s->log, SM_LOG_FLOW, "REGISTER from %s:%d user-agent='%s'",
                    inet_ntoa(src->sin_addr), ntohs(src->sin_port), m->user_agent);
     snprintf(extra, sizeof(extra),
-             "Contact: %s;expires=3600\r\n"
-             "Date: %s\r\n",
-             m->contact[0] ? m->contact : "<sip:modem@unknown>", "Tue, 15 Sep 2026 00:00:00 GMT");
+             "Contact: %s\r\n",
+             m->contact[0] ? m->contact : "<sip:modem@unknown>");
     send_response(s, m, src, 200, "OK", extra, NULL);
 }
 
@@ -756,6 +866,10 @@ static void handle_invite(sm_sip_t *s, const sip_msg_t *m,
     s->rtp_peer_known = 0;
     s->media_active = 0;
     s->call_active = 1;
+    s->rxq_head = s->rxq_tail = 0;
+    s->tick_ns = 160;
+    s->rx_underruns = 0;
+    s->rx_drops = 0;
 
     /* SDP answer. */
     snprintf(sdp, sizeof(sdp),
@@ -883,9 +997,9 @@ int sm_sip_run(sm_sip_t *s, int max_calls)
 
     while (max_calls < 0 || s->calls_done < max_calls)
     {
-        struct pollfd pfds[2];
+        struct pollfd pfds[3];
         int nfds = 0;
-        int sip_idx = -1, rtp_idx = -1;
+        int sip_idx = -1, rtp_idx = -1, daemon_idx = -1;
         int r;
 
         pfds[nfds].fd = s->sip_fd;
@@ -899,17 +1013,61 @@ int sm_sip_run(sm_sip_t *s, int max_calls)
             pfds[nfds].revents = 0;
             rtp_idx = nfds++;
         }
+        if (s->daemon_fd >= 0)
+        {
+            pfds[nfds].fd = s->daemon_fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            daemon_idx = nfds++;
+        }
         (void) sip_idx;
 
-        r = poll(pfds, (nfds_t) nfds, 500);
+        {
+            int timeout_ms = 500;
+
+            if (s->call_active && s->rtp_peer_known)
+            {
+                struct timespec now;
+                long d;
+
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                d = ts_ms_until(&s->next_tick, &now);
+                timeout_ms = d < 0 ? 0 : (d > 500 ? 500 : (int) d);
+            }
+            r = poll(pfds, (nfds_t) nfds, timeout_ms);
+        }
         if (r < 0)
         {
             if (errno == EINTR)
                 continue;
             return -1;
         }
-        if (r == 0)
+
+        /* The daemon can end a handshake before RTP has started (or between
+           incoming packets). Notice that close immediately so the SIP call
+           cannot remain active forever and make the next INVITE look busy. */
+        if (daemon_idx >= 0 &&
+            (pfds[daemon_idx].revents & (POLLHUP | POLLERR | POLLNVAL)))
+        {
+            sm_log_message(&s->log, SM_LOG_FLOW, "daemon ended the call");
+            if (s->rtp_peer_known)
+                send_bye(s);
+            end_call(s);
             continue;
+        }
+        if (daemon_idx >= 0 && (pfds[daemon_idx].revents & POLLIN))
+        {
+            uint8_t probe;
+            ssize_t peeked = recv(s->daemon_fd, &probe, 1, MSG_PEEK);
+            if (peeked == 0)
+            {
+                sm_log_message(&s->log, SM_LOG_FLOW, "daemon socket closed");
+                if (s->rtp_peer_known)
+                    send_bye(s);
+                end_call(s);
+                continue;
+            }
+        }
 
         if (s->rtp_fd >= 0 && (pfds[rtp_idx].revents & POLLIN))
         {
@@ -924,6 +1082,8 @@ int sm_sip_run(sm_sip_t *s, int max_calls)
                 {
                     s->rtp_peer = from;
                     s->rtp_peer_known = 1;
+                    clock_gettime(CLOCK_MONOTONIC, &s->next_tick);
+                    ts_add_ms(&s->next_tick, 40);   /* small jitter buffer */
                     sm_log_message(&s->log, SM_LOG_FLOW,
                                    "RTP peer is %s:%d",
                                    inet_ntoa(from.sin_addr), ntohs(from.sin_port));
@@ -961,6 +1121,28 @@ int sm_sip_run(sm_sip_t *s, int max_calls)
                     handle_options(s, &m, &src);
                 else
                     send_response(s, &m, &src, 405, "Method Not Allowed", NULL, NULL);
+            }
+        }
+
+        /* Paced audio pump: drain received audio and emit RTP on a steady
+           20 ms clock, independent of incoming packet timing. */
+        if (s->call_active && s->rtp_peer_known)
+        {
+            struct timespec now;
+
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            while (s->call_active && s->rtp_peer_known &&
+                   ts_ms_until(&s->next_tick, &now) <= 0)
+            {
+                audio_tick(s);
+                ts_add_ms(&s->next_tick, 20);
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                if (ts_ms_until(&s->next_tick, &now) <= -100)
+                {
+                    /* Fell badly behind; resync rather than burst. */
+                    s->next_tick = now;
+                    ts_add_ms(&s->next_tick, 20);
+                }
             }
         }
     }

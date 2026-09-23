@@ -1,0 +1,12 @@
+--- v34tx.c
++++ v34tx.c
+@@ -2481,7 +2481,8 @@
+            full training allowance. */
+         if ((!s->tx.duplex  &&  ++s->tx.tone_duration >= s->rx.infoh.length_of_trn*35*s->rx.infoh.baud_rate/1000)
+             ||
+-            (s->tx.duplex  &&  ++s->tx.tone_duration >= 512))
++            (s->tx.duplex  &&  ++s->tx.tone_duration >=
++             (s->tx.trn_after_j  ?  (int) exact_baud_rate(s->tx.baud_rate) : 512)))
+         {
+             if (s->tx.trn_after_j)
+             {

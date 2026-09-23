@@ -1,0 +1,17 @@
+--- v34tx.c
++++ v34tx.c
+@@ -2641,6 +2641,14 @@
+ static void mp_or_mph_baud_init(v34_state_t *s)
+ {
+     span_log(&s->logging, SPAN_LOG_FLOW, "Tx - mp_baud_init()\n");
++    if (s->tx.duplex  &&  s->rx.info1c.power_reduction > 0)
++    {
++        span_log(&s->logging, SPAN_LOG_FLOW,
++                 "Tx - applying INFO1c power reduction of %d dB for MP/data\n",
++                 s->rx.info1c.power_reduction);
++        s->tx.gain *= db_to_amplitude_ratio(-s->rx.info1c.power_reduction);
++    }
++    /*endif*/
+     /* Duplex MP is a primary-channel signal. Only half-duplex MPh is sent
+        through the 600-baud control-channel modulator. */
+     s->tx.current_modulator = s->tx.duplex  ?  V34_MODULATION_V34

@@ -38,8 +38,15 @@ static void usage(void)
             "  --ip-up-script PATH  pppd ip-up script\n"
             "  --ip-down-script PATH  pppd ip-down script\n"
             "  --no-ppp             run without pppd (loopback/testing)\n"
+            "  --bbs-db PATH        persistent BBS SQLite database (default bbs.db)\n"
             "  --echo               echo received data back (byte-exact test mode)\n"
             "  --v8                 negotiate with V.8 first (else plain answer tone)\n"
+            "  --v34                offer V.34 in the V.8 menu (opt-in; the V.34\n"
+            "                       receive data path is not finished yet, so a\n"
+            "                       V.34 call will train but not carry usable data)\n"
+            "  --binmodem           answer with the vendored BinModem engine: its\n"
+            "                       own V.8 and V.34 start-up, 16 kHz internally.\n"
+            "                       Needs --v34 to offer V.34.\n"
             "  --debug              verbose logging\n"
             "  --shim FD            internal pppd relay (do not use)\n",
             prog, DEFAULT_PORT);
@@ -89,6 +96,7 @@ int main(int argc, char **argv)
     cfg.dns1 = "192.168.2.1";
     cfg.dns2 = "8.8.8.8";
     cfg.log_dir = "/tmp/softmodem";
+    cfg.bbs_db = "bbs.db";
     cfg.enable_ppp = 1;
     cfg.log_level = SM_LOG_INFO;
 
@@ -133,10 +141,16 @@ int main(int argc, char **argv)
             cfg.ip_down_script = argv[++i];
         else if (strcmp(argv[i], "--no-ppp") == 0)
             cfg.enable_ppp = 0;
+        else if (strcmp(argv[i], "--bbs-db") == 0 && i + 1 < argc)
+            cfg.bbs_db = argv[++i];
         else if (strcmp(argv[i], "--echo") == 0)
             cfg.echo_data = 1;
         else if (strcmp(argv[i], "--v8") == 0)
             cfg.use_v8 = 1;
+        else if (strcmp(argv[i], "--v34") == 0)
+            cfg.use_v34 = 1;
+        else if (strcmp(argv[i], "--binmodem") == 0)
+            cfg.use_binmodem = 1;
         else if (strcmp(argv[i], "--debug") == 0)
             cfg.log_level = SM_LOG_FLOW;
         else if (strcmp(argv[i], "--help") == 0)
@@ -169,8 +183,10 @@ int main(int argc, char **argv)
         mkdir(cfg.log_dir, 0755);
 
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_term;
+    sa.sa_flags = SA_RESTART;
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
 
@@ -200,18 +216,24 @@ int main(int argc, char **argv)
 
     while (g_run)
     {
+        fprintf(stderr, "[PARENT %d] about to call accept\n", getpid());
         int fd = sm_ast_accept(listen_fd);
         pid_t pid;
 
         if (fd == -2)
+        {
+            fprintf(stderr, "[PARENT %d] accept returned EINTR\n", getpid());
             continue;               /* EINTR: check g_run */
+        }
         if (fd < 0)
         {
-            fprintf(stderr, "[%s] accept failed: %s\n", prog, strerror(errno));
+            fprintf(stderr, "[%s] accept failed: %s (errno=%d)\n", prog, strerror(errno), errno);
             break;
         }
+        fprintf(stderr, "[PARENT %d] accepted fd=%d, forking\n", getpid(), fd);
 
         pid = fork();
+        fprintf(stderr, "[PARENT %d] fork returned pid=%d\n", getpid(), pid);
         if (pid < 0)
         {
             fprintf(stderr, "[%s] fork failed: %s\n", prog, strerror(errno));
@@ -228,21 +250,27 @@ int main(int argc, char **argv)
             signal(SIGPIPE, SIG_IGN);
             signal(SIGTERM, SIG_DFL);
             signal(SIGINT, SIG_DFL);
+            setvbuf(stderr, NULL, _IONBF, 0);
+            fprintf(stderr, "[CHILD %d] Starting call %d\n", getpid(), call_seq);
 
             call = calloc(1, sizeof(*call));
             if (!call)
                 _exit(1);
             sm_call_init(call, &cfg, call_seq);
+            fprintf(stderr, "[CHILD %d] sm_call_init done, phase=%d\n", getpid(), call->phase);
             rc = sm_call_run(call, fd);
+            fprintf(stderr, "[CHILD %d] sm_call_run returned rc=%d\n", getpid(), rc);
             free(call);
             _exit(rc == 0 ? 0 : 1);
         }
+        fprintf(stderr, "[PARENT %d] closing fd=%d, call_seq=%d\n", getpid(), fd, call_seq);
         close(fd);
         call_seq++;
 
         /* Reap finished calls. */
         while (waitpid(-1, NULL, WNOHANG) > 0)
             ;
+        fprintf(stderr, "[PARENT %d] loop iteration done, g_run=%d\n", getpid(), g_run);
     }
 
     close(listen_fd);

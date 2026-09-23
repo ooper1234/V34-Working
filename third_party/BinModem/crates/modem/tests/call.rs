@@ -1,0 +1,1950 @@
+//! Two modems calling each other, driven the way a terminal drives one.
+//!
+//! Nothing here reaches past the two interfaces a modem actually has: bytes to
+//! and from the terminal, and samples to and from the line. If a thing cannot
+//! be done through those, a person with a terminal and a telephone line cannot
+//! do it either.
+
+use modem::{Modem, State};
+
+const FS: f64 = 16_000.0;
+
+/// Both ends of a call, joined by a line that sums the two directions.
+struct Pair {
+    caller: Modem,
+    host: Modem,
+    from_caller: f64,
+    from_host: f64,
+    /// Everything each end has said to its terminal.
+    at_caller: Vec<u8>,
+    at_host: Vec<u8>,
+}
+
+impl Pair {
+    fn new() -> Self {
+        Self {
+            caller: Modem::new(FS),
+            host: Modem::new(FS),
+            from_caller: 0.0,
+            from_host: 0.0,
+            at_caller: Vec::new(),
+            at_host: Vec::new(),
+        }
+    }
+
+    /// Type a command line at one end.
+    fn type_at(modem: &mut Modem, line: &str) {
+        for b in line.bytes() {
+            modem.feed_dte(b);
+        }
+        modem.feed_dte(b'\r');
+    }
+
+    /// Run the line for `seconds`, collecting what each terminal is told.
+    fn run(&mut self, seconds: f64) {
+        for _ in 0..(seconds * FS) as usize {
+            let (a, b) = (self.from_caller, self.from_host);
+            self.from_caller = self.caller.step(b);
+            self.from_host = self.host.step(a);
+            self.at_caller.extend(self.caller.take_dte());
+            self.at_host.extend(self.host.take_dte());
+        }
+    }
+
+    fn caller_saw(&self) -> String {
+        String::from_utf8_lossy(&self.at_caller).into_owned()
+    }
+
+    fn host_saw(&self) -> String {
+        String::from_utf8_lossy(&self.at_host).into_owned()
+    }
+}
+
+/// Place a call and wait for both ends to report a connection.
+fn connect() -> Pair {
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(10.0);
+    p
+}
+
+#[test]
+fn a_terminal_talks_to_the_modem_before_there_is_a_call() {
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT");
+    p.run(0.01);
+    assert!(
+        p.caller_saw().contains("OK"),
+        "a bare AT was answered with {:?}",
+        p.caller_saw()
+    );
+    assert_eq!(p.caller.state(), State::Command);
+}
+
+/// V.250 5.7: a command line gets one final result code, however many
+/// commands it held and whatever they asked the modem to do.
+#[test]
+fn every_command_line_is_answered_once() {
+    for line in ["AT+MS=V90", "ATH", "ATZ", "AT&F", "AT+ES=3", "AT+DS=3", "AT+FCLASS=0", "AT+MS=V34;+ES=3;+DS=0", "ATE1"] {
+        let mut p = Pair::new();
+        Pair::type_at(&mut p.caller, line);
+        p.run(0.05);
+        let saw = p.caller_saw();
+        assert_eq!(saw.matches("OK").count(), 1, "{line} was answered {saw:?}");
+    }
+}
+
+#[test]
+fn dialling_reaches_a_connection_and_says_so() {
+    let p = connect();
+    assert_eq!(p.caller.state(), State::Data, "the caller is not online");
+    assert_eq!(p.host.state(), State::Data, "the host is not online");
+    for (name, saw) in [("caller", p.caller_saw()), ("host", p.host_saw())] {
+        assert!(
+            saw.contains("CONNECT"),
+            "the {name}'s terminal was told {saw:?} rather than CONNECT"
+        );
+    }
+    // V.250 6.2.7: with X at its default the rate is reported, since it is the
+    // only way a terminal learns what it got rather than what it asked for.
+    //
+    // Which rate is not this test's business and is no longer fixed: with
+    // automode on, a plain ATD negotiates through V.8 and comes out at
+    // whichever modulation both ends liked best. What has to hold is that the
+    // number the terminal was told is the number the modem actually got.
+    let rate = p.caller.rate().expect("connected without a rate");
+    assert!(
+        p.caller_saw().contains(&rate.to_string()),
+        "CONNECT carried no rate: {:?}",
+        p.caller_saw()
+    );
+    assert_eq!(p.caller.rate(), p.host.rate(), "the two ends disagree");
+    // And what each end sends at is what the other receives at.
+    assert_eq!(p.caller.transmit_rate(), p.host.rate(), "the caller's sending rate");
+    assert_eq!(p.host.transmit_rate(), p.caller.rate(), "the host's sending rate");
+}
+
+#[test]
+fn typing_at_one_terminal_comes_out_at_the_other() {
+    let mut p = connect();
+    assert_eq!(p.caller.state(), State::Data);
+    // Let error control finish establishing before speaking.
+    p.run(2.0);
+    p.at_caller.clear();
+    p.at_host.clear();
+
+    for b in b"cactus\r\n" {
+        p.caller.feed_dte(*b);
+    }
+    p.run(3.0);
+    assert!(
+        p.host_saw().contains("cactus"),
+        "the host's terminal saw {:?}",
+        p.host_saw()
+    );
+
+    for b in b"Password:" {
+        p.host.feed_dte(*b);
+    }
+    p.run(3.0);
+    assert!(
+        p.caller_saw().contains("Password:"),
+        "the caller's terminal saw {:?}",
+        p.caller_saw()
+    );
+}
+
+#[test]
+fn error_control_comes_up_on_its_own() {
+    // V.42 is not something the terminal asks for. The originator offers, the
+    // answerer accepts, and neither terminal is told anything about it beyond
+    // what the CONNECT says.
+    let mut p = connect();
+    p.run(3.0);
+    assert!(
+        p.caller.error_controlled(),
+        "the caller has no error control"
+    );
+    assert!(p.host.error_controlled(), "the host has no error control");
+}
+
+#[test]
+fn compression_is_agreed_without_either_terminal_asking() {
+    // V.42bis is negotiated in XID during the connection, and what runs is the
+    // intersection of the two offers. Neither terminal is consulted.
+    let mut p = connect();
+    p.run(3.0);
+    assert!(p.caller.compressing(), "the caller is not compressing");
+    assert!(p.host.compressing(), "the host is not compressing");
+}
+
+#[test]
+fn a_far_end_without_error_control_still_carries_data() {
+    // The case V.42 7.2.1 exists for. A modem that treated a far end without
+    // error control as a failure would refuse connections that work perfectly
+    // well, which is most of what was answering telephones when V.42 was new.
+    let mut p = Pair::new();
+    p.host.set_error_control(false);
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(12.0);
+
+    assert_eq!(p.caller.state(), State::Data, "the caller never connected");
+    assert_eq!(p.host.state(), State::Data, "the host never connected");
+    assert!(
+        !p.caller.error_controlled(),
+        "error control was agreed with an end that does not do it"
+    );
+
+    p.at_host.clear();
+    for b in b"cactus" {
+        p.caller.feed_dte(*b);
+    }
+    p.run(3.0);
+    assert!(
+        p.host_saw().contains("cactus"),
+        "an unprotected connection carried {:?}",
+        p.host_saw()
+    );
+}
+
+#[test]
+fn the_escape_sequence_returns_to_command_state_without_dropping_the_call() {
+    // V.250 6.1.4. The point of the guard time either side is that a file
+    // containing three plusses must not drop the call carrying it, which is
+    // why the sequence alone is not enough.
+    let mut p = connect();
+    p.run(2.0);
+    p.at_caller.clear();
+
+    // Quiet, the sequence, then quiet again.
+    p.run(1.5);
+    for _ in 0..3 {
+        p.caller.feed_dte(b'+');
+    }
+    p.run(1.5);
+
+    assert_eq!(
+        p.caller.state(),
+        State::OnlineCommand,
+        "the escape did not take"
+    );
+    assert!(
+        p.caller_saw().contains("OK"),
+        "no OK after escaping: {:?}",
+        p.caller_saw()
+    );
+    assert_eq!(p.host.state(), State::Data, "the far end lost the call");
+
+    // And back again.
+    Pair::type_at(&mut p.caller, "ATO");
+    p.run(0.5);
+    assert_eq!(p.caller.state(), State::Data, "ATO did not return online");
+}
+
+#[test]
+fn three_plusses_in_the_middle_of_data_are_just_data() {
+    // The case the guard time exists for.
+    let mut p = connect();
+    p.run(2.0);
+    for b in b"a+++b" {
+        p.caller.feed_dte(*b);
+    }
+    p.run(0.5);
+    assert_eq!(
+        p.caller.state(),
+        State::Data,
+        "plusses inside a stream of data dropped the call out of it"
+    );
+}
+
+#[test]
+fn hanging_up_ends_the_call_at_both_ends() {
+    let mut p = connect();
+    p.run(2.0);
+    p.at_caller.clear();
+    p.at_host.clear();
+
+    // Escape first, as a terminal must: ATH is a command and commands are not
+    // read while the modem is passing data.
+    p.run(1.5);
+    for _ in 0..3 {
+        p.caller.feed_dte(b'+');
+    }
+    p.run(1.5);
+    Pair::type_at(&mut p.caller, "ATH0");
+    // Long enough for the far end to notice the carrier has gone, which is a
+    // thing it can only do by waiting.
+    p.run(6.0);
+
+    assert_eq!(p.caller.state(), State::Command, "the caller stayed online");
+    assert_eq!(
+        p.host.state(),
+        State::Command,
+        "the host did not notice the carrier go"
+    );
+    assert!(
+        p.host_saw().contains("NO CARRIER"),
+        "the host's terminal saw {:?}",
+        p.host_saw()
+    );
+    assert_eq!(p.caller_saw().matches("OK").count(), 2, "the caller saw {:?}", p.caller_saw());
+}
+
+#[test]
+fn a_call_to_nobody_gives_up_and_says_so() {
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    // The far end never answers. The handshake's own patience is a minute, so
+    // this only checks that it is still trying rather than that it has stopped.
+    p.run(5.0);
+    assert_eq!(p.caller.state(), State::Handshaking);
+    assert!(
+        !p.caller_saw().contains("CONNECT"),
+        "connected to nothing: {:?}",
+        p.caller_saw()
+    );
+}
+
+#[test]
+fn what_is_typed_while_dialling_is_not_treated_as_a_command() {
+    // A terminal that types during a dial must not have it parsed, and must
+    // not have it delivered as a burst the moment a connection comes up
+    // either. What it does instead is stop the dial: V.250 5.6.1, and the
+    // abortability clause of the D command.
+    //
+    // The distinction is visible in what comes back. A parsed ATH would
+    // answer OK; an aborted dial answers NO CARRIER, and the T and the H
+    // never reach a parser at all.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(0.5);
+    let before = p.caller_saw().len();
+    Pair::type_at(&mut p.caller, "ATH");
+    p.run(1.0);
+
+    assert_eq!(p.caller.state(), State::Command, "carried on dialling");
+    let after = &p.caller_saw()[before..];
+    assert!(
+        after.contains("NO CARRIER"),
+        "did not report the dial as abandoned: {after:?}"
+    );
+    assert!(
+        !after.contains("OK"),
+        "the ATH was parsed as a command: {after:?}"
+    );
+}
+
+#[test]
+fn ms_chooses_which_modulation_the_call_uses() {
+    // V.250 6.4.1. Both ends have to be told, because a modulation is not
+    // negotiated across the whole set: V.22bis and V.32 do not share a
+    // handshake and a modem listening for one hears nothing of the other.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+MS=V32");
+    Pair::type_at(&mut p.caller, "AT+MS=V32");
+    p.run(0.01);
+    assert!(p.caller_saw().contains("OK"), "{:?}", p.caller_saw());
+
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(12.0);
+
+    assert_eq!(p.caller.state(), State::Data, "the V.32 caller never connected");
+    assert_eq!(p.host.state(), State::Data, "the V.32 host never connected");
+    // V.250 gives V.32 and V.32bis separate carrier names, and what
+    // separates them is a ceiling: this is the older one, so 9600 is as fast
+    // as it goes even though the modulation underneath would carry 14 400
+    // without changing anything but the constellation.
+    assert_eq!(p.caller.rate(), Some(9600), "not the V.32 rate");
+    assert!(
+        p.caller_saw().contains("9600"),
+        "CONNECT did not report the V.32 rate: {:?}",
+        p.caller_saw()
+    );
+    assert_eq!(p.caller.standard(), "V.32");
+}
+
+/// The two V.32 carriers are one modulation with two ceilings.
+///
+/// V.250 names them separately and a terminal that asks for the older one
+/// means it -- which is also how to meet a far end that claims V.32bis and
+/// cannot hold it, since what this end offers is what the rate exchange can
+/// settle on.
+#[test]
+fn the_two_v32_carriers_are_two_ceilings() {
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+MS=V32B");
+    Pair::type_at(&mut p.caller, "AT+MS=V32B");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(14.0);
+    assert_eq!(p.caller.rate(), Some(14_400), "V.32bis should reach the top");
+    assert_eq!(p.caller.standard(), "V.32bis");
+    assert_eq!(p.caller.states(), 128);
+}
+
+/// Two modems asked for V.34 agree on it in V.8 and go through its start-up:
+/// capabilities, ranging, probing and the settlement in phase 2, training and
+/// the MP exchange in phases 3 and 4 -- and then connect at 33 600 both ways,
+/// with V.42 over it carrying a login both ways.
+#[test]
+fn two_modems_asked_for_v34_connect_at_33600_and_carry_data() {
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+MS=V34");
+    Pair::type_at(&mut p.caller, "AT+MS=V34");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    let mut phases = Vec::new();
+    for _ in 0..2000 {
+        p.run(0.01);
+        let phase = p.caller.line_phase();
+        if phases.last() != Some(&phase) {
+            phases.push(phase);
+        }
+        if p.caller.state() == State::Data && p.host.state() == State::Data {
+            break;
+        }
+    }
+    assert!(phases.contains(&"V.34 ranging"), "never ranged: {phases:?}");
+    assert!(phases.contains(&"V.34 phase 4: MP"), "never reached MP: {phases:?}");
+    assert_eq!(p.caller.state(), State::Data, "still in {phases:?}: {}", p.caller_saw());
+    assert_eq!(p.host.state(), State::Data, "{}", p.host_saw());
+    assert!(p.caller_saw().contains("CONNECT 33600"), "{}", p.caller_saw());
+    assert_eq!(p.caller.rate(), Some(33_600));
+    assert_eq!(p.caller.transmit_rate(), Some(33_600));
+
+    p.at_caller.clear();
+    p.at_host.clear();
+    for b in b"cactus\r" {
+        p.caller.feed_dte(*b);
+    }
+    for b in b"Password:" {
+        p.host.feed_dte(*b);
+    }
+    p.run(4.0);
+    assert!(p.host_saw().contains("cactus"), "the host saw {:?}", p.host_saw());
+    assert!(p.caller_saw().contains("Password:"), "the caller saw {:?}", p.caller_saw());
+
+    for (who, modem) in [("caller", &p.caller), ("host", &p.host)] {
+        let report = modem.v34_report().unwrap_or_else(|| panic!("{who}: no report"));
+        assert_eq!(report.failed, None, "{who}: {:?}", report.failed);
+        let info1a = report.info1a.expect("no INFO1a");
+        assert_eq!(info1a.answer_to_call.nominal(), 3429, "{who}: {info1a:?}");
+        assert_eq!(info1a.call_to_answer.nominal(), 3429, "{who}: {info1a:?}");
+        assert_eq!(info1a.probed.max_rate, 14, "{who}: {info1a:?}");
+        let rtd = report.round_trip.expect("no round trip");
+        assert!(rtd < 0.003, "{who}: {rtd} s round trip on a direct connection");
+        let training = report.training.as_ref().expect("phases 3 and 4 never started");
+        assert!(training.done, "{who}: {:?}", training.stopped);
+        assert_eq!(training.connected, Some((33_600, 33_600)), "{who}");
+        assert_eq!(training.far_asked, Some(datapump::v34::signals::Size::Sixteen), "{who}");
+        assert!(training.phase3_snr.unwrap() > 30.0, "{who}: {:?}", training.phase3_snr);
+        assert_eq!(training.rates, Some((14, 14)), "{who}");
+        let rows = modem.distant();
+        assert!(rows.iter().any(|(k, v)| *k == "V.34 to this end" && v.contains("33600")), "{rows:?}");
+        assert!(rows.iter().any(|(k, v)| *k == "V.34 rates" && v == "33600 bit/s to this end, 33600 from it"), "{rows:?}");
+    }
+
+    // A rate renegotiation from the caller (11.6): down two steps towards it,
+    // and the call goes on -- no NO CARRIER, no second CONNECT, and the
+    // terminals carry on talking once V.42 has sent again what was in flight.
+    p.at_caller.clear();
+    p.at_host.clear();
+    p.caller.ask_for_retrain();
+    p.run(3.0);
+    assert_eq!(p.caller.retrains(), 1);
+    assert_eq!(p.host.retrains(), 1, "the host never heard S");
+    assert_eq!((p.caller.state(), p.host.state()), (State::Data, State::Data), "{} / {}", p.caller_saw(), p.host_saw());
+    assert!(!p.caller_saw().contains("NO CARRIER") && !p.caller_saw().contains("CONNECT"), "{}", p.caller_saw());
+    assert_eq!(p.caller.rate(), Some(28_800));
+    // The renegotiation asked the host to send slower and nothing of the
+    // caller, so the two directions have parted: the caller still sends at
+    // 33 600, and the host, which receives that, says so.
+    assert_eq!(p.caller.transmit_rate(), Some(33_600), "the caller's sending rate moved");
+    assert_eq!(p.host.rate(), Some(33_600));
+    assert_eq!(p.host.transmit_rate(), Some(28_800), "the host is not sending at what the caller receives");
+    for b in b"ls -l\r" {
+        p.caller.feed_dte(*b);
+    }
+    for b in b"total 42" {
+        p.host.feed_dte(*b);
+    }
+    p.run(4.0);
+    assert!(p.host_saw().contains("ls -l"), "the host saw {:?}", p.host_saw());
+    assert!(p.caller_saw().contains("total 42"), "the caller saw {:?}", p.caller_saw());
+    let rows = p.caller.distant();
+    assert!(rows.iter().any(|(k, v)| *k == "V.34 rates" && v == "28800 bit/s to this end, 33600 from it"), "{rows:?}");
+    assert!(rows.iter().any(|(k, v)| *k == "V.34 renegotiated" && v == "1 time"), "{rows:?}");
+}
+
+/// The Retrain button: a full retrain (11.5) from data mode, back through
+/// phase 2 and up again on the same call, with the terminals still talking
+/// afterwards. The whole stack, as the window drives it.
+#[test]
+fn a_v34_call_retrains_the_whole_way_and_comes_back() {
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+MS=V34");
+    Pair::type_at(&mut p.caller, "AT+MS=V34");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    for _ in 0..2000 {
+        p.run(0.01);
+        if p.caller.state() == State::Data && p.host.state() == State::Data {
+            break;
+        }
+    }
+    assert_eq!(p.caller.state(), State::Data, "never connected: {}", p.caller_saw());
+    assert_eq!(p.caller.rate(), Some(33_600));
+
+    p.at_caller.clear();
+    p.at_host.clear();
+    p.caller.retrain();
+    // Phase 2 and phases 3 and 4 again: longer than a renegotiation.
+    for _ in 0..60 {
+        p.run(0.5);
+        if p.caller.retraining() {
+            break;
+        }
+    }
+    assert!(p.caller.retraining() || p.caller.rate().is_some(), "the retrain never started");
+    p.run(25.0);
+    assert_eq!(
+        (p.caller.state(), p.host.state()),
+        (State::Data, State::Data),
+        "{} / {}",
+        p.caller_saw(),
+        p.host_saw()
+    );
+    assert!(!p.caller_saw().contains("NO CARRIER"), "the call dropped: {}", p.caller_saw());
+    assert_eq!(p.caller.rate(), Some(33_600), "came back at a different rate");
+    // And the terminals are still talking over it.
+    for b in b"after\r" {
+        p.caller.feed_dte(*b);
+    }
+    p.run(4.0);
+    assert!(p.host_saw().contains("after"), "the host saw {:?}", p.host_saw());
+}
+
+/// A V.34 caller and a far end without it: V.8 settles on V.32bis, and the
+/// call goes ahead on that exactly as though V.34 had never been asked for.
+#[test]
+fn a_v34_caller_meets_a_v32bis_modem_on_v32bis() {
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+MS=V32B");
+    Pair::type_at(&mut p.caller, "AT+MS=V34");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(14.0);
+    assert_eq!(p.caller.state(), State::Data, "{}", p.caller_saw());
+    assert_eq!(p.caller.rate(), Some(14_400));
+    assert!(p.caller.v34_report().is_none());
+}
+
+/// Error control is asked for once, however long the line is.
+///
+/// From a live call to a board over a SIP trunk: V.34 measured the round trip
+/// at 1125 ms in phase 2, and then the SABME was sent, not answered for 1.19 s,
+/// and sent again at 1.02 s -- because T401 at 28 800 bit/s came to 1.03 s,
+/// which is a second's allowance for a line and a few milliseconds of frame.
+/// The far end honoured the second one as V.42 8.2.4.3 says it should: a
+/// second UA, its sequence numbers back to zero, and its banner sent again
+/// under a link this end thought was already carrying it.
+///
+/// Every call over that line does it, and the line had already said how long
+/// it was. So the two modems here are joined by the same delay, and the end
+/// asking must ask once.
+#[test]
+fn error_control_is_asked_for_once_over_a_line_with_a_long_round_trip() {
+    // 562 ms each way: the 1125 ms that call measured.
+    const ONE_WAY: usize = (0.5625 * FS) as usize;
+    let mut caller = Modem::new(FS);
+    let mut host = Modem::new(FS);
+    Pair::type_at(&mut host, "AT+MS=V34");
+    Pair::type_at(&mut caller, "AT+MS=V34");
+    Pair::type_at(&mut host, "ATA");
+    Pair::type_at(&mut caller, "ATD5551234");
+
+    let mut to_host = std::collections::VecDeque::from(vec![0.0; ONE_WAY]);
+    let mut to_caller = std::collections::VecDeque::from(vec![0.0; ONE_WAY]);
+    let (mut from_caller, mut from_host) = (0.0, 0.0);
+    let (mut asked, mut answered) = (0, 0);
+    let mut saw = Vec::new();
+    let mut host_saw = Vec::new();
+    // A SABME is control field 0x6f, 0x7f with the P bit (V.42 Table 7),
+    // whichever address it went out on; a UA is 0x63, 0x73 with the F bit; an
+    // XID is 0xaf, command and response alike.
+    let sabme = |body: &[u8]| body.get(1).is_some_and(|c| c & 0xef == 0x6f);
+    let ua = |body: &[u8]| body.get(1).is_some_and(|c| c & 0xef == 0x63);
+    let xid = |body: &[u8]| body.get(1).is_some_and(|c| c & 0xef == 0xaf);
+    let (mut caller_xids, mut host_xids) = (0, 0);
+    // Past the connection by a few round trips, so that a second SABME has
+    // had every chance to go out and to be answered.
+    let mut settled_at = None;
+    for i in 0..(60.0 * FS) as usize {
+        to_host.push_front(from_caller);
+        to_caller.push_front(from_host);
+        from_caller = caller.step(to_caller.pop_back().unwrap_or(0.0));
+        from_host = host.step(to_host.pop_back().unwrap_or(0.0));
+        saw.extend(caller.take_dte());
+        host_saw.extend(host.take_dte());
+        let caller_log = caller.take_frame_log();
+        let host_log = host.take_frame_log();
+        asked += caller_log.iter().filter(|f| f.outbound && sabme(&f.body)).count();
+        answered += host_log.iter().filter(|f| f.outbound && ua(&f.body)).count();
+        caller_xids += caller_log.iter().filter(|f| f.outbound && xid(&f.body)).count();
+        host_xids += host_log.iter().filter(|f| f.outbound && xid(&f.body)).count();
+        if settled_at.is_none() && caller.state() == State::Data && host.state() == State::Data {
+            settled_at = Some(i);
+        }
+        if settled_at.is_some_and(|at| i > at + (5.0 * FS) as usize) {
+            break;
+        }
+    }
+    assert!(
+        settled_at.is_some(),
+        "never connected over the long line: the caller was told {:?}, the host {:?}",
+        String::from_utf8_lossy(&saw),
+        String::from_utf8_lossy(&host_saw),
+    );
+    // Connected is not enough on its own: an originator that hears nothing back
+    // goes on without error control, and that is a connection too.
+    for (who, modem) in [("caller", &caller), ("host", &host)] {
+        assert_eq!(
+            modem.error_control_phase(),
+            "connected",
+            "the {who} has no error control: asked {asked}, answered {answered},              {} frames the host could not read",
+            host.damaged_frames()
+        );
+    }
+    let round_trip = caller
+        .v34_report()
+        .and_then(|r| r.round_trip)
+        .expect("V.34 never measured the line");
+    assert!(
+        (1.0..1.3).contains(&round_trip),
+        "the line was meant to measure about 1.125 s and measured {round_trip:.3}"
+    );
+    assert_eq!(asked, 1, "error control was asked for {asked} times");
+    assert_eq!(answered, 1, "and answered {answered} times");
+    // And the XID exchange of V.42 8.10.2 was the one command, an answer to
+    // the far end's, and at most 8.10.3's retransmission of each -- not the
+    // fifty to two hundred copies that used to go out for as long as the
+    // encoder had nothing else to send.
+    //
+    // Four is that ceiling and nothing finer. It is the most 8.10.2 and 8.10.3
+    // can put on the line between them, a command and its one retransmission
+    // plus a response to each of the far end's two, so what it catches is the
+    // repetition -- not a retransmission that stopped happening, which is the
+    // ec crate's own timing test, and not the exchange failing outright, which
+    // is the compression below: that needs an XID response to have arrived and
+    // been read, so it is also what says any XID went out at all.
+    for (who, sent) in [("caller", caller_xids), ("host", host_xids)] {
+        assert!(sent <= 4, "the {who} put {sent} XID frames on the line");
+    }
+    for (who, modem) in [("caller", &caller), ("host", &host)] {
+        assert!(modem.compression_name().is_some(), "the {who} negotiated no compression");
+    }
+}
+
+#[test]
+fn a_v32_call_carries_data_both_ways() {
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+MS=V32");
+    Pair::type_at(&mut p.caller, "AT+MS=V32");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(14.0);
+    assert_eq!(p.caller.state(), State::Data);
+
+    p.at_caller.clear();
+    p.at_host.clear();
+    for b in b"cactus
+" {
+        p.caller.feed_dte(*b);
+    }
+    for b in b"Password:" {
+        p.host.feed_dte(*b);
+    }
+    p.run(4.0);
+    assert!(
+        p.host_saw().contains("cactus"),
+        "the host saw {:?}",
+        p.host_saw()
+    );
+    assert!(
+        p.caller_saw().contains("Password:"),
+        "the caller saw {:?}",
+        p.caller_saw()
+    );
+}
+
+#[test]
+fn turning_compression_off_is_obeyed() {
+    // AT+DS=0 and AT+DS44=0: V.42bis and V.44 each have their own switch.
+    // Error control stays, and only the compression goes.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+DS=0;+DS44=0");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(12.0);
+    assert!(p.caller.error_controlled(), "lost error control as well");
+    assert!(
+        !p.caller.compressing() && !p.host.compressing(),
+        "compression was used after being turned off"
+    );
+}
+
+#[test]
+fn turning_v42bis_off_leaves_v44() {
+    // AT+DS is V.42bis's switch and nothing else's (V.250 6.6.1, 6.6.2).
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+DS=0");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(12.0);
+    assert_eq!(p.caller.compression_name(), Some("V.44"));
+    assert_eq!(p.host.compression_name(), Some("V.44"));
+}
+
+#[test]
+fn turning_error_control_off_is_obeyed() {
+    // AT+ES=0 is direct mode: no V.42 at all, and the characters go down the
+    // line with nothing but their own start and stop bits.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+ES=0");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(12.0);
+    assert_eq!(p.caller.state(), State::Data);
+    assert!(!p.caller.error_controlled(), "V.42 ran after +ES=0");
+
+    p.at_host.clear();
+    for b in b"cactus" {
+        p.caller.feed_dte(*b);
+    }
+    p.run(3.0);
+    assert!(
+        p.host_saw().contains("cactus"),
+        "direct mode carried {:?}",
+        p.host_saw()
+    );
+}
+
+#[test]
+fn a_bell_103_call_carries_a_bbs_session() {
+    // The oldest thing this modem can do, and the one a board from 1985 would
+    // recognise. No error control, no compression, no negotiation to speak
+    // of: the answering end whistles, the calling end whistles back, and
+    // whatever is typed goes down the line as start-stop characters.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+MS=B103");
+    Pair::type_at(&mut p.caller, "AT+MS=B103");
+    p.run(0.01);
+    assert!(p.caller_saw().contains("OK"), "{:?}", p.caller_saw());
+
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(5.0);
+
+    assert_eq!(p.caller.state(), State::Data, "the 300 bit/s caller never connected");
+    assert_eq!(p.host.state(), State::Data, "the 300 bit/s host never connected");
+    assert_eq!(p.caller.rate(), Some(300));
+    assert!(
+        p.caller_saw().contains("300"),
+        "CONNECT did not report the rate: {:?}",
+        p.caller_saw()
+    );
+    // Nothing from 1985 has heard of V.42, and this pump could not carry it
+    // if it had: the line format is already start-stop.
+    assert!(!p.caller.error_controlled());
+
+    let banner = "\r\nThe Dead Zone BBS\r\nLogin: ";
+    for b in banner.bytes() {
+        p.host.feed_dte(b);
+    }
+    Pair::type_at(&mut p.caller, "guest");
+    // Thirty characters a second, so this takes a moment.
+    p.run(3.0);
+
+    assert!(
+        p.caller_saw().contains(banner),
+        "the banner did not come through: {:?}",
+        p.caller_saw()
+    );
+    assert!(
+        p.host_saw().contains("guest\r"),
+        "the login did not go down the line: {:?}",
+        p.host_saw()
+    );
+}
+
+#[test]
+fn a_scope_can_see_what_the_modem_is_doing() {
+    // Everything the live window puts on screen comes through these, and none
+    // of it is visible from the terminal side, which sees a CONNECT and a rate
+    // and nothing else. If they lie, the scope lies.
+    let mut p = Pair::new();
+    assert!(!p.caller.off_hook(), "on hook before a call");
+    assert_eq!(p.caller.standard(), "V.22bis", "the default modulation");
+    assert_eq!(p.caller.constellation_point(), None, "a point with no call");
+
+    Pair::type_at(&mut p.host, "AT+MS=V32B");
+    Pair::type_at(&mut p.caller, "AT+MS=V32B");
+    p.run(0.01);
+    assert_eq!(
+        p.caller.standard(),
+        "V.32bis",
+        "+MS did not change what is reported"
+    );
+
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(0.5);
+    assert!(p.caller.off_hook(), "still on hook while dialling");
+    // V.8 comes first and is not V.32, and says so rather than claiming to be
+    // a modulation it is only choosing between.
+    assert_eq!(p.caller.standard(), "V.8", "did not negotiate first");
+
+    // Once it has chosen, the V.32 start-up runs entirely in the four states
+    // whatever rate is being negotiated, so a scope watching it sees four.
+    p.run(4.0);
+    assert_eq!(p.caller.standard(), "V.32", "never reached the modulation");
+    assert_eq!(p.caller.states(), 4);
+
+    p.run(13.0);
+    assert_eq!(p.caller.state(), State::Data, "never connected");
+    assert_eq!(p.caller.rate(), Some(14_400));
+    // And a hundred and twenty-eight once the rate exchange has settled on
+    // 14 400: six information bits and the redundant one, on Figure
+    // 2-1/V.32bis. It was sixteen when 2.4.1.1 was the only 9600 there was,
+    // and thirty-two when 9600 was the fastest rate this modem had.
+    assert_eq!(p.caller.states(), 128);
+    assert_eq!(p.caller.shape(), "128TCM");
+    assert!(p.caller.carrier(), "connected with no carrier");
+    let point = p.caller.constellation_point().expect("no point once connected");
+    let radius = point.0.hypot(point.1);
+    // Thirty-two points on five rings, normalised by the constellation's own
+    // A hundred and twenty-eight points on many rings, normalised by the
+    // constellation's own root-mean-square. Which ring this is depends on the
+    // byte being carried when the run stopped, so the range has to hold all of
+    // them -- from the four innermost to the corners of the cross.
+    assert!(
+        (0.1..2.0).contains(&radius),
+        "the constellation is at radius {radius:.2}, so the scope would draw it \
+         off the edge or in a dot"
+    );
+    let error = p.caller.residual_error().expect("no residual error");
+    assert!(error < 0.3, "residual error {error:.2} on a clean line");
+    // FSK has no constellation and QAM has no discriminator: each modulation
+    // offers the scope the one it actually has.
+    assert_eq!(p.caller.discriminator(), None);
+}
+
+#[test]
+fn a_three_hundred_baud_scope_gets_an_eye_and_not_a_constellation() {
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+MS=B103");
+    Pair::type_at(&mut p.caller, "AT+MS=B103");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(5.0);
+    assert_eq!(p.caller.state(), State::Data);
+    assert_eq!(p.caller.standard(), "Bell 103");
+    assert_eq!(p.caller.shape(), "2FSK");
+    assert_eq!(p.caller.states(), 2);
+    assert_eq!(p.caller.constellation_point(), None, "FSK has no constellation");
+    let level = p.caller.discriminator().expect("no discriminator");
+    assert!(
+        level > 0.5,
+        "an idle line sits at mark, so the discriminator should read near +1, \
+         not {level:.2}"
+    );
+}
+
+/// Root mean square and peak of a second of one modulation, once it is up.
+fn level_of(carrier: &str, seconds: f64) -> (f64, f64) {
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, &format!("AT+MS={carrier}"));
+    Pair::type_at(&mut p.caller, &format!("AT+MS={carrier}"));
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(seconds);
+    assert_eq!(p.caller.state(), State::Data, "{carrier} never connected");
+
+    // Measure the caller alone, with something to say, so the figure is a
+    // modem carrying data rather than one idling.
+    for b in b"the quick brown fox jumps over the lazy dog " {
+        p.caller.feed_dte(*b);
+    }
+    let (mut sum, mut peak, mut n) = (0.0f64, 0.0f64, 0u32);
+    let (mut a, mut b) = (p.from_caller, p.from_host);
+    for _ in 0..(FS as usize) {
+        let out = p.caller.step(b);
+        b = p.host.step(a);
+        a = out;
+        p.caller.take_dte();
+        p.host.take_dte();
+        sum += out * out;
+        peak = peak.max(out.abs());
+        n += 1;
+    }
+    ((sum / f64::from(n)).sqrt(), peak)
+}
+
+#[test]
+fn every_modulation_goes_out_at_the_same_level() {
+    // A real modem transmits at a level the network expects and does not
+    // change it because the modulation changed, so neither does this one. It
+    // is also what makes a single drive control on the line honest: one
+    // setting has to mean the same power whichever of these is running.
+    let mut measured = Vec::new();
+    for (carrier, seconds) in [("B103", 5.0), ("V22B", 10.0), ("V32", 14.0)] {
+        let (rms, peak) = level_of(carrier, seconds);
+        println!("{carrier:>5}: rms {rms:.3}  peak {peak:.3}  crest {:.2}", peak / rms);
+        measured.push((carrier, rms, peak));
+    }
+    let quietest = measured.iter().map(|m| m.1).fold(f64::MAX, f64::min);
+    let loudest = measured.iter().map(|m| m.1).fold(0.0, f64::max);
+    assert!(
+        20.0 * (loudest / quietest).log10() < 1.0,
+        "the modulations differ by more than a decibel: {measured:?}"
+    );
+
+    // What they do differ in, enormously, is how peaky they are at that same
+    // power. Frequency shift keying has a constant envelope and sits at its
+    // peak permanently; a shaped constellation goes nearly three times above
+    // its own average. Anything choosing a transmit level has to leave room
+    // for the worst of them or the peaks are simply flattened, and a receiver
+    // trains happily on a clipped constellation because every outer point has
+    // moved inwards together.
+    let crest = |name: &str| {
+        let m = measured.iter().find(|m| m.0 == name).expect("not measured");
+        m.2 / m.1
+    };
+    assert!(
+        (1.35..1.50).contains(&crest("B103")),
+        "constant envelope should crest at the root of two, not {:.2}",
+        crest("B103")
+    );
+    assert!(
+        crest("V32") > 2.5,
+        "a shaped constellation crests far above its average, not at {:.2}",
+        crest("V32")
+    );
+}
+
+#[test]
+#[ignore]
+fn report_levels() {
+    for (carrier, seconds) in [("B103", 5.0), ("V22B", 10.0), ("V32", 14.0)] {
+        let (rms, peak) = level_of(carrier, seconds);
+        println!(
+            "{carrier:>5}: rms {rms:.3} ({:>6.2} dB)   peak {peak:.3}   crest {:.2}",
+            20.0 * rms.log10(),
+            peak / rms
+        );
+    }
+}
+
+#[test]
+fn typing_during_a_call_attempt_gives_up_on_it() {
+    // V.250 5.6.1 and the abortability clause of the D command: a single
+    // character from the terminal while a call is being placed is an
+    // instruction to stop, and the modem "disconnects from the line in an
+    // orderly manner". Dropping those characters instead leaves a terminal
+    // with no way back from a handshake that is not going to finish, short of
+    // waiting out the whole patience of the modem, which is a minute.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(1.0);
+    assert_eq!(p.caller.state(), State::Handshaking, "never went off hook");
+
+    p.caller.feed_dte(b'x');
+    p.run(0.05);
+    assert_eq!(p.caller.state(), State::Command, "went on regardless");
+    assert!(
+        p.caller_saw().contains("NO CARRIER"),
+        "said nothing about giving up: {:?}",
+        p.caller_saw()
+    );
+
+    // And the terminal is answered again straight away, which is the point.
+    Pair::type_at(&mut p.caller, "AT");
+    p.run(0.05);
+    assert!(
+        p.caller_saw().ends_with("OK\r\n"),
+        "would not talk afterwards: {:?}",
+        p.caller_saw()
+    );
+}
+
+#[test]
+fn a_line_feed_after_the_dial_does_not_abort_it() {
+    // The reason 5.6.1 puts an eighth of a second in front of the rule: a
+    // terminal that ends its lines with a return and a line feed would
+    // otherwise be hanging up on itself the instant it dialled.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.caller.feed_dte(b'\n');
+    p.run(0.05);
+    assert_eq!(
+        p.caller.state(),
+        State::Handshaking,
+        "a trailing line feed dropped the call"
+    );
+}
+
+#[test]
+fn a_clean_300_bit_link_reports_no_bad_frames() {
+    // Bell 103 recovers characters on the line, by their own start and stop
+    // bits, and then hands them up as bits for the layer above to frame again.
+    // That round trip is lossless by construction: what goes in is a character
+    // and what comes out is the same character wrapped the same way. So on a
+    // line with nothing wrong with it the count has to be zero, and if it is
+    // not then the fault is in the handing over rather than in the line, which
+    // is a distinction no amount of staring at corrupted text will make.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+MS=B103");
+    Pair::type_at(&mut p.caller, "AT+MS=B103");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(5.0);
+    assert_eq!(p.caller.state(), State::Data, "never connected");
+
+    // Something with every byte value in it, including the escape that a
+    // board's colour sequences begin with.
+    let payload: Vec<u8> = (0..=255u8).collect();
+    for b in &payload {
+        p.host.feed_dte(*b);
+    }
+    // 256 characters at thirty a second.
+    p.run(10.0);
+
+    assert_eq!(
+        p.caller.framing_errors(),
+        0,
+        "{} characters lost between the line and the terminal on a clean link",
+        p.caller.framing_errors()
+    );
+    let saw = &p.at_caller[p.at_caller.len().saturating_sub(payload.len())..];
+    assert_eq!(saw, &payload[..], "the bytes came back changed");
+}
+
+#[test]
+fn a_plain_dial_negotiates_before_it_starts() {
+    // V.250 6.4.1 names the mechanism: <automode> "enables or disables
+    // automatic modulation negotiation (e.g., Annex A/V.32 bis or ITU-T
+    // Rec. V.8)", and it is on by default. So an ordinary ATD asks first.
+    //
+    // This is the thing no modem start-up can do for itself. Every one of them
+    // assumes both ends already agree which Recommendation is being followed,
+    // and nothing in any of them says so; two modems that guessed differently
+    // transmit past each other until one gives up, which from either end looks
+    // exactly like a modem that never answered.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(0.5);
+    assert_eq!(p.caller.standard(), "V.8", "dialled without negotiating");
+    assert_eq!(p.host.standard(), "V.8", "answered without negotiating");
+
+    p.run(20.0);
+    assert_eq!(p.caller.state(), State::Data, "the caller never connected");
+    assert_eq!(p.host.state(), State::Data, "the host never connected");
+    // The point of it: both ends at the same place, having agreed rather than
+    // guessed.
+    assert_eq!(p.caller.standard(), p.host.standard());
+    assert_eq!(p.caller.rate(), p.host.rate());
+}
+
+#[test]
+fn error_control_is_settled_in_v8_and_not_only_after_it() {
+    // V.8 Table 6 carries a protocol octet, and 7.3 says it is there "in order
+    // to negotiate LAPM without requiring the ODP/ADP exchange". Both ends can
+    // know before a data carrier exists.
+    //
+    // The exchange still runs -- V.42 Appendix VI.2 says many answering modems
+    // run it whatever V.8 said, and V.8 7.3 warns that some indicate LAPM and
+    // then require it anyway. What the earlier answer buys is a reading of
+    // silence: a detection phase that hears nothing has not contradicted a far
+    // end that already said, in its own words, that it does LAPM.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(20.0);
+    assert!(p.caller.error_control_negotiated(), "the caller never asked in V.8");
+    assert!(p.host.error_control_negotiated(), "the host never answered in V.8");
+    assert!(p.caller.error_controlled(), "and it never came up");
+    assert!(p.host.error_controlled());
+}
+
+#[test]
+fn a_modem_told_not_to_do_error_control_does_not_ask_for_it_in_v8() {
+    // 7.4 completes the negotiation only when the JM answers a CM that asked.
+    // A modem with error control turned off has nothing to ask about, and
+    // saying LAPM in V.8 and then declining it is a way of being wrong twice.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+ES=0");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(20.0);
+    assert_eq!(p.caller.state(), State::Data, "the call should still connect");
+    assert!(!p.caller.error_control_negotiated());
+    assert!(!p.host.error_control_negotiated(), "there was nothing to answer");
+}
+
+#[test]
+fn turning_automode_off_says_the_modulation_and_means_it() {
+    // 6.4.1 lists disabling automode among the constraints on switching, and
+    // a terminal that has named a modulation and turned negotiation off has
+    // said what it wants twice.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+MS=V22B,0");
+    Pair::type_at(&mut p.caller, "AT+MS=V22B,0");
+    p.run(0.01);
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(0.5);
+    assert_eq!(
+        p.caller.standard(),
+        "V.22bis",
+        "negotiated after being told not to"
+    );
+
+    p.run(12.0);
+    assert_eq!(p.caller.state(), State::Data);
+    assert_eq!(p.caller.rate(), Some(2400));
+}
+
+#[test]
+fn a_rate_ceiling_is_honoured_through_the_negotiation() {
+    // The setting that matters on a line that cannot carry the faster rate,
+    // and the one a negotiation could quietly undo: V.8 settles on "the
+    // modulation mode with the lowest item number", which is the fastest, so
+    // a ceiling has to be applied to what is offered rather than to what comes
+    // back. Offer V.32 and V.32 is what will be agreed.
+    let mut p = Pair::new();
+    for m in [&mut p.host, &mut p.caller] {
+        Pair::type_at(m, "AT+MS=V22B,1,1200,1200");
+    }
+    p.run(0.01);
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(20.0);
+
+    assert_eq!(p.caller.state(), State::Data, "never connected");
+    assert_eq!(p.caller.standard(), "V.22bis", "went faster than it was allowed");
+    assert_eq!(p.caller.rate(), Some(1200));
+    assert_eq!(p.host.rate(), Some(1200));
+}
+
+#[test]
+fn a_far_end_that_cannot_go_as_fast_is_met_where_it_is() {
+    // One end able to do V.32 and the other not. Without V.8 this is the case
+    // that fails silently at both ends; with it, both come out at V.22bis.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+MS=V32,1,1200,9600");
+    Pair::type_at(&mut p.host, "AT+MS=V22B,1,1200,2400");
+    p.run(0.01);
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(20.0);
+
+    assert_eq!(p.caller.state(), State::Data, "the caller never connected");
+    assert_eq!(p.host.state(), State::Data, "the host never connected");
+    assert_eq!(p.caller.standard(), "V.22bis");
+    assert_eq!(p.host.standard(), "V.22bis");
+}
+
+// ---------------------------------------------------------------------------
+// What the terminal is told, and when.
+
+#[test]
+fn the_reports_come_out_in_the_order_v250_gives_them() {
+    // V.250 6.5.5: +ER is issued "before the final result code (e.g.,
+    // CONNECT) is transmitted", and "after the modulation report ... and
+    // before the data compression report (+DR)". So there is an order, and
+    // the CONNECT is last -- which means it cannot be sent while the thing
+    // being reported is still being negotiated.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+ER=1;+DR=1");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(20.0);
+
+    let saw = p.caller_saw();
+    let er = saw.find("+ER: LAPM").expect("no error control report");
+    // Two of these both have V.44, and that is what they use and report.
+    let dr = saw.find("+DR: V44").expect("no compression report");
+    let connect = saw.find("CONNECT").expect("never connected");
+    assert!(er < dr, "+DR should follow +ER");
+    assert!(dr < connect, "CONNECT is the final result code and comes last");
+}
+
+#[test]
+fn without_v44_the_report_says_v42bis() {
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+DR=1;+DS44=0");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(20.0);
+    let saw = p.caller_saw();
+    assert!(saw.contains("+DR: V42B"), "{saw:?}");
+    assert!(saw.contains("CONNECT"), "{saw:?}");
+}
+
+#[test]
+fn insisting_on_v44_hangs_up_on_a_far_end_that_will_not() {
+    // Table 28's <compression_negotiation> of 1, against a far end with
+    // V.44 turned off: V.42bis would run, and that is not what was asked.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+DS44=3,1");
+    Pair::type_at(&mut p.host, "AT+DS44=0");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(20.0);
+    let saw = p.caller_saw();
+    assert!(saw.contains("NO CARRIER"), "{saw:?}");
+    assert!(!saw.contains("CONNECT"), "{saw:?}");
+}
+
+#[test]
+fn nothing_is_reported_unless_the_terminal_asked() {
+    // Both parameters default to 0 (V.250 6.5.5, 6.6.3), so an ordinary call
+    // says what it always said.
+    let p = connect();
+    let saw = p.caller_saw();
+    assert!(saw.contains("CONNECT"), "never connected");
+    assert!(!saw.contains("+ER:"), "reported without being asked");
+    assert!(!saw.contains("+DR:"));
+}
+
+#[test]
+fn the_connect_is_not_sent_before_it_is_true() {
+    // The reason the report has to come first is that it describes something
+    // that is not settled when the carriers come up. A CONNECT sent then is a
+    // promise about a negotiation that has not happened.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    // Step until the terminal is told, then look at what was true when it was.
+    let mut told = false;
+    for _ in 0..(30.0 * FS) as usize {
+        let (a, b) = (p.from_caller, p.from_host);
+        p.from_caller = p.caller.step(b);
+        p.from_host = p.host.step(a);
+        let out = p.caller.take_dte();
+        if String::from_utf8_lossy(&out).contains("CONNECT") {
+            told = true;
+            break;
+        }
+        // And the state agrees with what the terminal has been told. A modem
+        // in data state that has not said CONNECT is telling two stories.
+        assert_ne!(p.caller.state(), State::Data, "in data before the CONNECT");
+    }
+    assert!(told, "the caller was never told it had connected");
+    assert!(
+        p.caller.error_controlled(),
+        "CONNECT arrived while error control was still being negotiated"
+    );
+}
+
+#[test]
+fn a_call_without_error_control_still_says_connect_at_once() {
+    // The wait is for an answer, not for a protocol. A modem with error
+    // control turned off has its answer already.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+ES=0;+ER=1");
+    Pair::type_at(&mut p.host, "AT+ES=0");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(20.0);
+    let saw = p.caller_saw();
+    assert!(saw.contains("+ER: NONE"), "no report: {saw:?}");
+    assert!(saw.contains("CONNECT"), "never connected");
+    assert!(!p.caller.error_controlled());
+}
+
+#[test]
+fn error_control_reports_where_it_has_got_to() {
+    // Nothing about this reaches the terminal, and on a real line the
+    // interesting part is which step did not happen. So the steps are
+    // reportable while they are happening, in the order V.42 puts them:
+    // 7.2.1's detection phase, then 8.10's XID exchange, then establishment.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    for _ in 0..(20.0 * FS) as usize {
+        let (a, b) = (p.from_caller, p.from_host);
+        p.from_caller = p.caller.step(b);
+        p.from_host = p.host.step(a);
+        p.caller.take_dte();
+        p.host.take_dte();
+        let phase = p.caller.error_control_phase();
+        if seen.last() != Some(&phase) {
+            seen.push(phase);
+        }
+    }
+    assert_eq!(
+        seen,
+        ["", "detecting", "negotiating", "establishing", "connected"],
+        "the phases a call goes through, in order"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A line that eats samples.
+//
+// The fault a real VoIP call actually has. It is not noise: noise flips a bit
+// and the frame check sequence catches it. A dropped sample moves the clock,
+// so the receiver's idea of where a bit ends slides by a fraction and then
+// stays slid -- and what comes out is not a damaged frame but a stream that
+// has lost its place. Everything above has to notice and recover, and the only
+// thing that can notice is the frame check sequence.
+
+impl Pair {
+    /// Run the line, losing a sample every `every` sample periods.
+    ///
+    /// Lost, not corrupted. Each end is stepped a second time on the input it
+    /// has already been given, and only the second output goes out -- so each
+    /// direction is short one sample and each receiver has been handed one
+    /// twice. That is what a jitter buffer running dry does to a modem: not a
+    /// gap the receiver can see, but a moment that never came, after which
+    /// everything is early. Noise flips a bit and the frame check sequence
+    /// catches it; this moves the clock, and what comes out is a stream that
+    /// has lost its place rather than a frame with a hole in it.
+    /// Run with a stretch of the line missing every so often.
+    ///
+    /// `every` samples apart, `run` of them are lost. One sample at a time is
+    /// a clock offset and the timing loop simply tracks it; a run is a jitter
+    /// buffer that did not have the next packet when it needed it, which is
+    /// what a VoIP line actually does and what actually damages a frame.
+    fn run_lossy(&mut self, seconds: f64, every: usize, run: usize) {
+        for i in 0..(seconds * FS) as usize {
+            let (a, b) = (self.from_caller, self.from_host);
+            self.from_caller = self.caller.step(b);
+            self.from_host = self.host.step(a);
+            if every > 0 && i % every == 0 {
+                for _ in 0..run {
+                    self.from_caller = self.caller.step(b);
+                    self.from_host = self.host.step(a);
+                }
+            }
+            self.at_caller.extend(self.caller.take_dte());
+            self.at_host.extend(self.host.take_dte());
+        }
+    }
+}
+
+#[test]
+fn a_line_that_drops_samples_still_delivers_every_byte() {
+    // The whole point of error control, stated as a test. A byte that arrives
+    // wrong is worse than one that does not arrive, and V.42 exists so that
+    // neither happens: what the far end reads is what was typed, or the call
+    // ends.
+    let mut p = connect();
+    assert!(p.caller.error_controlled(), "no error control to test");
+
+    let text = "The quick brown fox jumps over the lazy dog. 0123456789\r\n";
+    for _ in 0..8 {
+        for b in text.bytes() {
+            p.caller.feed_dte(b);
+        }
+    }
+    // A millisecond of line gone every 200 ms: a jitter buffer that did not
+    // have the next packet in time, over and over. It damages about a hundred
+    // and forty frames across the run, and the text still arrives, which is
+    // the whole claim.
+    //
+    // It used to be a single sample every 20 ms. That stopped damaging
+    // anything the moment 9600 became trellis coded -- the decisions it used
+    // to push over a boundary are not marginal any more -- so the impairment
+    // had to get harsher to go on testing the same thing.
+    p.run_lossy(25.0, (FS * 0.200) as usize, (FS * 0.001) as usize);
+
+    let heard = p.host_saw();
+    let wanted = text.repeat(8);
+    assert!(
+        heard.contains(&wanted) || heard.is_empty(),
+        "what arrived was neither the text nor nothing:\n{heard:?}"
+    );
+    assert!(heard.contains(&wanted), "the text never arrived intact");
+    // And the recovery actually ran. A test that loses nothing proves nothing,
+    // and the count is the only evidence either way.
+    assert!(
+        p.host.damaged_frames() > 0,
+        "no frame was damaged, so nothing here was tested"
+    );
+}
+
+/// How much sample loss a call survives, and what it costs.
+///
+/// `cargo test -p modem --test call -- --ignored --nocapture report_loss`
+///
+/// Not a clean threshold, and it is not expected to be one. The loss here is
+/// perfectly regular, so how much harm it does depends on how its period sits
+/// against the symbol clock -- a rate that lands on the clock is tracked out
+/// like any other frequency offset, and one that beats against it is not. The
+/// figure to take from it is the order of magnitude, which is a lost sample
+/// every millisecond or so at 16 kHz.
+#[test]
+#[ignore = "reports rather than asserts"]
+fn report_loss_tolerance() {
+    let text = "The quick brown fox jumps over the lazy dog. 0123456789\r\n";
+    let wanted = text.repeat(8);
+
+    let sample = connect();
+    println!(
+        "\n  over {} at {} bit/s, error control {}, compression {}",
+        sample.caller.standard(),
+        sample.caller.rate().unwrap_or(0),
+        if sample.caller.error_controlled() { "V.42" } else { "off" },
+        if sample.caller.compressing() { "V.42bis" } else { "off" }
+    );
+    println!("\n  1 ms of line lost every  damaged  delivered");
+    for ms in [2000.0, 1000.0, 500.0, 200.0, 100.0, 50.0, 20.0] {
+        let mut p = connect();
+        if !p.caller.error_controlled() {
+            println!("  {ms:>7.3} ms           no error control");
+            continue;
+        }
+        for b in wanted.bytes() {
+            p.caller.feed_dte(b);
+        }
+        p.run_lossy(25.0, (FS * ms / 1000.0) as usize, (FS * 0.001) as usize);
+        println!(
+            "  {ms:>7.3} ms         {:8}  {}",
+            p.host.damaged_frames(),
+            if p.host_saw().contains(&wanted) {
+                "yes"
+            } else if p.host.state() == State::Data {
+                "not within 25 s, still retrying"
+            } else {
+                "no, the call dropped"
+            }
+        );
+    }
+    println!();
+}
+
+#[test]
+fn error_control_comes_up_on_every_pump_that_can_carry_it() {
+    // V.42 wants a synchronous bit pipe. Two of the three pumps are one; the
+    // third is not, and the difference is not a detail that shows up anywhere
+    // above. Worth checking on each rather than on whichever the default
+    // happens to be, because the layer that would notice is the layer being
+    // tested.
+    for (carrier, seconds) in [("V22B", 12.0), ("V32", 14.0)] {
+        let mut p = Pair::new();
+        Pair::type_at(&mut p.host, &format!("AT+MS={carrier}"));
+        Pair::type_at(&mut p.caller, &format!("AT+MS={carrier}"));
+        Pair::type_at(&mut p.host, "ATA");
+        Pair::type_at(&mut p.caller, "ATD5551234");
+        p.run(seconds);
+        assert_eq!(p.caller.state(), State::Data, "{carrier} never connected");
+        assert!(p.caller.error_controlled(), "{carrier}: no error control");
+        assert!(p.host.error_controlled(), "{carrier}: none at the far end");
+        assert!(p.caller.compressing(), "{carrier}: no compression");
+    }
+
+    // Bell 103 is asynchronous all the way down: its line format *is*
+    // start-stop framing and its receiver re-synchronises on every start bit,
+    // so there is no synchronous pipe for V.42 to run on. Which is also how
+    // anyone ever dialled a board at 300 bit/s.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+MS=B103");
+    Pair::type_at(&mut p.caller, "AT+MS=B103");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(12.0);
+    assert_eq!(p.caller.state(), State::Data, "Bell 103 never connected");
+    assert!(!p.caller.error_controlled(), "Bell 103 cannot carry V.42");
+    assert_eq!(p.caller.error_control_phase(), "none");
+
+    // And it still carries what is typed, which is the point.
+    for b in b"HELLO\r" {
+        p.caller.feed_dte(*b);
+    }
+    p.run(4.0);
+    assert!(p.host_saw().contains("HELLO"), "{:?}", p.host_saw());
+}
+
+#[test]
+fn asking_for_v42_without_the_detection_phase_skips_it() {
+    // V.250 Table 20, <orig_rqst> of 2: "initiate V.42 without Detection
+    // Phase. If ITU-T Rec. V.8 is in use, this is a request to disable V.42
+    // Detection Phase." A terminal that already knows what it is dialling can
+    // save the three quarters of a second of asking.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+ES=2");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    for _ in 0..(20.0 * FS) as usize {
+        let (a, b) = (p.from_caller, p.from_host);
+        p.from_caller = p.caller.step(b);
+        p.from_host = p.host.step(a);
+        p.caller.take_dte();
+        p.host.take_dte();
+        let phase = p.caller.error_control_phase();
+        if seen.last() != Some(&phase) {
+            seen.push(phase);
+        }
+    }
+    assert!(!seen.contains(&"detecting"), "detected anyway: {seen:?}");
+    assert!(p.caller.error_controlled(), "and then did not establish");
+    // The far end was not told, and had to notice: V.42 7.2.1.3 ends its own
+    // wait on continuous flags as well as on the pattern it was listening for.
+    assert!(p.host.error_controlled(), "the answerer never noticed");
+}
+
+#[test]
+fn error_control_can_be_made_a_condition_of_the_call() {
+    // V.250 Table 20, <orig_fbk> of 2 and above: "error control required ...
+    // if error control not established, disconnect". A connection the terminal
+    // has already said it will not accept unprotected is not one to hand it
+    // anyway and let it find out.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+ES=3,2");
+    Pair::type_at(&mut p.host, "AT+ES=0");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(25.0);
+
+    let saw = p.caller_saw();
+    assert!(!saw.contains("CONNECT"), "connected anyway: {saw:?}");
+    assert!(saw.contains("NO CARRIER"), "said nothing about it: {saw:?}");
+    assert_eq!(p.caller.state(), State::Command, "still off hook");
+}
+
+#[test]
+fn the_same_call_connects_when_error_control_is_only_preferred() {
+    // The other half of it, and the default: a far end without V.42 is a
+    // perfectly ordinary far end, and <orig_fbk> of 0 says so.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+ES=3,0");
+    Pair::type_at(&mut p.host, "AT+ES=0");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(25.0);
+    assert!(p.caller_saw().contains("CONNECT"), "{:?}", p.caller_saw());
+    assert!(!p.caller.error_controlled());
+}
+
+#[test]
+fn compression_can_be_made_a_condition_of_the_call_too() {
+    // V.250 Table 27, <compression_negotiation> of 1: "disconnect if ITU-T
+    // Rec. V.42 bis is not negotiated by the remote DCE as specified in
+    // <direction>". The same bargain as <orig_fbk> makes for error control,
+    // one layer up.
+    //
+    // A far end that still had V.44 would satisfy it -- any compression does
+    // -- so this one has neither.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.caller, "AT+DS=3,1");
+    Pair::type_at(&mut p.host, "AT+DS=0;+DS44=0");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(25.0);
+
+    let saw = p.caller_saw();
+    assert!(!saw.contains("CONNECT"), "connected anyway: {saw:?}");
+    assert!(saw.contains("NO CARRIER"), "said nothing about it: {saw:?}");
+    // Error control was fine; it was compression that was refused, and the
+    // call was conditional on it.
+    assert_eq!(p.caller.state(), State::Command);
+}
+
+#[test]
+fn a_smaller_dictionary_is_still_a_working_call() {
+    // The setting exists to be used, not just to be accepted. A terminal that
+    // knows it is about to send something incompressible can hold the
+    // dictionary down, and the call has to go on working when it does.
+    let mut p = Pair::new();
+    for m in [&mut p.host, &mut p.caller] {
+        Pair::type_at(m, "AT+DS=3,0,512,6");
+    }
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(20.0);
+    assert_eq!(p.caller.state(), State::Data, "never connected");
+    assert!(p.caller.compressing(), "compression never came up");
+
+    for b in b"MAIN MENU\r" {
+        p.caller.feed_dte(*b);
+    }
+    p.run(6.0);
+    assert!(p.host_saw().contains("MAIN MENU"), "{:?}", p.host_saw());
+}
+
+#[test]
+fn why_there_is_no_error_control_survives_there_being_none() {
+    // A connection that ends up without it drops the stack, and every fact
+    // about why goes with it -- at exactly the moment those facts are worth
+    // most. A far end that declined, one that answered something nobody has
+    // defined, and one that said nothing at all are three different faults,
+    // and afterwards they look identical.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+ES=0");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    p.run(25.0);
+
+    assert_eq!(p.caller.state(), State::Data, "never connected");
+    assert!(!p.caller.error_controlled(), "the far end had it turned off");
+
+    let distant = p.caller.distant();
+    // The row itself is the point. Whether it says the far end declined, or
+    // said something nobody has defined, or said nothing at all, it is the
+    // difference between three faults that look identical afterwards -- and
+    // before this it went into the bin with the stack that heard it.
+    let answered = distant
+        .iter()
+        .find(|(k, _)| *k == "answered")
+        .map(|(_, v)| v.clone())
+        .expect("the far end's answer was thrown away with the stack");
+    assert!(!answered.is_empty());
+}
+
+#[test]
+fn a_retrain_is_not_mistaken_for_the_far_end_hanging_up() {
+    // The line these two are joined by has no echo on it whatever, which is
+    // the condition this is about. 5.2.3's training segment is the one stretch
+    // of the start-up the far end is required to be silent for, so while this
+    // end sends its own the line carries nothing at all -- and a carrier
+    // detector that has not been told a retrain is running reads that as a far
+    // end that has gone.
+    //
+    // Which is what happened on a real call over a trunk that reflects almost
+    // nothing: the modem asked for a retrain, reached its own training
+    // segment, decided the carrier had dropped, dropped the pump and stopped
+    // transmitting. The far end was left listening for a signal that was never
+    // coming, in the middle of a procedure this end had started.
+    let mut p = Pair::new();
+    Pair::type_at(&mut p.host, "AT+MS=V32B,1,4800,9600");
+    Pair::type_at(&mut p.caller, "AT+MS=V32B,1,4800,9600");
+    Pair::type_at(&mut p.host, "ATA");
+    Pair::type_at(&mut p.caller, "ATD5551234");
+    // Long enough for error control and compression to have finished
+    // negotiating, which is what a call asking for a retrain has behind it.
+    //
+    // And no longer than that. Where in the far end's data the retrain lands
+    // used to decide whether it ever finished, so any figure here that passed
+    // was a figure that happened to pass: this was 14, V.44's longer XID moved
+    // everything after it, and 20 was simply a moment that worked. The start-up
+    // was what was wrong, and the data pump's own tests now ask at many moments
+    // (`a_retrain_comes_back_whenever_it_is_asked_for_and_whoever_asks`).
+    p.run(14.0);
+    assert_eq!(p.caller.state(), State::Data, "never connected to begin with");
+    assert!(p.caller.compressing(), "compression never came up");
+    let before = p.caller.retrains();
+
+    p.at_caller.clear();
+    p.at_host.clear();
+    p.caller.ask_for_retrain();
+    p.run(25.0);
+
+    assert!(
+        !p.caller_saw().contains("NO CARRIER"),
+        "the end that asked for the retrain hung up on itself: {:?}",
+        p.caller_saw()
+    );
+    assert!(
+        !p.host_saw().contains("NO CARRIER"),
+        "the far end was dropped during the retrain: {:?}",
+        p.host_saw()
+    );
+    assert!(
+        p.caller.retrains() > before,
+        "the retrain never happened at all"
+    );
+    assert_eq!(p.caller.state(), State::Data, "the call did not come back");
+    assert_eq!(p.host.state(), State::Data, "the far end did not come back");
+
+    // And it still carries what it carried before.
+    p.at_caller.clear();
+    p.at_host.clear();
+    for b in b"still here" {
+        p.caller.feed_dte(*b);
+    }
+    p.run(4.0);
+    assert!(
+        p.host_saw().contains("still here"),
+        "nothing crossed after the retrain: {:?}",
+        p.host_saw(),
+    );
+    
+}
+
+#[test]
+fn a_fax_call_carries_the_identification_it_was_given() {
+    // The identification is set before the dial and read when the call is
+    // built, so anything that sets it a moment too late sends twenty spaces
+    // instead. Which is what happened against a real machine, twice, because
+    // the window set it after the dial had already been acted on.
+    let mut caller = Modem::new(FS);
+    caller.fax_identification = "61399990000".to_owned();
+    Pair::type_at(&mut caller, "AT+FCLASS=1");
+    Pair::type_at(&mut caller, "ATD1300368909");
+
+    // A far end that answers as a real fax does: its identification, then
+    // what it can do. The capability field is a real one, off a recording.
+    let mut far_frames = fax::frames::Sender::new();
+    far_frames.send(&[
+        fax::frames::Message::new(fax::t30::Frame::Csi, false)
+            .and_more()
+            .with_fif(b"       909 863  0031"),
+        fax::frames::Message::new(fax::t30::Frame::Dis, false)
+            .with_fif(&[0x00, 0x6e, 0xf8, 0x00]),
+    ]);
+    let mut far = datapump::v21::Sender::new(FS);
+    far.set_transmitting(true);
+
+    // And read back what this end says.
+    let mut ours = datapump::v21::Receiver::new(FS);
+    let mut reader = fax::frames::Reader::new();
+    let mut said: Vec<fax::frames::Message> = Vec::new();
+
+    let mut from_far = 0.0;
+    for _ in 0..(FS * 20.0) as usize {
+        while far.pending_bits() < 16 {
+            match far_frames.next_bit() {
+                Some(b) => far.push_bits(&[b]),
+                None => break,
+            }
+        }
+        let from_us = caller.step(from_far);
+        from_far = far.next_sample();
+        let _ = caller.take_dte();
+        if let Some(bit) = ours.feed(from_us)
+            && let Some(m) = reader.feed(bit)
+        {
+            said.push(m);
+        }
+    }
+
+    let call = caller.fax_call().expect("there was a fax call");
+    assert_eq!(call.identity(), "1300  368 909", "did not read the far end");
+    assert!(call.capabilities().is_some());
+
+    let tsi = said
+        .iter()
+        .find(|m| m.frame == fax::t30::Frame::Tsi)
+        .expect("this end never identified itself");
+    assert_eq!(
+        fax::t30::identification(&tsi.fif),
+        "61399990000",
+        "the identification did not reach the line"
+    );
+}
+
+/// A page with something on it that survives a round trip recognisably.
+fn a_test_page(lines: usize) -> fax::page::Page {
+    let width = fax::page::WIDTH;
+    fax::page::Page {
+        lines: (0..lines)
+            .map(|y| {
+                (0..width)
+                    .map(|x| (x / 60 + y / 6).is_multiple_of(2) && x % 60 < 44)
+                    .collect()
+            })
+            .collect(),
+        resolution: fax::page::Resolution::Standard,
+    }
+}
+
+#[test]
+fn one_modem_faxes_a_page_to_another_over_at_commands() {
+    // The whole of what the two buttons in the window do, and nothing else:
+    // one modem is told it is a fax and dialled, the other is told it is a
+    // fax and answered, and a page has to cross between them.
+    let mut caller = Modem::new(FS);
+    caller.fax_identification = "61399990000".to_owned();
+    let page = a_test_page(10);
+    caller.fax_page = Some(page.clone());
+    Pair::type_at(&mut caller, "AT+FCLASS=1");
+    Pair::type_at(&mut caller, "ATD61388880000");
+
+    let mut answerer = Modem::new(FS);
+    answerer.fax_identification = "61388880000".to_owned();
+    Pair::type_at(&mut answerer, "AT+FCLASS=1");
+    Pair::type_at(&mut answerer, "ATA");
+
+    let (mut to_caller, mut to_answerer) = (0.0, 0.0);
+    let mut arrived = None;
+    for _ in 0..(FS * 40.0) as usize {
+        let from_caller = caller.step(to_caller);
+        let from_answerer = answerer.step(to_answerer);
+        to_caller = from_answerer;
+        to_answerer = from_caller;
+        let _ = caller.take_dte();
+        let _ = answerer.take_dte();
+        if arrived.is_none() {
+            arrived = answerer.take_received_page().map(|(_, page)| page);
+        }
+        let both_done = caller
+            .fax_call()
+            .is_some_and(|c| c.phase().is_over())
+            && answerer.fax_call().is_some_and(|c| c.phase().is_over());
+        if both_done && arrived.is_some() {
+            break;
+        }
+    }
+
+    let got = arrived.expect("no page reached the answering end");
+    assert_eq!(got.lines.len(), page.lines.len(), "wrong number of lines");
+    assert_eq!(got.lines, page.lines, "the page came out different");
+
+    // And each end knows who the other said it was.
+    assert_eq!(
+        caller.fax_call().expect("a call").identity(),
+        "61388880000",
+        "the caller never read the CSI"
+    );
+    assert_eq!(
+        answerer.fax_call().expect("a call").identity(),
+        "61399990000",
+        "the answerer never read the TSI"
+    );
+}
+
+#[test]
+fn a_fax_that_answers_does_not_go_looking_for_v8() {
+    // The 2100 Hz an answering fax sends has no phase reversals in it, and a
+    // V.8 negotiation must never be started on a fax call. This is the same
+    // rule the dialling side already follows, from the other end.
+    let mut answerer = Modem::new(FS);
+    Pair::type_at(&mut answerer, "AT+FCLASS=1");
+    Pair::type_at(&mut answerer, "ATA");
+    let seconds = 2.0;
+    let mut cos_sum = 0.0f64;
+    let mut sin_sum = 0.0f64;
+    let mut power = 0.0f64;
+    for i in 0..(FS * seconds) as usize {
+        let out = answerer.step(0.0);
+        let turn = std::f64::consts::TAU * 2100.0 * i as f64 / FS;
+        cos_sum += out * turn.cos();
+        sin_sum += out * turn.sin();
+        power += out * out;
+    }
+    assert!(
+        answerer.fax_call().is_some(),
+        "answering in fax class did not make a fax call"
+    );
+    assert_ne!(answerer.standard(), "V.8", "a fax call started a negotiation");
+
+    // A tone that holds one phase for two whole seconds correlates with
+    // itself; one that turns over every 450 ms, as V.8 asks, does not. That
+    // difference is the only thing telling an answering fax from an answering
+    // modem, and it is why a fax call must never reach the negotiation.
+    let n = FS * seconds;
+    let magnitude = (cos_sum * cos_sum + sin_sum * sin_sum).sqrt() / n;
+    let rms = (power / n).sqrt();
+    assert!(rms > 0.1, "no tone went out at all: {rms:.4}");
+    assert!(
+        magnitude > 0.45 * rms,
+        "the 2100 Hz tone was not continuous: {magnitude:.4} of {rms:.4}"
+    );
+}
+
+/// Run a dialling and an answering fax against each other until both are
+/// done, handing back the page and the speed it went at.
+/// What a fax call between two modems came to.
+struct Faxed {
+    page: Option<fax::page::Page>,
+    rate: u32,
+    error_correction: bool,
+}
+
+fn fax_between(caller: &mut Modem, answerer: &mut Modem) -> Faxed {
+    let (mut to_caller, mut to_answerer) = (0.0, 0.0);
+    let mut arrived = None;
+    let mut rate = 0;
+    let mut error_correction = false;
+    for _ in 0..(FS * 40.0) as usize {
+        let from_caller = caller.step(to_caller);
+        let from_answerer = answerer.step(to_answerer);
+        to_caller = from_answerer;
+        to_answerer = from_caller;
+        let _ = caller.take_dte();
+        let _ = answerer.take_dte();
+        if let Some(call) = caller.fax_call()
+            && matches!(call.phase(), fax::call::Phase::Sending)
+        {
+            rate = call.rate();
+            error_correction = call.error_correction();
+        }
+        if arrived.is_none() {
+            arrived = answerer.take_received_page().map(|(_, page)| page);
+        }
+        let done = caller.fax_call().is_some_and(|c| c.phase().is_over())
+            && answerer.fax_call().is_some_and(|c| c.phase().is_over());
+        if done && arrived.is_some() {
+            break;
+        }
+    }
+    Faxed {
+        page: arrived,
+        rate,
+        error_correction,
+    }
+}
+
+#[test]
+fn a_fax_goes_at_9600_unless_it_is_told_not_to() {
+    // Two of these offer V.29 and V.27 ter to each other, so the page goes at
+    // V.29's 9600. Told to use V.27 ter alone -- the box in the window -- the
+    // same call goes at 4800, and the page arrives just the same.
+    for (offer, want) in [
+        (fax::call::OUR_MODULATIONS.to_vec(), 9600),
+        (vec![fax::t30::Modulation::V27ter], 4800),
+    ] {
+        let page = a_test_page(6);
+        let mut caller = Modem::new(FS);
+        caller.fax_page = Some(page.clone());
+        caller.fax_offer = offer.clone();
+        Pair::type_at(&mut caller, "AT+FCLASS=1");
+        Pair::type_at(&mut caller, "ATD1");
+        let mut answerer = Modem::new(FS);
+        Pair::type_at(&mut answerer, "AT+FCLASS=1");
+        Pair::type_at(&mut answerer, "ATA");
+
+        let faxed = fax_between(&mut caller, &mut answerer);
+        let got = faxed.page.unwrap_or_else(|| panic!("offering {offer:?}, no page arrived"));
+        assert_eq!(got.lines, page.lines, "offering {offer:?}");
+        assert_eq!(faxed.rate, want, "offering {offer:?}");
+    }
+}
+
+#[test]
+fn a_fax_uses_error_correction_unless_either_end_is_told_not_to() {
+    // On at both ends by default, so two of these use it. Turned off at
+    // either end -- the box in the window -- the call goes without, since it
+    // takes both ends offering it, and the page arrives just the same.
+    for (at_caller, at_answerer, want) in
+        [(true, true, true), (false, true, false), (true, false, false)]
+    {
+        let page = a_test_page(6);
+        let mut caller = Modem::new(FS);
+        caller.fax_page = Some(page.clone());
+        caller.fax_error_correction = at_caller;
+        Pair::type_at(&mut caller, "AT+FCLASS=1");
+        Pair::type_at(&mut caller, "ATD1");
+        let mut answerer = Modem::new(FS);
+        answerer.fax_error_correction = at_answerer;
+        Pair::type_at(&mut answerer, "AT+FCLASS=1");
+        Pair::type_at(&mut answerer, "ATA");
+
+        let faxed = fax_between(&mut caller, &mut answerer);
+        let case = format!("caller {at_caller}, answerer {at_answerer}");
+        let got = faxed.page.unwrap_or_else(|| panic!("{case}: no page arrived"));
+        assert_eq!(got.lines, page.lines, "{case}");
+        assert_eq!(faxed.error_correction, want, "{case}");
+    }
+}

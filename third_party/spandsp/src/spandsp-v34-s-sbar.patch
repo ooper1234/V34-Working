@@ -1,0 +1,138 @@
+--- v34tx.c
++++ v34tx.c
+@@ -2254,11 +2254,7 @@
+ 
+ static complex_sig_t get_s_not_s_baud(v34_state_t *s)
+ {
+-#if defined(SPANDSP_USE_FIXED_POINT)
+-    int16_t x;
+-#else
+-    float x;
+-#endif
++    complex_sig_t z;
+ 
+     switch (s->tx.stage)
+     {
+@@ -2266,21 +2262,25 @@
+         /* V.34 11.3.1.2.1: after INFO1a the answer modem transmits silence for
+            70 +/- 5 ms, then S for 128T and !S for 16T. The silence is a time,
+            not a symbol count, so it is computed from the symbol rate. */
+-        if (++s->tx.tone_duration < (int) (exact_baud_rate(s->tx.baud_rate)*0.070))
++        if (s->tx.tone_duration++ < (int) (exact_baud_rate(s->tx.baud_rate)*0.070))
+             return zero;
+         /*endif*/
+-        if (s->tx.tone_duration == (128 + (int) (exact_baud_rate(s->tx.baud_rate)*0.070)))
++        z = (s->tx.tone_duration & 1)
++            ? training_constellation_4[0]
++            : training_constellation_4[3];
++        if (s->tx.tone_duration >= (128 + (int) (exact_baud_rate(s->tx.baud_rate)*0.070)))
+         {
+-            s->tx.lastbit.re = -s->tx.lastbit.re;
+             s->tx.stage = V34_TX_STAGE_FIRST_NOT_S;
+             s->tx.tone_duration = 0;
+         }
+         /*endif*/
+-        break;
++        return z;
+     case V34_TX_STAGE_FIRST_NOT_S:
+-        if (++s->tx.tone_duration == 16)
++        z = (s->tx.tone_duration++ & 1)
++            ? training_constellation_4[1]
++            : training_constellation_4[2];
++        if (s->tx.tone_duration >= 16)
+         {
+-            s->tx.lastbit.re = -s->tx.lastbit.re;
+             /* V.34 11.3.1.2.1: the answer modem's own MD duration is the one
+                it sent in INFO1a (zero here, so the second S/!S is skipped). */
+             if (s->tx.duplex  &&  s->tx.info1a.md)
+@@ -2291,30 +2291,32 @@
+             s->tx.tone_duration = 0;
+         }
+         /*endif*/
+-        break;
++        return z;
+     case V34_TX_STAGE_MD:
+         /* This is where MD would go */
+         break;
+     case V34_TX_STAGE_SECOND_S:
+-        if (++s->tx.tone_duration == 128)
++        z = (s->tx.tone_duration++ & 1)
++            ? training_constellation_4[3]
++            : training_constellation_4[0];
++        if (s->tx.tone_duration >= 128)
+         {
+-            s->tx.lastbit.re = -s->tx.lastbit.re;
+             s->tx.stage = V34_TX_STAGE_SECOND_NOT_S;
+             s->tx.tone_duration = 0;
+         }
+         /*endif*/
+-        break;
++        return z;
+     case V34_TX_STAGE_SECOND_NOT_S:
+-        if (++s->tx.tone_duration == 16)
++        z = (s->tx.tone_duration++ & 1)
++            ? training_constellation_4[1]
++            : training_constellation_4[2];
++        if (s->tx.tone_duration >= 16)
+             pp_baud_init(s);
+         /*endif*/
+-        break;
++        return z;
+     }
+     /*endswitch*/
+-    x = s->tx.lastbit.re;
+-    s->tx.lastbit.re = s->tx.lastbit.im;
+-    s->tx.lastbit.im = x;
+-    return s->tx.lastbit;
++    return zero;
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
+@@ -2407,35 +2409,37 @@
+ 
+ static complex_sig_t get_phase4_s_baud(v34_state_t *s)
+ {
+-    float x;
++    complex_sig_t z;
+ 
+     /* V.34 11.4.1.2.1: the answer modem transmits S for 128T and !S for 16T,
+        followed by TRN. */
+     switch (s->tx.stage)
+     {
+     case V34_TX_STAGE_PHASE4_S:
+-        if (++s->tx.tone_duration == 128)
++        z = (s->tx.tone_duration++ & 1)
++            ? training_constellation_4[3]
++            : training_constellation_4[0];
++        if (s->tx.tone_duration >= 128)
+         {
+-            s->tx.lastbit.re = -s->tx.lastbit.re;
+             s->tx.stage = V34_TX_STAGE_PHASE4_NOT_S;
+             s->tx.tone_duration = 0;
+         }
+         /*endif*/
+-        break;
++        return z;
+     case V34_TX_STAGE_PHASE4_NOT_S:
+-        if (++s->tx.tone_duration == 16)
++        z = (s->tx.tone_duration++ & 1)
++            ? training_constellation_4[1]
++            : training_constellation_4[2];
++        if (s->tx.tone_duration >= 16)
+         {
+             s->tx.trn_after_j = true;
+             trn_baud_init(s);
+         }
+         /*endif*/
+-        break;
++        return z;
+     }
+     /*endswitch*/
+-    x = s->tx.lastbit.re;
+-    s->tx.lastbit.re = s->tx.lastbit.im;
+-    s->tx.lastbit.im = x;
+-    return s->tx.lastbit;
++    return zero;
+ }
+ /*- End of function --------------------------------------------------------*/
+ 

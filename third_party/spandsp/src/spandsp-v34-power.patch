@@ -1,0 +1,26 @@
+--- v34tx.c
++++ v34tx.c
+@@ -3200,6 +3200,23 @@
+     int len;
+     int lenx;
+ 
++    /* V.34 10.1.2.3.4 (Table 15): INFO1c's minimum power reduction shall be
++       implemented by the answer modem transmitter. INFO1c is parsed by the RX
++       path asynchronously - in practice it lands after our phase-3 S/!S has
++       already started, because the ATA's jitter buffer delays it past our
++       70 ms post-INFO1a silence - so latch it here on the first transmit
++       block after it is seen. Applying it once here scales every modulator
++       (control channel, primary channel, E, B1 and data) for the rest of the
++       call without compounding. */
++    if (!s->tx.power_reduction_applied  &&  s->rx.info1c.power_reduction > 0)
++    {
++        span_log(&s->logging, SPAN_LOG_FLOW,
++                 "Tx - applying INFO1c power reduction of %d dB\n",
++                 s->rx.info1c.power_reduction);
++        s->tx.gain *= db_to_amplitude_ratio(-s->rx.info1c.power_reduction);
++        s->tx.power_reduction_applied = true;
++    }
++    /*endif*/
+     len = 0;
+     lenx = -1;
+     do

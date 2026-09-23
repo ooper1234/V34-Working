@@ -1,5 +1,22 @@
 #include "sm_call.h"
 #include "ppp/sm_pppd.h"
+#include "bbs/bbs.h"
+
+#ifdef SM_HAVE_BM
+#include "bm_answerer.h"
+#endif
+
+#ifdef SM_HAVE_V34
+/* spandsp/v34.h assumes the base spanDSP environment has been included. */
+#include "spandsp/telephony.h"
+#include "spandsp/logging.h"
+#include "spandsp/complex.h"
+#include "spandsp/async.h"
+#include "spandsp/dds.h"
+#include "spandsp/v29rx.h"
+#include "spandsp/v8.h"
+#include "spandsp/v34.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,10 +28,57 @@
 #include <math.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <stdio.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------ */
 /* Modem callbacks                                                     */
 /* ------------------------------------------------------------------ */
+
+static int start_pppd(sm_call_t *c);
+
+static void bbs_write(void *ud, const uint8_t *data, size_t len)
+{
+    sm_call_t *c = ud;
+    size_t i;
+    for (i = 0; i < len; i++)
+    {
+        if (sm_bitq_push_byte(&c->txbits, data[i]) < 0)
+        {
+            sm_log_message(&c->log, SM_LOG_WARNING, "BBS output queue full");
+            break;
+        }
+    }
+    c->data_bytes_tx += i;
+}
+
+static void start_bbs_selector(sm_call_t *c)
+{
+    bbs_connection_meta_t m;
+    if (c->bbs || c->cfg.echo_data)
+        return;
+    memset(&m, 0, sizeof(m));
+    m.protocol = c->mode == SM_CALL_MODE_V34 ? "V.34" : "V.22bis";
+    m.tx_bps = c->negotiated_rate;
+    m.rx_bps = c->negotiated_rate;
+#ifdef SM_HAVE_BM
+    if (c->bm)
+    {
+        m.protocol = "V.34";
+        m.tx_bps = bm_rate_tx(c->bm);
+        m.rx_bps = bm_rate_rx(c->bm);
+    }
+#endif
+    m.connected = 1;
+    m.connected_at = time(NULL);
+    m.carrier_state = 1;
+    /* RTP statistics live in sm_sip and are not carried by AudioSocket yet. */
+    m.packets_rx = m.packets_tx = m.packets_lost = -1;
+    m.jitter_ms = -1.0;
+    c->bbs = bbs_session_create(c->cfg.bbs_db, &m, bbs_write, c);
+    if (c->bbs)
+        bbs_session_start(c->bbs);
+}
 
 static int call_get_bit(void *ud)
 {
@@ -29,6 +93,27 @@ static void call_put_bit(void *ud, int bit)
 {
     sm_call_t *c = ud;
 
+    if (bit < 0)
+        return;
+#ifdef SM_HAVE_V34
+    if (c->mode == SM_CALL_MODE_V34)
+    {
+        /* The V.34 receiver only delivers payload bits once the E has been
+           seen and the primary demapper is running, which is exactly data
+           mode. Entering here loses no bits. */
+        if (c->phase != SM_CALL_DATA)
+        {
+            c->phase = SM_CALL_DATA;
+            c->negotiated_rate = v34_get_current_bit_rate((v34_state_t *) c->v34);
+            sm_log_message(&c->log, SM_LOG_FLOW,
+                           "==> DATA MODE at %d bps (V.34)", c->negotiated_rate);
+        }
+        /*endif*/
+        sm_deframer_bit(&c->deframer, bit);
+        return;
+    }
+    /*endif*/
+#endif
     if (c->phase != SM_CALL_DATA)
         return;
     sm_deframer_bit(&c->deframer, bit);
@@ -79,7 +164,13 @@ static void call_v8_result(void *user_data, int status,
         break;
     case 2:  /* V8_STATUS_V8_CALL */
         c->v8_done = 1;
-        c->v8_ok = (modulations & 0x04) != 0;   /* V8_MOD_V22 */
+#ifdef SM_HAVE_V34
+        if (c->cfg.use_v34  &&  (modulations & V8_MOD_V34))
+            c->v8_ok = 2;   /* V.34 selected */
+        else
+#endif
+            c->v8_ok = (modulations & 0x04) != 0;   /* V8_MOD_V22 */
+        /*endif*/
         break;
     case 3:  /* V8_STATUS_NON_V8_CALL */
         c->v8_done = 1;
@@ -103,7 +194,37 @@ void sm_call_init(sm_call_t *c, const sm_call_config_t *cfg, int call_id)
     c->call_id = call_id;
     c->ppp_fd = -1;
     c->pppd_pid = -1;
+    c->bm_ec_seen = -2;
     sm_log_init(&c->log, cfg->log_level, "CALL", call_id);
+
+#ifdef SM_HAVE_BM
+    if (cfg->use_binmodem)
+    {
+        /* The vendored BinModem answerer owns the whole start-up: its own
+           V.8 (ANSam, CM/JM) and then V.34 through phase 4 into data mode.
+           sm_v8, the answer tone and the spanDSP V.34 engine stay out of
+           it entirely -- until the engine hands a V.22bis call back, which
+           bm_poll does. The V.22bis engine is still initialised here: the
+           hand-back runs it. */
+        c->bm = bm_create(1 /* answer */, cfg->use_v34,
+                          call_get_bit, c, call_put_bit, c);
+        if (c->bm)
+        {
+            c->phase = SM_CALL_V8;
+            sm_log_message(&c->log, SM_LOG_FLOW,
+                           "BinModem answerer started (V.8 + V.34, 16 kHz engine)");
+            v22bis_init(&c->modem, false /* answerer */, cfg->rate,
+                        call_get_bit, c, call_put_bit, c, call_status, c);
+            c->modem.log.call_id = call_id;
+            sm_log_set_level(&c->modem.log, cfg->log_level);
+            sm_bitq_init(&c->txbits);
+            sm_deframer_init(&c->deframer);
+            goto capture_setup;
+        }
+        sm_log_message(&c->log, SM_LOG_WARNING,
+                       "BinModem init failed; falling back to the built-in path");
+    }
+#endif
     v22bis_init(&c->modem, false /* answerer */, cfg->rate,
                 call_get_bit, c, call_put_bit, c, call_status, c);
     c->modem.log.call_id = call_id;
@@ -111,14 +232,47 @@ void sm_call_init(sm_call_t *c, const sm_call_config_t *cfg, int call_id)
     sm_bitq_init(&c->txbits);
     sm_deframer_init(&c->deframer);
 
+capture_setup:
+    {
+        /* SM_CAPTURE=<base> writes the call's inbound and outbound PCM as raw
+           little endian 16 bit samples at 8 kHz, for offline analysis of a
+           real call. Bounded to 120 s per direction. */
+        const char *base = getenv("SM_CAPTURE");
+        if (base  &&  base[0])
+        {
+            char path[512];
+            snprintf(path, sizeof(path), "%s.in.pcm", base);
+            c->cap_in = fopen(path, "wb");
+            snprintf(path, sizeof(path), "%s.out.pcm", base);
+            c->cap_out = fopen(path, "wb");
+            sm_log_message(&c->log, SM_LOG_FLOW, "capture enabled: %s.in/out.pcm", base);
+        }
+        /*endif*/
+    }
+
     c->tone_phase = 0.0;
     c->tone_phase_inc = SM_TWO_PI * 2100.0 / (double) SM_SAMPLE_RATE;
     c->tone_amplitude = 6000.0;
 
+#ifdef SM_HAVE_BM
+    /* The BinModem engine runs its own V.8 and speaks for itself; the
+       sm_v8 negotiation and the plain answer sequence below would double
+       every signal it sends. */
+    if (c->bm)
+        return;
+    /*endif*/
+#endif
+
 #ifdef SM_HAVE_V8
     if (cfg->use_v8)
     {
-        c->v8 = sm_v8_create(false /* answerer */, 0x04 /* V8_MOD_V22 */,
+        int allowed = 0x04 /* V8_MOD_V22 */;
+#ifdef SM_HAVE_V34
+        if (cfg->use_v34)
+            allowed |= V8_MOD_V34;
+        /*endif*/
+#endif
+        c->v8 = sm_v8_create(false /* answerer */, allowed,
                              call_v8_result, c, cfg->log_level);
         if (c->v8)
         {
@@ -167,10 +321,23 @@ static void ppp_flush(sm_call_t *c)
 
 static void pump_ppp(sm_call_t *c)
 {
-    if (c->ppp_fd < 0 && !c->cfg.echo_data)
+    if (c->phase != SM_CALL_DATA && c->ppp_fd < 0 && !c->cfg.echo_data)
         return;
 
-    /* Modem RX -> pppd (or echo). */
+    /* Straight to PPP: no selection banner, pppd starts the moment data
+       mode is up. Bytes typed before that are staged in ppy_out and flushed
+       by ppp_flush as soon as the pty exists. */
+    if (c->phase == SM_CALL_DATA && !c->cfg.echo_data
+        && c->cfg.enable_ppp && !c->ppp_started)
+    {
+        if (start_pppd(c) < 0)
+        {
+            c->phase = SM_CALL_HANGUP;
+            return;
+        }
+    }
+
+    /* Modem RX -> selector/BBS, pppd, or echo. */
     if (c->phase == SM_CALL_DATA)
     {
         uint8_t tmp[256];
@@ -184,6 +351,40 @@ static void pump_ppp(sm_call_t *c)
                 sm_bitq_push_byte(&c->txbits, tmp[i]);
             c->data_bytes_tx += n;
             c->data_bytes_rx += n;
+            return;
+        }
+
+        if (c->bbs)
+        {
+            int route;
+            if (n > 0)
+                bbs_session_feed((bbs_session_t *) c->bbs, tmp, (size_t) n);
+            route = bbs_session_route((bbs_session_t *) c->bbs);
+            c->data_bytes_rx += n;
+            if (route == BBS_ROUTE_HANGUP)
+            {
+                c->phase = SM_CALL_HANGUP;
+                return;
+            }
+            if (route != BBS_ROUTE_PPP)
+                return;
+            if (c->cfg.enable_ppp && c->ppp_fd < 0 && start_pppd(c) < 0)
+            {
+                c->phase = SM_CALL_HANGUP;
+                return;
+            }
+            if (c->ppp_fd >= 0)
+            {
+                uint8_t early[1024];
+                size_t en = bbs_session_take_ppp((bbs_session_t *) c->bbs,
+                                                  early, sizeof(early));
+                if (en > sizeof(c->ppy_out)) en = sizeof(c->ppy_out);
+                memcpy(c->ppy_out, early, en);
+                c->ppy_out_len = (int) en;
+            }
+            bbs_session_destroy((bbs_session_t *) c->bbs);
+            c->bbs = NULL;
+            ppp_flush(c);
             return;
         }
 
@@ -211,7 +412,10 @@ static void pump_ppp(sm_call_t *c)
        bits wait in the queue until the modem reaches data mode. */
     {
         uint8_t tmp[256];
-        ssize_t r = read(c->ppp_fd, tmp, sizeof(tmp));
+        ssize_t r;
+        if (c->ppp_fd < 0)
+            return;
+        r = read(c->ppp_fd, tmp, sizeof(tmp));
         if (r > 0)
         {
             int i;
@@ -237,9 +441,159 @@ static void pump_ppp(sm_call_t *c)
 /* Audio processing                                                    */
 /* ------------------------------------------------------------------ */
 
+#ifdef SM_HAVE_BM
+/* Observe the BinModem engine once per audio chunk: log phase changes, and
+   turn its status into the call state machine's phases. Runs before the
+   chunk's bits are moved, so anything the transition flushes cannot reach
+   the byte path. */
+static void bm_poll(sm_call_t *c, int n)
+{
+    int st = bm_status(c->bm);
+    const char *ph = bm_phase(c->bm);
+    int ep = bm_ec_phase(c->bm);
+
+    if (strcmp(ph, c->bm_phase_seen) != 0)
+    {
+        int d = 0;
+        double pk = 0.0, en = 0.0;
+        snprintf(c->bm_phase_seen, sizeof(c->bm_phase_seen), "%s", ph);
+        bm_echo(c->bm, &d, &pk, &en);
+        if (ph[0])
+            sm_log_message(&c->log, SM_LOG_FLOW,
+                           "binmodem: %s (echo delay=%d peak=%.2f energy=%.4f)",
+                           ph, d, pk, en);
+        /*endif*/
+    }
+
+    if (ep != c->bm_ec_seen)
+    {
+        static const char *const names[] = {"detection", "XID", "LAPM", "transparent"};
+        c->bm_ec_seen = ep;
+        if (ep >= 0 && ep <= 3)
+            sm_log_message(&c->log, SM_LOG_FLOW,
+                           "binmodem: V.42 %s (V.8 LAPM=%d observed=0x%x damaged=%llu)",
+                           names[ep], bm_lapm_declared(c->bm),
+                           bm_ec_observed(c->bm), bm_damaged_frames(c->bm));
+    }
+
+    if (st == BM_FAILED)
+    {
+        sm_log_message(&c->log, SM_LOG_ERROR, "binmodem failed: %s",
+                       bm_failure(c->bm));
+        c->phase = SM_CALL_HANGUP;
+        return;
+    }
+
+    if (st == BM_AGREED_V22 || st == BM_AGREED_OTHER)
+    {
+        /* V.8 settled on something this daemon's own engines carry. Hand
+           back exactly the transition the built-in V.8 path performs: the
+           V.22bis receiver restarts, squelched for 500 ms while the answer
+           sequence it is about to hear stops ringing in its own band. */
+        sm_log_message(&c->log, SM_LOG_FLOW,
+                       st == BM_AGREED_V22
+                           ? "V.8 negotiated V.22bis; starting V.22bis"
+                           : "V.8 not negotiated; starting V.22bis");
+        c->mode = SM_CALL_MODE_V22;
+        v22bis_rx_restart(&c->modem);
+#ifdef SM_HAVE_V8
+        c->rx_guard = SM_SAMPLE_RATE * 500 / 1000;
+#endif
+        c->phase = SM_CALL_HANDSHAKE;
+        bm_destroy(c->bm);
+        c->bm = NULL;
+        return;
+    }
+
+    if (st == BM_RETRAINING  &&  c->phase == SM_CALL_DATA)
+    {
+        /* A retrain resets the link; drop partial async state, as the
+           V.22bis retrain status does. */
+        sm_deframer_init(&c->deframer);
+        c->phase = SM_CALL_HANDSHAKE;
+        c->bm_nocarrier = 0;
+        sm_log_message(&c->log, SM_LOG_FLOW, "binmodem: retrain");
+    }
+
+    if (st == BM_CONNECTED)
+    {
+        int rate = bm_rate_rx(c->bm);
+
+        if (c->phase != SM_CALL_DATA)
+        {
+            /* Everything the receiver made of the handshake is noise; the
+               engine's own integrator says the same. */
+            bm_flush_rx(c->bm);
+            sm_deframer_init(&c->deframer);
+            c->phase = SM_CALL_DATA;
+            c->negotiated_rate = rate;
+            sm_log_message(&c->log, SM_LOG_FLOW,
+                           "==> DATA MODE at %d bps rx, %d bps tx (BinModem V.34)",
+                           rate, bm_rate_tx(c->bm));
+            sm_log_message(&c->log, SM_LOG_FLOW,
+                           "binmodem: error control=%s compression=%s damaged_frames=%llu",
+                           bm_error_control(c->bm) ? "V.42 LAPM" : "none",
+                           bm_compression(c->bm) == 2 ? "V.44" :
+                           bm_compression(c->bm) == 1 ? "V.42bis" : "none",
+                           bm_damaged_frames(c->bm));
+
+        }
+        else if (rate != c->negotiated_rate)
+        {
+            c->negotiated_rate = rate;
+            sm_log_message(&c->log, SM_LOG_FLOW,
+                           "binmodem: rate renegotiated to %d bps", rate);
+        }
+
+        if (bm_carrier(c->bm))
+            c->bm_nocarrier = 0;
+        else if ((c->bm_nocarrier += n) >= SM_SAMPLE_RATE / 2)
+        {
+            /* Half a second without the far end's signal: the call is over
+               whether the engine says so or not. */
+            sm_log_message(&c->log, SM_LOG_FLOW, "binmodem: carrier lost");
+            c->phase = SM_CALL_HANGUP;
+        }
+    }
+}
+#endif
+
 static void process_audio(sm_call_t *c, const int16_t *in, int n)
 {
     int i = 0;
+
+    if ((c->cap_in  ||  c->cap_out)  &&  c->cap_count < 120L*SM_SAMPLE_RATE)
+    {
+        if (c->cap_in)
+            fwrite(in, sizeof(int16_t), (size_t) n, c->cap_in);
+        /*endif*/
+        if (c->cap_out)
+            fwrite(c->txbuf, sizeof(int16_t), (size_t) n, c->cap_out);
+        /*endif*/
+        c->cap_count += n;
+    }
+    /*endif*/
+
+#ifdef SM_HAVE_BM
+    if (c->bm)
+    {
+        int k;
+
+        bm_poll(c, n);
+        if (c->bm)
+        {
+            /* Order matters: poll first (a transition flushes the noise the
+               receiver made before data mode), then move this chunk's bits,
+               then run the engine over the chunk. On the hand-back to
+               V.22bis, c->bm is NULL and the fall-through below starts the
+               built-in engine with the guard bm_poll armed. */
+            bm_service(c->bm);
+            for (k = 0; k < n; k++)
+                c->txbuf[k] = bm_step(c->bm, in[k]);
+            i = n;
+        }
+    }
+#endif
 
     while (i < n)
     {
@@ -299,8 +653,19 @@ static void process_audio(sm_call_t *c, const int16_t *in, int n)
 #endif
             if (m > 0)
             {
-                v22bis_tx(&c->modem, c->txbuf + i, m);
-                v22bis_rx(&c->modem, in + i, m);
+#ifdef SM_HAVE_V34
+                if (c->mode == SM_CALL_MODE_V34)
+                {
+                    v34_tx((v34_state_t *) c->v34, c->txbuf + i, m);
+                    v34_rx((v34_state_t *) c->v34, in + i, m);
+                }
+                else
+#endif
+                {
+                    v22bis_tx(&c->modem, c->txbuf + i, m);
+                    v22bis_rx(&c->modem, in + i, m);
+                }
+                /*endif*/
                 i = n;
             }
         }
@@ -319,17 +684,125 @@ static void process_audio(sm_call_t *c, const int16_t *in, int n)
        S1 burst. TX is unaffected. */
     if (c->phase == SM_CALL_V8 && c->v8_done)
     {
-        sm_log_message(&c->log, SM_LOG_FLOW,
-                       c->v8_ok ? "V.8 negotiated V.22bis; starting V.22bis"
-                                : "V.8 not negotiated (non-V.8 call); starting V.22bis");
-        v22bis_rx_restart(&c->modem);
-        c->rx_guard = SM_SAMPLE_RATE * 500 / 1000;
-        c->phase = SM_CALL_HANDSHAKE;
+        int started_v34 = 0;
+
+#ifdef SM_HAVE_V34
+        if (c->v8_ok == 2)
+        {
+            /* The common Conexant/PAP2 path rejects 3429 baud in INFO1c but
+               offers 3200 baud through 31200 bit/s. Use that interoperable
+               ceiling until INFO1-driven dynamic selection is complete. */
+            int baud = c->cfg.v34_baud  ?  c->cfg.v34_baud  :  2400;
+            int rate = c->cfg.v34_rate  ?  c->cfg.v34_rate  :  2400;
+
+            sm_log_message(&c->log, SM_LOG_FLOW,
+                           "V.34 connection speeds: 33600, 31200, 28800, 26400, 24000, 21600, 19200, 16800, 14400, 12000, 9600, 7200, 4800, 2400 bps");
+            sm_log_message(&c->log, SM_LOG_FLOW, ">>> v34_init ENTRY baud=%d rate=%d", baud, rate);
+            c->v34 = v34_init(NULL, baud, rate,
+                              false /* answerer */, true /* duplex */,
+                              call_get_bit, c, call_put_bit, c);
+            sm_log_message(&c->log, SM_LOG_FLOW, "<<< v34_init EXIT v34=%p", c->v34);
+            if (c->v34)
+            {
+                v34_tx_power((v34_state_t *) c->v34, -13.0f);
+                /* V34_TRACE=1 logs the engine's state machine (PP/TRN/J,
+                   MP/E, data mode) into the call log. */
+                {
+                    const char *t = getenv("V34_TRACE");
+                    if (t  &&  atoi(t))
+                    {
+                        logging_state_t *vlog = v34_get_logging_state((v34_state_t *) c->v34);
+                        span_log_set_level(vlog, SPAN_LOG_SHOW_SEVERITY | SPAN_LOG_SHOW_TAG | SPAN_LOG_FLOW);
+                        span_log_set_tag(vlog, "v34");
+                    }
+                    /*endif*/
+                }
+                c->mode = SM_CALL_MODE_V34;
+                c->v34_baud_rate = baud;
+                started_v34 = 1;
+                sm_log_message(&c->log, SM_LOG_FLOW,
+                               "V.8 negotiated V.34; starting V.34 (%d baud, up to %d bps)",
+                               baud, rate);
+                c->phase = SM_CALL_HANDSHAKE;
+            }
+            else
+            {
+                sm_log_message(&c->log, SM_LOG_WARNING,
+                               "V.34 init failed; starting V.22bis instead");
+                c->v8_ok = 1;
+            }
+            /*endif*/
+        }
+        /*endif*/
+#endif
+
+        if (!started_v34)
+        {
+#ifdef SM_HAVE_V34
+            /* When V.8 fails but --v34 is set, try V.34 directly anyway.
+               The PAP2T audio bridge often corrupts the V.8 byte exchange
+               (CM/JM), but both endpoints support V.34.  Start V.34 as if
+               V.8 had selected it; if the far end is truly V.22bis the
+               training will fail and we'll catch it in the handshake. */
+            if (c->cfg.use_v34  &&  !c->v8_ok)
+            {
+                int baud = c->cfg.v34_baud  ?  c->cfg.v34_baud  :  2400;
+                int rate = c->cfg.v34_rate  ?  c->cfg.v34_rate  :  2400;
+
+                sm_log_message(&c->log, SM_LOG_FLOW,
+                               "V.8 failed; forcing V.34 anyway (%d baud, up to %d bps)",
+                               baud, rate);
+                c->v34 = v34_init(NULL, baud, rate,
+                                  false /* answerer */, true /* duplex */,
+                                  call_get_bit, c, call_put_bit, c);
+                if (c->v34)
+                {
+                    v34_tx_power((v34_state_t *) c->v34, -13.0f);
+                    {
+                        const char *t = getenv("V34_TRACE");
+                        if (t  &&  atoi(t))
+                        {
+                            logging_state_t *vlog = v34_get_logging_state((v34_state_t *) c->v34);
+                            span_log_set_level(vlog, SPAN_LOG_SHOW_SEVERITY | SPAN_LOG_SHOW_TAG | SPAN_LOG_FLOW);
+                            span_log_set_tag(vlog, "v34");
+                        }
+                        /*endif*/
+                    }
+                    c->mode = SM_CALL_MODE_V34;
+                    c->v34_baud_rate = baud;
+                    started_v34 = 1;
+                    c->phase = SM_CALL_HANDSHAKE;
+                }
+                else
+                {
+                    sm_log_message(&c->log, SM_LOG_WARNING,
+                                   "V.34 init failed; falling back to V.22bis");
+                }
+            }
+            else
+#endif
+            {
+                sm_log_message(&c->log, SM_LOG_FLOW,
+                               c->v8_ok ? "V.8 negotiated V.22bis; starting V.22bis"
+                                        : "V.8 not negotiated (non-V.8 call); starting V.22bis");
+                c->mode = SM_CALL_MODE_V22;
+                v22bis_rx_restart(&c->modem);
+                c->rx_guard = SM_SAMPLE_RATE * 500 / 1000;
+                c->phase = SM_CALL_HANDSHAKE;
+            }
+        /*endif*/
+    }
     }
 #endif
 
-    /* Detect data mode: both directions in NORMAL_OPERATION. */
-    if (c->phase == SM_CALL_HANDSHAKE
+    /* Detect data mode: both directions in NORMAL_OPERATION. (V.34 enters
+       data mode from its own put_bit callback, on the first payload bit.)
+       The gate on c->bm keeps this off while the BinModem engine owns the
+       call: a V.22bis engine that has never been stepped sits at
+       NORMAL_OPERATION in both directions, which would read as connected. */
+    if (c->mode == SM_CALL_MODE_V22
+        && c->phase == SM_CALL_HANDSHAKE
+        && c->bm == NULL
         && c->modem.tx.training == V22BIS_TX_TRAINING_NORMAL_OPERATION
         && c->modem.rx.training == V22BIS_RX_TRAINING_NORMAL_OPERATION)
     {
@@ -345,6 +818,9 @@ static void process_audio(sm_call_t *c, const int16_t *in, int n)
 
     c->samples_in += n;
     c->samples_out += n;
+    if (c->bbs)
+        bbs_session_tick((bbs_session_t *) c->bbs,
+                         (unsigned) ((long long) n * 1000 / SM_SAMPLE_RATE));
 }
 
 /* ------------------------------------------------------------------ */
@@ -421,6 +897,8 @@ int sm_call_run(sm_call_t *c, int socket_fd)
     int timeout_count = 0;
     int rc = 0;
 
+    sm_log_message(&c->log, SM_LOG_FLOW, ">>> sm_call_run ENTRY socket_fd=%d call_id=%d phase=%d", socket_fd, c->call_id, c->phase);
+
     sm_ast_init(&c->as, socket_fd);
 
     /* First message from Asterisk carries the 16-byte call UUID. */
@@ -453,14 +931,9 @@ int sm_call_run(sm_call_t *c, int socket_fd)
         sm_log_message(&c->log, SM_LOG_DEBUG, "pre-call msg kind=0x%02x len=%d", kind, (int) plen);
     }
 
-    if (c->cfg.enable_ppp && !c->cfg.echo_data)
-    {
-        if (start_pppd(c) < 0)
-        {
-            stop_pppd(c);
-            return -1;
-        }
-    }
+    /* pppd is started only after the caller selects PPP (or sends an LCP
+       frame directly). Starting it here used to queue binary PPP across the
+       modem before the post-CONNECT BBS/PPP choice could be shown. */
 
     while (c->phase != SM_CALL_HANGUP)
     {
@@ -534,19 +1007,58 @@ int sm_call_run(sm_call_t *c, int socket_fd)
     }
 
 out:
-    sm_log_message(&c->log, SM_LOG_FLOW,
-                   "call summary: samples_in=%lld samples_out=%lld tx_bytes=%lld rx_bytes=%lld rate=%d state=%s",
-                   c->samples_in, c->samples_out, c->data_bytes_tx, c->data_bytes_rx,
-                   c->negotiated_rate ? c->negotiated_rate : c->modem.negotiated_bit_rate,
-                   c->phase == SM_CALL_DATA ? "DATA" : "HANDSHAKE");
+    {
+        int d = 0;
+        double pk = 0.0, en = 0.0;
+        if (c->bm)
+            bm_echo(c->bm, &d, &pk, &en);
+        /*endif*/
+        sm_log_message(&c->log, SM_LOG_FLOW,
+                       "call summary: samples_in=%lld samples_out=%lld tx_bytes=%lld rx_bytes=%lld rate=%d state=%s echo(delay=%d peak=%.2f energy=%.4f)",
+                       c->samples_in, c->samples_out, c->data_bytes_tx, c->data_bytes_rx,
+                       c->negotiated_rate ? c->negotiated_rate : c->modem.negotiated_bit_rate,
+                       c->phase == SM_CALL_DATA ? "DATA" : "HANDSHAKE",
+                       d, pk, en);
+    }
+    if (c->cap_in)
+        fclose(c->cap_in);
+    /*endif*/
+    if (c->cap_out)
+        fclose(c->cap_out);
+    /*endif*/
+    c->cap_in = NULL;
+    c->cap_out = NULL;
 #ifdef SM_HAVE_V8
     if (c->v8)
     {
         sm_v8_destroy(c->v8);
         c->v8 = NULL;
     }
+    /*endif*/
 #endif
+#ifdef SM_HAVE_BM
+    if (c->bm)
+    {
+        bm_destroy(c->bm);
+        c->bm = NULL;
+    }
+    /*endif*/
+#endif
+#ifdef SM_HAVE_V34
+    if (c->v34)
+    {
+        v34_free((v34_state_t *) c->v34);
+        c->v34 = NULL;
+    }
+    /*endif*/
+#endif
+    if (c->bbs)
+    {
+        bbs_session_destroy((bbs_session_t *) c->bbs);
+        c->bbs = NULL;
+    }
     stop_pppd(c);
     close(socket_fd);
+    sm_log_message(&c->log, SM_LOG_FLOW, "<<< sm_call_run EXIT rc=%d", rc);
     return rc;
 }

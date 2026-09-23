@@ -14,9 +14,11 @@ and answering modes are implemented.
 
 ## 2. Duplex architecture
 
-FDM band split:
-- Low band carrier **1200 Hz** — used by the **answering** modem TX, calling modem RX.
-- High band carrier **2400 Hz** — used by the **calling** modem TX, answering modem RX.
+FDM band split (ITU-T V.22bis §6.3.1.1: "the answering modem shall be
+conditioned to transmit signals in the high channel … and receive signals in the
+low channel"; the calling modem is the mirror image):
+- Low band carrier **1200 Hz** — used by the **calling** modem TX, answering modem RX.
+- High band carrier **2400 Hz** — used by the **answering** modem TX, calling modem RX.
 
 600 symbols/s in both directions. Guard tone (answerer only): none, 550 Hz or
 1800 Hz per region/config.

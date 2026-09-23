@@ -1,0 +1,13 @@
+--- v34tx.c
++++ v34tx.c
+@@ -2798,7 +2798,9 @@
+ {
+     span_log(&s->logging, SPAN_LOG_FLOW, "Tx - e_baud_init()\n");
+     s->tx.tone_duration = 0;
+     s->tx.stage = V34_TX_STAGE_HDX_E;
+-    s->tx.current_modulator = V34_MODULATION_CC;
++    /* Duplex E follows MP' on the primary channel.  The 600-baud control
++       channel is used here only by the half-duplex startup sequence. */
++    s->tx.current_modulator = s->tx.duplex ? V34_MODULATION_V34 : V34_MODULATION_CC;
+     s->tx.current_getbaud = get_e_baud;
+ }

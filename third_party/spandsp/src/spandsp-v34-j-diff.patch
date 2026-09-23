@@ -1,0 +1,36 @@
+--- v34tx.c
++++ v34tx.c
+@@ -2459,9 +2459,12 @@
+         0x89B0  /* 16 point constellation */
+     };
+     int bit;
++    bool differential;
+ 
+     /* See V.34/10.1.3.8 */
+     bit = 0;
++    differential = (s->tx.stage == V34_TX_STAGE_J  ||
++                    s->tx.stage == V34_TX_STAGE_J_DASHED);
+     switch (s->tx.stage)
+     {
+     case V34_TX_STAGE_TRN:
+@@ -2545,7 +2548,17 @@
+     }
+     /*endswitch*/
+-    /* MP differential encoding starts from the final TRN/J symbol. */
+-    s->tx.diff = bit & 3;
+-    return training_constellation_4[bit];
++    if (differential)
++    {
++        /* V.34 10.1.3.3: J and J' use differential QPSK.  The previous
++           implementation mapped each scrambled dibit directly, so a real
++           modem could not recognize J and remained in Phase 3. */
++        s->tx.diff = (s->tx.diff + bit) & 3;
++    }
++    else
++    {
++        /* TRN uses direct 4-point mapping; its final point initializes J. */
++        s->tx.diff = bit & 3;
++    }
++    return training_constellation_4[s->tx.diff];
+ }
+ /*- End of function --------------------------------------------------------*/

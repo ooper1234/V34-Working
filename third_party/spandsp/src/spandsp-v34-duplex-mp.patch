@@ -1,0 +1,89 @@
+--- v34tx.c
++++ v34tx.c
+@@ -2555,6 +2555,8 @@
+         break;
+     }
+     /*endswitch*/
++    /* MP differential encoding starts from the final TRN/J symbol. */
++    s->tx.diff = bit & 3;
+     return training_constellation_4[bit];
+ }
+ /*- End of function --------------------------------------------------------*/
+@@ -2563,18 +2565,10 @@
+ {
+     span_log(&s->logging, SPAN_LOG_FLOW, "Tx - trn_baud_init()\n");
+     s->tx.tone_duration = 0;
++    /* V.34 10.1.3.8: initialize the scrambler to all zeroes before TRN. */
++    s->tx.scramble_reg = 0;
+     s->tx.stage = V34_TX_STAGE_TRN;
+     s->tx.current_getbaud = get_trn_baud;
+-    if (s->tx.trn_after_j)
+-    {
+-        /* The far end is sending its post-J TRN and then MP/MPH on the V.34
+-           carrier's control channel. Follow it with the receiver. */
+-        s->rx.current_demodulator = V34_MODULATION_CC;
+-        s->rx.stage = V34_RX_STAGE_CC;
+-        s->rx.mp_seen = 0;
+-        s->rx.mp_count = -1;
+-    }
+-    /*endif*/
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
+@@ -2628,9 +2622,24 @@
+ static void mp_or_mph_baud_init(v34_state_t *s)
+ {
+     span_log(&s->logging, SPAN_LOG_FLOW, "Tx - mp_baud_init()\n");
+-    /* The MP/MPH exchange is carried on the control channel, which the
+-       receiver decodes in its CC demodulator. */
+-    s->tx.current_modulator = V34_MODULATION_CC;
++    /* Duplex MP is a primary-channel signal. Only half-duplex MPh is sent
++       through the 600-baud control-channel modulator. */
++    s->tx.current_modulator = s->tx.duplex  ?  V34_MODULATION_V34
++                                             :  V34_MODULATION_CC;
++    if (s->tx.duplex)
++    {
++        /* Start parsing at the MP boundary, after post-J TRN. The scrambler is
++           self-synchronizing, so repeated MP frames recover after 23 bits even
++           when the two transmit directions reach this boundary at different
++           times. */
++        s->rx.current_demodulator = V34_MODULATION_V34;
++        s->rx.stage = V34_RX_STAGE_CC;
++        s->rx.mp_seen = 0;
++        s->rx.mp_count = -1;
++        s->rx.bitstream = 0;
++        s->rx.scramble_reg = 0;
++    }
++    /*endif*/
+     s->tx.mp_tx_count = 0;
+     /* Fill in the MP/MPH message. Upstream never initialised these fields, so
+        the message went out announcing zero bit rates and an empty symbol rate
+--- v34rx.c
++++ v34rx.c
+@@ -2258,7 +2258,11 @@
+     if ((s->baud_half ^= 1))
+         return;
+     /*endif*/
+-    cc_symbol_sync(s);
++    if (s->current_demodulator == V34_MODULATION_V34)
++        pri_symbol_sync(s);
++    else
++        cc_symbol_sync(s);
++    /*endif*/
+ 
+     /* Slice the phase difference, to get a pair of data bits */
+     ang1 = arctan2(sample->re, sample->im);
+@@ -2590,6 +2594,13 @@
+ 
+ static void process_primary_half_baud(v34_rx_state_t *s, const complexf_t *sample)
+ {
++    /* Duplex MP/MP'/E uses primary modulation while retaining MP framing. */
++    if (s->stage == V34_RX_STAGE_CC)
++    {
++        process_cc_half_baud(s, sample);
++        return;
++    }
++    /*endif*/
+ #if 0
+     int i;
+     complexf_t z;

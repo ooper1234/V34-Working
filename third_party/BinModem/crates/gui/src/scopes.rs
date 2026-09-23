@@ -1,0 +1,503 @@
+//! Scope painting: waterfall, spectrum, eye and the LED faceplate.
+
+use eframe::egui::{
+    Align2, Color32, ColorImage, Context, FontId, Painter, Pos2, Rect, Sense, Stroke, TextureHandle,
+    TextureOptions, Ui, Vec2, pos2, vec2,
+};
+
+/// Upper edge of the display in Hz. The voiceband ends well below Nyquist, so
+/// showing 0-4000 Hz wastes no space and keeps the tone pairs large.
+pub const DISPLAY_HZ: f64 = 4000.0;
+
+const BACKDROP: Color32 = Color32::from_rgb(12, 14, 18);
+const GRID: Color32 = Color32::from_rgb(40, 46, 56);
+const TRACE: Color32 = Color32::from_rgb(120, 220, 160);
+const LABEL: Color32 = Color32::from_rgb(150, 160, 175);
+
+/// Blue for whatever the calling modem puts on the line, orange for the
+/// answering modem, so the two directions can be told apart at a glance.
+const CALLING: Color32 = Color32::from_rgb(90, 150, 240);
+const ANSWERING: Color32 = Color32::from_rgb(240, 170, 90);
+/// A line both directions share, which V.32 onwards is the whole point of.
+const SHARED: Color32 = Color32::from_rgb(160, 140, 230);
+
+const BELL103: &[(f64, &str, Color32)] = &[
+    (1070.0, "1070 O-space", CALLING),
+    (1270.0, "1270 O-mark", CALLING),
+    (2025.0, "2025 A-space", ANSWERING),
+    (2225.0, "2225 A-mark", ANSWERING),
+];
+
+const V22BIS: &[(f64, &str, Color32)] = &[
+    (1200.0, "1200 calling", CALLING),
+    (2400.0, "2400 answering", ANSWERING),
+];
+
+const V32: &[(f64, &str, Color32)] = &[
+    // Both directions on the one carrier, which is why V.32 needs an echo
+    // canceller where V.22bis needs only a filter.
+    (1800.0, "1800 carrier", SHARED),
+    // Where the start-up puts its sidebands when it alternates states: the
+    // carrier suppressed and these two left standing (5.4).
+    (600.0, "600 sideband", SHARED),
+    (3000.0, "3000 sideband", SHARED),
+];
+
+/// Where to draw tone markers for the modulation actually in use.
+///
+/// Drawn from the modulation the modem reports rather than fixed, because a
+/// marker in the wrong place is worse than none: it invites the eye to read
+/// energy that is somewhere else as being where the label says.
+pub fn markers(modulation: &str) -> &'static [(f64, &'static str, Color32)] {
+    match modulation {
+        "Bell 103" => BELL103,
+        "V.22bis" => V22BIS,
+        "V.32" | "V.32bis" => V32,
+        _ => &[],
+    }
+}
+
+/// Map a normalised magnitude to a waterfall colour.
+///
+/// Black through blue, cyan, green, yellow to red: the palette every ham
+/// waterfall uses, chosen because weak signals stay visible against the noise
+/// floor while strong ones saturate distinctly.
+fn heat(v: f32) -> Color32 {
+    let v = v.clamp(0.0, 1.0);
+    let (r, g, b) = if v < 0.25 {
+        let t = v / 0.25;
+        (0.0, 0.0, 0.35 + 0.65 * t)
+    } else if v < 0.45 {
+        let t = (v - 0.25) / 0.20;
+        (0.0, t, 1.0)
+    } else if v < 0.65 {
+        let t = (v - 0.45) / 0.20;
+        (0.0, 1.0, 1.0 - t)
+    } else if v < 0.85 {
+        let t = (v - 0.65) / 0.20;
+        (t, 1.0, 0.0)
+    } else {
+        let t = (v - 0.85) / 0.15;
+        (1.0, 1.0 - t, 0.0)
+    };
+    Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+/// A scrolling spectrogram. Newest row at the top.
+pub struct Waterfall {
+    width: usize,
+    height: usize,
+    image: ColorImage,
+    texture: Option<TextureHandle>,
+    /// dB window mapped across the colour ramp.
+    pub floor_db: f32,
+    pub ceiling_db: f32,
+}
+
+impl Waterfall {
+    pub fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            image: ColorImage::filled([width, height], BACKDROP),
+            texture: None,
+            floor_db: -90.0,
+            ceiling_db: -20.0,
+        }
+    }
+
+    /// Push one spectrum row, resampling the bins across the display width.
+    pub fn push_row(&mut self, bins: &[f32], hz_per_bin: f64) {
+        let px = &mut self.image.pixels;
+        let w = self.width;
+        // Scroll everything down by one row, then write the new row at the top.
+        px.copy_within(0..(self.height - 1) * w, w);
+
+        let span = self.ceiling_db - self.floor_db;
+        for (x, cell) in px.iter_mut().take(w).enumerate() {
+            let hz = DISPLAY_HZ * x as f64 / w as f64;
+            let bin = (hz / hz_per_bin).round() as usize;
+            let db = bins.get(bin).copied().unwrap_or(-120.0);
+            *cell = heat((db - self.floor_db) / span);
+        }
+    }
+
+    pub fn paint(&mut self, ui: &mut Ui, height: f32, modulation: &str) {
+        let texture = self.texture.get_or_insert_with(|| {
+            ui.ctx()
+                .load_texture("waterfall", self.image.clone(), TextureOptions::LINEAR)
+        });
+        texture.set(self.image.clone(), TextureOptions::LINEAR);
+
+        let (rect, painter) = allocate(ui, height);
+        painter.image(
+            texture.id(),
+            rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        paint_tone_markers(&painter, rect, false, modulation);
+        frame_border(&painter, rect);
+    }
+}
+
+fn allocate(ui: &mut Ui, height: f32) -> (Rect, Painter) {
+    let size = vec2(ui.available_width(), height);
+    let (response, painter) = ui.allocate_painter(size, Sense::hover());
+    (response.rect, painter)
+}
+
+fn frame_border(painter: &Painter, rect: Rect) {
+    painter.rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(1.0, GRID),
+        eframe::egui::StrokeKind::Inside,
+    );
+}
+
+/// Vertical lines at the tones the modulation in use lives on, so the eye can
+/// find them instantly.
+///
+/// Bell 103's tones sit 200 Hz apart, which is only a few pixels wide, so the
+/// labels are staggered vertically. Drawn on one line they overlap into an
+/// unreadable smear.
+fn paint_tone_markers(painter: &Painter, rect: Rect, with_text: bool, modulation: &str) {
+    for (i, (hz, name, colour)) in markers(modulation).iter().enumerate() {
+        let x = rect.left() + rect.width() * (*hz / DISPLAY_HZ) as f32;
+        painter.line_segment(
+            [pos2(x, rect.top()), pos2(x, rect.bottom())],
+            Stroke::new(1.0, colour.gamma_multiply(0.55)),
+        );
+        if with_text {
+            let row = (i % 2) as f32;
+            painter.text(
+                pos2(x + 3.0, rect.top() + 2.0 + row * 11.0),
+                Align2::LEFT_TOP,
+                name,
+                FontId::monospace(9.0),
+                *colour,
+            );
+        }
+    }
+}
+
+/// Instantaneous spectrum, drawn as a filled trace.
+pub fn spectrum(
+    ui: &mut Ui,
+    bins: &[f32],
+    hz_per_bin: f64,
+    height: f32,
+    floor: f32,
+    ceiling: f32,
+    modulation: &str,
+) {
+    let (rect, painter) = allocate(ui, height);
+    painter.rect_filled(rect, 0.0, BACKDROP);
+
+    // Horizontal grid every 20 dB, labelled.
+    let span = ceiling - floor;
+    let mut db = ceiling;
+    while db >= floor {
+        let y = rect.top() + rect.height() * (ceiling - db) / span;
+        painter.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(1.0, GRID));
+        painter.text(
+            pos2(rect.left() + 3.0, y),
+            Align2::LEFT_CENTER,
+            format!("{db:.0}"),
+            FontId::monospace(9.0),
+            LABEL,
+        );
+        db -= 20.0;
+    }
+    paint_tone_markers(&painter, rect, true, modulation);
+
+    let w = rect.width() as usize;
+    let mut points = Vec::with_capacity(w);
+    for x in 0..w {
+        let hz = DISPLAY_HZ * x as f64 / w as f64;
+        let bin = (hz / hz_per_bin).round() as usize;
+        let v = bins.get(bin).copied().unwrap_or(-120.0);
+        let t = ((v - floor) / span).clamp(0.0, 1.0);
+        points.push(pos2(rect.left() + x as f32, rect.bottom() - rect.height() * t));
+    }
+    for pair in points.windows(2) {
+        painter.line_segment([pair[0], pair[1]], Stroke::new(1.2, TRACE));
+    }
+
+    // Frequency ticks every 500 Hz.
+    let mut hz = 0.0;
+    while hz <= DISPLAY_HZ {
+        let x = rect.left() + rect.width() * (hz / DISPLAY_HZ) as f32;
+        painter.text(
+            pos2(x, rect.bottom() - 2.0),
+            Align2::CENTER_BOTTOM,
+            format!("{hz:.0}"),
+            FontId::monospace(9.0),
+            LABEL,
+        );
+        hz += 500.0;
+    }
+    frame_border(&painter, rect);
+}
+
+/// Symbol scope, in the style ARDOP uses for its FSK modes.
+///
+/// A cross of axes with the decision threshold at the centre. Each recovered
+/// symbol is drawn as a vertical line on the horizontal axis at its slicer
+/// margin: out at the arm tips it was an unambiguous tone, in toward the centre
+/// it was a marginal decision. Colour follows the same scale, green at the tips
+/// through yellow to red at the middle, so a degrading link is visible as the
+/// marks collapsing inward and reddening before any bit errors appear.
+///
+/// Binary FSK populates only the horizontal axis. The vertical axis is drawn
+/// for the four-tone modes to use, where symbols occupy all four arms.
+///
+/// The same widget serves the phase and quadrature-amplitude modulations: when
+/// `constellation` is non-empty it plots those points as a dot scatter against
+/// the same cross, which is what every mode above 300 bps will need.
+/// The scatter half of the symbol scope: the points, how many the modulation
+/// has, and how far they reach.
+pub struct Constellation<'a> {
+    pub points: &'a [(f32, f32)],
+    /// Sets how many arms are drawn: 2 for Bell 103, 16 for V.22bis.
+    pub tones: usize,
+    /// How far the points reach. One fits the box exactly.
+    pub peak: f32,
+    /// The points are PCM samples, each against the next, rather than I and
+    /// Q -- which a reader will take them for unless told.
+    pub pairs: bool,
+}
+
+pub fn symbol_scope(
+    ui: &mut Ui,
+    symbols: &[f32],
+    dots: Constellation<'_>,
+    label: &str,
+    quality: Option<u32>,
+    height: f32,
+) -> eframe::egui::Response {
+    let Constellation { points: constellation, tones, peak, pairs } = dots;
+    let size = vec2(ui.available_width(), height);
+    let (response, painter) = ui.allocate_painter(size, Sense::click());
+    let rect = response.rect;
+    painter.rect_filled(rect, 0.0, Color32::BLACK);
+
+    let centre = rect.center();
+    // Keep the plot square so the two axes share a scale.
+    let radius = (rect.width().min(rect.height()) * 0.5) - 12.0;
+    let axis = Color32::from_rgb(70, 130, 200);
+
+    let quadrature = tones > 2 || !constellation.is_empty();
+    painter.line_segment(
+        [pos2(centre.x - radius, centre.y), pos2(centre.x + radius, centre.y)],
+        Stroke::new(1.5, axis),
+    );
+    if quadrature {
+        painter.line_segment(
+            [pos2(centre.x, centre.y - radius), pos2(centre.x, centre.y + radius)],
+            Stroke::new(1.5, axis),
+        );
+    }
+    // Tick at each arm tip: where an ideal symbol should land.
+    for dx in [-1.0f32, 1.0] {
+        let x = centre.x + dx * radius;
+        painter.line_segment(
+            [pos2(x, centre.y - 5.0), pos2(x, centre.y + 5.0)],
+            Stroke::new(1.0, axis.gamma_multiply(0.8)),
+        );
+    }
+
+    // Newer symbols are drawn more strongly, so the display shows the present
+    // rather than a smear of everything ever received.
+    let n = symbols.len().max(1);
+    for (i, &v) in symbols.iter().enumerate() {
+        let margin = v.abs().min(1.0);
+        let x = centre.x + v.clamp(-1.2, 1.2) * radius;
+        let fade = 0.30 + 0.70 * (i as f32 / n as f32);
+        let half = 7.0 + 5.0 * margin;
+        painter.line_segment(
+            [pos2(x, centre.y - half), pos2(x, centre.y + half)],
+            Stroke::new(3.0, margin_colour(margin).gamma_multiply(fade)),
+        );
+    }
+
+    // Phase and QAM modulations plot as a dot scatter instead. Points are
+    // scaled so a unit-magnitude symbol sits at the arm tip, matching the FSK
+    // convention that the tips are where an ideal symbol belongs -- and then
+    // shrunk to fit if the constellation reaches further than that, which
+    // V.32's thirty-two points do. Eight of them have a coordinate a quarter
+    // beyond the box and were being drawn off the edge of it, so a
+    // thirty-two-point constellation showed twenty-four dots.
+    let fit = 1.0 / peak.max(1.0);
+    let m = constellation.len().max(1);
+    let at = |re: f32, im: f32| {
+        pos2(
+            centre.x + (re * fit).clamp(-1.4, 1.4) * radius,
+            centre.y - (im * fit).clamp(-1.4, 1.4) * radius,
+        )
+    };
+    // Every constellation is drawn the same way, whatever the modulation:
+    // one colour, faint enough that the symbols landing on a point build up
+    // into it, as one mesh rather than thousands of shapes.
+    //
+    // Colouring each symbol by its distance from the centre, which the
+    // smaller constellations used to do, paints the outer ring green and the
+    // inner one red on any modulation whose points are not all the same
+    // distance out -- which says something about the constellation and
+    // nothing about the line. What a reader wants from this scope is the
+    // shape of the clusters, and that is what building up shows.
+    //
+    // The smaller constellations keep 512 symbols against V.34's thousands,
+    // so their squares are larger and less faint; otherwise sixteen clusters
+    // of thirty-two symbols would be almost invisible beside a V.34 cloud.
+    let mut mesh = eframe::egui::Mesh::default();
+    let crowded = m > 200;
+    let side = (radius / 180.0).clamp(1.0, 2.5) * if crowded { 1.0 } else { 1.7 };
+    let colour = Color32::from_rgba_unmultiplied(120, 220, 160, if crowded { 110 } else { 150 });
+    for &(re, im) in constellation {
+        mesh.add_colored_rect(Rect::from_center_size(at(re, im), vec2(side, side)), colour);
+    }
+    painter.add(eframe::egui::Shape::mesh(mesh));
+
+    // Always say something. A silent, empty scope gives no way to tell a modem
+    // that is not decoding from a display that is not being fed.
+    if pairs {
+        // Said on the axes themselves, always: this is not I against Q.
+        let faint = Color32::from_rgb(110, 125, 145);
+        painter.text(pos2(centre.x + radius - 2.0, centre.y + 4.0), Align2::RIGHT_TOP, "sample n", FontId::monospace(10.0), faint);
+        painter.text(pos2(centre.x + 4.0, centre.y - radius + 2.0), Align2::LEFT_TOP, "sample n+1", FontId::monospace(10.0), faint);
+    }
+    let (text, colour) = match quality {
+        _ if pairs && !constellation.is_empty() => (
+            format!("{label} {tones} points, last {} samples", constellation.len()),
+            Color32::from_rgb(150, 160, 175),
+        ),
+        Some(q) => (format!("{label} Quality: {q}"), margin_colour(q as f32 / 100.0)),
+        None if tones > 128 && !constellation.is_empty() => (
+            format!("{label}  {tones} points, last {} symbols", constellation.len()),
+            Color32::from_rgb(150, 160, 175),
+        ),
+        None if !constellation.is_empty() => (
+            format!("{label}  {} points", constellation.len()),
+            Color32::from_rgb(150, 160, 175),
+        ),
+        None => (format!("{label}  no symbols"), Color32::from_rgb(120, 100, 100)),
+    };
+    painter.text(
+        pos2(rect.left() + 6.0, rect.bottom() - 4.0),
+        Align2::LEFT_BOTTOM,
+        text,
+        FontId::monospace(11.0),
+        colour,
+    );
+    frame_border(&painter, rect);
+    response
+}
+
+/// Green at a full decision margin, through yellow, to red at the threshold.
+fn margin_colour(margin: f32) -> Color32 {
+    let m = margin.clamp(0.0, 1.0);
+    if m > 0.5 {
+        let t = (m - 0.5) / 0.5;
+        Color32::from_rgb(
+            (255.0 * (1.0 - t) + 60.0 * t) as u8,
+            (215.0 * (1.0 - t) + 230.0 * t) as u8,
+            (60.0 * (1.0 - t) + 90.0 * t) as u8,
+        )
+    } else {
+        let t = m / 0.5;
+        Color32::from_rgb(
+            (235.0 * (1.0 - t) + 255.0 * t) as u8,
+            (60.0 * (1.0 - t) + 215.0 * t) as u8,
+            (55.0 * (1.0 - t) + 60.0 * t) as u8,
+        )
+    }
+}
+
+/// One faceplate lamp.
+fn lamp(painter: &Painter, centre: Pos2, on: bool, label: &str, hue: Color32) {
+    let colour = if on { hue } else { hue.gamma_multiply(0.16) };
+    painter.circle_filled(centre, 6.0, colour);
+    if on {
+        // A soft halo, so a lit lamp reads at a glance.
+        painter.circle_filled(centre, 9.0, colour.gamma_multiply(0.25));
+    }
+    painter.circle_stroke(centre, 6.0, Stroke::new(1.0, GRID));
+    painter.text(
+        pos2(centre.x, centre.y + 11.0),
+        Align2::CENTER_TOP,
+        label,
+        FontId::monospace(9.0),
+        if on { LABEL } else { LABEL.gamma_multiply(0.5) },
+    );
+}
+
+/// The LED faceplate, in the order a real modem carried the lamps.
+pub fn faceplate(ui: &mut Ui, leds: &telemetry::Leds) {
+    let size = vec2(ui.available_width(), 44.0);
+    let (response, painter) = ui.allocate_painter(size, Sense::hover());
+    let rect = response.rect;
+    painter.rect_filled(rect, 0.0, BACKDROP);
+
+    let green = Color32::from_rgb(80, 230, 120);
+    let amber = Color32::from_rgb(245, 180, 70);
+    let red = Color32::from_rgb(235, 100, 90);
+
+    let lamps: [(&str, bool, Color32); 9] = [
+        ("MR", leds.mr, green),
+        ("TR", leds.tr, green),
+        ("SD", leds.sd, amber),
+        ("RD", leds.rd, amber),
+        ("CD", leds.cd, green),
+        ("OH", leds.oh, red),
+        ("AA", leds.aa, amber),
+        ("HS", leds.hs, green),
+        ("EC", leds.ec, green),
+    ];
+
+    let step = rect.width() / lamps.len() as f32;
+    for (i, (label, on, hue)) in lamps.iter().enumerate() {
+        let x = rect.left() + step * (i as f32 + 0.5);
+        lamp(&painter, pos2(x, rect.top() + 12.0), *on, label, *hue);
+    }
+    frame_border(&painter, rect);
+}
+
+/// A horizontal level meter in dBFS.
+pub fn level_meter(ui: &mut Ui, db: f32) {
+    let size = vec2(ui.available_width(), 14.0);
+    let (response, painter) = ui.allocate_painter(size, Sense::hover());
+    let rect = response.rect;
+    painter.rect_filled(rect, 0.0, BACKDROP);
+
+    let (floor, ceiling) = (-60.0f32, 0.0f32);
+    let t = ((db - floor) / (ceiling - floor)).clamp(0.0, 1.0);
+    let filled = Rect::from_min_size(rect.min, vec2(rect.width() * t, rect.height()));
+    // Green up to -12 dBFS, amber to -3, red above: a modem receiving above
+    // -10 dBFS is almost certainly clipping somewhere upstream.
+    let colour = if db > -3.0 {
+        Color32::from_rgb(235, 90, 80)
+    } else if db > -12.0 {
+        Color32::from_rgb(240, 180, 70)
+    } else {
+        Color32::from_rgb(80, 210, 120)
+    };
+    painter.rect_filled(filled, 0.0, colour);
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        format!("{db:.1} dBFS"),
+        FontId::monospace(10.0),
+        Color32::from_rgb(230, 235, 240),
+    );
+    frame_border(&painter, rect);
+}
+
+/// Repaint continuously while a call is running, so the waterfall scrolls.
+pub fn request_animation(ctx: &Context) {
+    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+}
+
+#[allow(dead_code)]
+fn unused(_: Vec2) {}

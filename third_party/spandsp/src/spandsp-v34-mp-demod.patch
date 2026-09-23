@@ -1,0 +1,286 @@
+--- v34tx.c
++++ v34tx.c
+@@ -455,7 +455,9 @@
+ 
+     s->tx.info1a.use_high_carrier = false;
+     s->tx.info1a.preemphasis_filter = 6;
+-    s->tx.info1a.max_data_rate = s->tx.parms.max_bit_rate_code;
++    /* INFO1a carries the rate in 2400 bit/s units (four bits), not the
++       internal Table 10 bit-rate code. */
++    s->tx.info1a.max_data_rate = s->tx.parms.bit_rate/2400;
+ 
+     s->tx.info1a.baud_rate_a_to_c = s->tx.baud_rate;
+     s->tx.info1a.baud_rate_c_to_a = s->tx.baud_rate;
+--- v34rx.c
++++ v34rx.c
+@@ -165,6 +165,7 @@
+ 
+ static void process_cc_half_baud(v34_rx_state_t *s, const complexf_t *sample);
+ static void process_primary_half_baud(v34_rx_state_t *s, const complexf_t *sample);
++static int duplex_mp_rx(v34_rx_state_t *s, const int16_t amp[], int len);
+ SPAN_DECLARE(void) v34_put_mapping_frame(v34_rx_state_t *s, int16_t bits[16]);
+ static void l1_l2_analysis_init(v34_rx_state_t *s);
+ static void s_signal_detector_init(v34_rx_state_t *s);
+@@ -2252,7 +2253,11 @@
+         return;
+     /*endif*/
+     if (s->current_demodulator == V34_MODULATION_V34)
+-        pri_symbol_sync(s);
++    {
++        if (!s->mp_direct)
++            pri_symbol_sync(s);
++        /*endif*/
++    }
+     else
+         cc_symbol_sync(s);
+     /*endif*/
+@@ -2262,6 +2267,14 @@
+     ang2 = arctan2(s->last_sample.re, s->last_sample.im);
+     ang3 = ang1 - ang2 + DDS_PHASE(45.0f);
+     data_bits = ang3 >> 30;
++    if (s->mp_direct)
++    {
++        data_bits ^= s->mp_dibit_xor;
++        if (s->mp_dibit_swap)
++            data_bits = ((data_bits & 1) << 1) | ((data_bits >> 1) & 1);
++        /*endif*/
++    }
++    /*endif*/
+ 
+     /* Descramble the data bits. */
+     for (i = 0;  i < 2;  i++)
+@@ -2375,8 +2388,9 @@
+             {
+                 if (s->mp_count == s->mp_len)
+                 {
+-                    /* This should be the end of the MPh message */
+-                    if (s->crc == 0)
++                    /* crc_itu16_bits() leaves the transmitted MP CRC at
++                       zero residual when the raw CRC bits are appended. */
++                    if (s->crc == 0)
+                     {
+                         if (s->duplex)
+                         {
+@@ -2703,6 +2717,210 @@
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
++/* A conventional quadrature/matched-filter front end for duplex MP.
++   The unfinished upstream primary receiver never acquired MP reliably.  MP is
++   QPSK on the selected primary carrier, so mix it to baseband, low-pass it,
++   and deliver one differential symbol at the negotiated baud rate. */
++static int duplex_mp_rx(v34_rx_state_t *s, const int16_t amp[], int len)
++{
++    static float coeffs[6][81];
++    static bool coeffs_ready[6];
++    int i;
++    int k;
++    int rate = s->baud_rate;
++    float baud = exact_baud_rate(rate);
++
++    if (!coeffs_ready[rate])
++    {
++        const float beta = 0.12f;
++        float sum = 0.0f;
++        for (k = 0;  k < 81;  k++)
++        {
++            float t = (k - 40)*baud/8000.0f;
++            float h;
++            if (fabsf(t) < 1.0e-6f)
++            {
++                h = 1.0f + beta*(4.0f/(float) M_PI - 1.0f);
++            }
++            else if (fabsf(fabsf(t) - 1.0f/(4.0f*beta)) < 1.0e-4f)
++            {
++                h = beta/sqrtf(2.0f)*
++                    ((1.0f + 2.0f/(float) M_PI)*sinf((float) M_PI/(4.0f*beta))
++                     + (1.0f - 2.0f/(float) M_PI)*cosf((float) M_PI/(4.0f*beta)));
++            }
++            else
++            {
++                h = (sinf((float) M_PI*t*(1.0f - beta))
++                     + 4.0f*beta*t*cosf((float) M_PI*t*(1.0f + beta)))
++                    /((float) M_PI*t*(1.0f - 16.0f*beta*beta*t*t));
++            }
++            /*endif*/
++            coeffs[rate][k] = h;
++            sum += h;
++        }
++        for (k = 0;  k < 81;  k++)
++            coeffs[rate][k] /= sum;
++        /*endfor*/
++        coeffs_ready[rate] = true;
++    }
++    /*endif*/
++
++    if (!s->mp_direct)
++    {
++        memset(s->mp_mix_i, 0, sizeof(s->mp_mix_i));
++        memset(s->mp_mix_q, 0, sizeof(s->mp_mix_q));
++        s->mp_mix_step = 0;
++        s->mp_symbol_phase = 0.0f;
++        s->mp_timing_lock = -1;
++        for (k = 0;  k < 160;  k++)
++        {
++            s->mp_timing_phase[k] = (k%10)/10.0f;
++            s->mp_timing_scramble[k] = 0;
++            s->mp_timing_stream[k] = 0;
++            s->mp_timing_valid[k] = false;
++            s->mp_timing_count[k] = -1;
++            s->mp_timing_len[k] = 0;
++            s->mp_timing_crc[k] = 0xFFFF;
++        }
++        /*endfor*/
++        s->baud_half = 1;
++        s->mp_direct = true;
++    }
++    /*endif*/
++
++    for (i = 0;  i < len  &&  s->stage == V34_RX_STAGE_CC;  i++)
++    {
++        complexf_t carrier = dds_lookup_complexf(s->carrier_phase);
++        complexf_t symbol;
++        float in = 2.0f*amp[i]*s->agc_scaling;
++
++        s->mp_mix_i[s->mp_mix_step] = in*carrier.re;
++        s->mp_mix_q[s->mp_mix_step] = -in*carrier.im;
++        if (++s->mp_mix_step >= 81)
++            s->mp_mix_step = 0;
++        /*endif*/
++        dds_advancef(&s->carrier_phase, s->v34_carrier_phase_rate);
++
++        {
++            bool have_symbol = false;
++            int first = (s->mp_timing_lock >= 0)  ?  s->mp_timing_lock : 0;
++            int last = (s->mp_timing_lock >= 0)  ?  s->mp_timing_lock + 1 : 160;
++            int candidate;
++
++            for (candidate = first;  candidate < last;  candidate++)
++            {
++                s->mp_timing_phase[candidate] += baud/8000.0f;
++                if (s->mp_timing_phase[candidate] < 1.0f)
++                    continue;
++                /*endif*/
++                s->mp_timing_phase[candidate] -= 1.0f;
++                if (!have_symbol)
++                {
++                    symbol.re = 0.0f;
++                    symbol.im = 0.0f;
++                    for (k = 0;  k < 81;  k++)
++                    {
++                        int n = s->mp_mix_step + k;
++                        if (n >= 81)
++                            n -= 81;
++                        /*endif*/
++                        symbol.re += coeffs[rate][k]*s->mp_mix_i[n];
++                        symbol.im += coeffs[rate][k]*s->mp_mix_q[n];
++                    }
++                    /*endfor*/
++                    have_symbol = true;
++                }
++                /*endif*/
++
++                if (s->mp_timing_lock >= 0)
++                {
++                    s->baud_half = 1;
++                    process_cc_half_baud(s, &symbol);
++                    break;
++                }
++                /*endif*/
++
++                if (s->mp_timing_valid[candidate])
++                {
++                    uint32_t a1 = arctan2(symbol.re, symbol.im);
++                    uint32_t a2 = arctan2(s->mp_timing_last[candidate].re,
++                                          s->mp_timing_last[candidate].im);
++                    int dibit = (a1 - a2 + DDS_PHASE(45.0f)) >> 30;
++                    int variant = (candidate/10)%8;
++                    int descrambler_tap = (candidate >= 80)
++                                          ? ((s->scrambler_tap == 4) ? 17 : 4)
++                                          : s->scrambler_tap;
++                    dibit ^= variant & 3;
++                    if (variant & 4)
++                        dibit = ((dibit & 1) << 1) | ((dibit >> 1) & 1);
++                    /*endif*/
++                    int b;
++                    int j;
++                    for (j = 0;  j < 2;  j++)
++                    {
++                        int raw = dibit & 1;
++                        b = (raw
++                             ^ (s->mp_timing_scramble[candidate] >> descrambler_tap)
++                             ^ (s->mp_timing_scramble[candidate] >> 22)) & 1;
++                        s->mp_timing_scramble[candidate] =
++                            (s->mp_timing_scramble[candidate] << 1) | raw;
++                        s->mp_timing_stream[candidate] =
++                            (s->mp_timing_stream[candidate] << 1) | b;
++                        if ((s->mp_timing_stream[candidate] & 0x7FFFE) == 0x7FFFC)
++                        {
++                            s->mp_timing_crc[candidate] = 0xFFFF;
++                            s->mp_timing_count[candidate] = 17;
++                            s->mp_timing_len[candidate] = b ? 187 : 85;
++                        }
++                        /*endif*/
++                        if (s->mp_timing_count[candidate] >= 0)
++                        {
++                            s->mp_timing_count[candidate]++;
++                            if (s->mp_timing_count[candidate]%17 != 0)
++                                s->mp_timing_crc[candidate] =
++                                    crc_itu16_bits(b, 1, s->mp_timing_crc[candidate]);
++                            /*endif*/
++                            if (s->mp_timing_count[candidate] == s->mp_timing_len[candidate])
++                            {
++                                if (s->mp_timing_crc[candidate] == 0)
++                                {
++                                    s->mp_timing_lock = candidate;
++                                    s->mp_dibit_xor = variant & 3;
++                                    s->mp_dibit_swap = (variant & 4) != 0;
++                                    s->scrambler_tap = descrambler_tap;
++                                    s->scramble_reg = s->mp_timing_scramble[candidate];
++                                    s->bitstream = s->mp_timing_stream[candidate];
++                                    s->last_sample = symbol;
++                                    span_log(s->logging, SPAN_LOG_FLOW,
++                                             "Rx - duplex MP timing locked by CRC at phase %d/10, xor=%d swap=%d tap=%d\n",
++                                             candidate%10, s->mp_dibit_xor, s->mp_dibit_swap,
++                                             s->scrambler_tap);
++                                }
++                                /*endif*/
++                                s->mp_timing_count[candidate] = -1;
++                            }
++                            /*endif*/
++                        }
++                        /*endif*/
++                        dibit >>= 1;
++                    }
++                    /*endfor*/
++                }
++                else
++                {
++                    s->mp_timing_valid[candidate] = true;
++                }
++                /*endif*/
++                s->mp_timing_last[candidate] = symbol;
++            }
++            /*endfor*/
++        }
++    }
++    /*endfor*/
++    return i;
++}
++/*- End of function --------------------------------------------------------*/
++
+ static int primary_channel_rx(v34_rx_state_t *s, const int16_t amp[], int len)
+ {
+     int i;
+@@ -2719,6 +2937,11 @@
+     float ii;
+     float qq;
+     float v;
++
++    if (s->stage == V34_RX_STAGE_CC  &&  s->duplex)
++        return duplex_mp_rx(s, amp, len);
++    /*endif*/
++
+     /* Fractional-timing increments for the T/2 sample insertion, for each of
+        the 6 baud rates. The processing in process_primary_half_baud(), the
+        Godard TED and the equalizer all expect one insertion per half baud

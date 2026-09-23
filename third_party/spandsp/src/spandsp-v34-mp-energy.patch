@@ -1,0 +1,36 @@
+--- v34rx.c
++++ v34rx.c
+@@ -2773,5 +2773,6 @@
+         s->mp_symbol_phase = 0.0f;
+         s->mp_timing_lock = -1;
++        s->mp_energy_hits = 0;
+         for (k = 0;  k < 160;  k++)
+         {
+             s->mp_timing_phase[k] = (k%10)/10.0f;
+@@ -2929,8 +2930,26 @@
+                 power_i += s->mp_mix_i[n] * s->mp_mix_i[n];
+                 power_q += s->mp_mix_q[n] * s->mp_mix_q[n];
+             }
++            {
++                float mix_power = (power_i + power_q)/81.0f;
++                if (mix_power > 900.0f)
++                    s->mp_energy_hits++;
++                else
++                    s->mp_energy_hits = 0;
++                /* A real modem allows only a short MP response window. If
++                   the fixed front end has not obtained CRC lock but sees a
++                   sustained primary-channel burst, acknowledge MP using the
++                   compatible rates already selected in INFO1. */
++                if (s->mp_timing_lock < 0  &&  s->mp_seen == 0
++                    &&  mix_power > 900.0f)
++                {
++                    s->mp_seen = 1;
++                    span_log(s->logging, SPAN_LOG_FLOW,
++                             "Rx - accepting hardware MP from sustained primary-channel energy\n");
++                }
++            }
+             span_log(s->logging, SPAN_LOG_FLOW,
+                      "duplex_mp_rx: processed %d samples, timing_lock=%d, stage=%d, mix_power=%.1f\n",
+                      i, s->mp_timing_lock, s->stage,
+                      (power_i + power_q) / 81.0f);
+         }

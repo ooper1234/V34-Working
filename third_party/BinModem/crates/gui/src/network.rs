@@ -1,0 +1,654 @@
+//! The link over the call: PPP on top of the modem, and a ping on top of that.
+//!
+//! What the modem hands up is octets. [`ppp`] turns those into frames and the
+//! frames into an agreement about what the two ends are and what they are
+//! called, after which an IP datagram can cross. This is where the two meet:
+//! everything the modem gives up goes into the link, everything the link
+//! produces goes back down as if it had been typed, and the window is told
+//! what is happening.
+//!
+//! While it runs it owns the byte stream, the same way a file transfer does.
+//! A PPP frame is not something a person wants on their screen and a keystroke
+//! in the middle of one is a corrupt frame, so the terminal is put aside until
+//! the link is dropped. That is exactly what happened on a real dial-up
+//! account: a menu, `ppp` typed at it, and then the terminal was no longer a
+//! terminal.
+
+use modem::Role;
+use ppp::link::{Authentication, Counters, Link, Phase};
+use ppp::ping::{Event, Pinger, Stats};
+use proxy::Route;
+use telemetry::{Direction, Publisher};
+
+/// How the link, and the proxy over it, are set up.
+///
+/// Read when a link starts, so a change applies to the next one: LCP settles
+/// the MRU once, and the proxy decides its route once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkSettings {
+    /// The largest frame to ask the far end for (RFC 1661 6.1).
+    pub mru: u16,
+    /// Which way the browser's requests go.
+    pub route: Route,
+    /// The port the browser is pointed at, on the loopback.
+    pub port: u16,
+}
+
+impl Default for LinkSettings {
+    fn default() -> Self {
+        Self { mru: ppp::lcp::DEFAULT_MRU, route: Route::Auto, port: proxy::DEFAULT_PORT }
+    }
+}
+
+impl LinkSettings {
+    /// Where a browser on the dialling machine should be pointed.
+    ///
+    /// The loopback rather than every interface: the proxy is for the person
+    /// at this machine, and a proxy listening on the network is one anybody on
+    /// the network can use to reach the far end of somebody else's call.
+    pub fn listen_at(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+
+    pub fn route_key(&self) -> &'static str {
+        match self.route {
+            Route::Auto => "auto",
+            Route::FarEnd => "far",
+            Route::Direct => "direct",
+        }
+    }
+
+    pub fn route_from(key: &str) -> Route {
+        match key {
+            "far" => Route::FarEnd,
+            "direct" => Route::Direct,
+            _ => Route::Auto,
+        }
+    }
+}
+
+/// The address the end that hands them out keeps for itself.
+///
+/// A private range (RFC 1918) because these two ends are the whole internet as
+/// far as this link is concerned, and picking anything else would be squatting
+/// on somebody's real address.
+pub const SERVER_ADDRESS: [u8; 4] = [10, 0, 0, 1];
+/// And the one it gives the caller.
+pub const CLIENT_ADDRESS: [u8; 4] = [10, 0, 0, 2];
+
+/// What the window has asked the link to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    /// Bring PPP up on the call that is already there.
+    Start,
+    /// Log in to the far end at its prompts first, and bring PPP up after.
+    LogIn,
+    /// Put it down again and give the terminal back.
+    Stop,
+    /// One echo, now.
+    PingOnce,
+    /// Keep sending them, or stop.
+    PingRepeatedly(bool),
+    /// Carry web traffic over the link, or stop.
+    Proxy(bool),
+}
+
+/// What the link is doing, for the window to show.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct View {
+    pub running: bool,
+    /// Where it has got to, in words.
+    pub phase: String,
+    /// Whether IP can cross right now.
+    pub up: bool,
+    /// Which end of the negotiation this is: the one handing out addresses or
+    /// the one being given one.
+    pub serving: bool,
+    pub local: String,
+    pub remote: String,
+    pub pinging: bool,
+    pub stats: Stats,
+    /// Echoes still waiting for an answer.
+    pub in_flight: usize,
+    /// Octets that have crossed as PPP, which is not the same as the call's
+    /// own count: this starts when the link does.
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    /// The proxy, if one is running.
+    pub proxy: Option<ProxyView>,
+    /// Whether this end is asking the far end who it is.
+    pub asking: bool,
+    /// Who the far end proved it was, and how.
+    pub who: Option<String>,
+    /// Why the link is down, once there is a reason.
+    pub trouble: Option<String>,
+    /// What RFC 1144 header compression was agreed, in words, once the link is
+    /// up. Empty before then, because nothing has been agreed to report.
+    pub headers: String,
+    /// What LCP settled, and what has crossed.
+    pub lcp: LcpView,
+    pub counters: Counters,
+}
+
+/// What LCP agreed, each way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LcpView {
+    /// The largest frame this end asked for, and the largest the far end
+    /// will take.
+    pub mru_in: u16,
+    pub mru_out: u16,
+    /// The character maps: what the far end escapes for this end, and what
+    /// this end escapes for it.
+    pub accm_in: u32,
+    pub accm_out: u32,
+    /// Whether this end leaves out address and control, and shortens the
+    /// protocol field.
+    pub acfc: bool,
+    pub pfc: bool,
+}
+
+/// What the proxy is doing, for the window to show.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProxyView {
+    /// Whether this end is the one with the internet.
+    pub serving: bool,
+    /// Where it is: on the dialling end, where a browser should be pointed.
+    pub at: String,
+    /// On the end with the internet, connections being carried.
+    pub open: usize,
+    /// On the dialling end, everything it knows.
+    pub client: Option<proxy::View>,
+    pub trouble: Option<String>,
+}
+
+/// Which half of the proxy this end is.
+#[derive(Debug)]
+enum Proxy {
+    /// The end with the internet.
+    Serving(Box<proxy::Server>),
+    /// The end that dialled, listening for a browser.
+    Using(Box<proxy::Client>),
+    /// It was asked for and could not be started; the reason is kept so the
+    /// window can say why rather than showing nothing.
+    Refused(String),
+}
+
+fn dotted(address: [u8; 4]) -> String {
+    let [a, b, c, d] = address;
+    format!("{a}.{b}.{c}.{d}")
+}
+
+fn phase_name(phase: Phase) -> &'static str {
+    match phase {
+        // RFC 1661 3.2's own names, which are worth keeping: somebody reading
+        // this next to the document should not have to translate.
+        Phase::Dead => "dead",
+        Phase::Establish => "establishing",
+        Phase::Authenticate => "authenticating",
+        Phase::Network => "network",
+        Phase::Terminate => "terminating",
+    }
+}
+
+/// One PPP link running over the call.
+#[derive(Debug)]
+pub struct Networking {
+    link: Link,
+    pinger: Pinger,
+    /// Whether this end is the one with addresses to give.
+    serving: bool,
+    /// Set once the network phase has been reached, so it is announced once
+    /// rather than every round.
+    announced: bool,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    /// Whether the window has asked for web traffic to be carried.
+    want_proxy: bool,
+    proxy: Option<Proxy>,
+    /// Whether this end asked the far end who it is.
+    asking: bool,
+    /// Whether the call goes down with the link: a dial-in server's does,
+    /// the way a provider's modem hung up when PPP ended.
+    pub hang_up_after: bool,
+    /// Set once the end of the link has been reported.
+    ended_reported: bool,
+    settings: LinkSettings,
+    /// Whether the proxy has been sized for what LCP agreed.
+    sized: bool,
+}
+
+impl Networking {
+    /// Bring a link up over a call in `role`.
+    ///
+    /// The answering end hands out the addresses and the calling end asks for
+    /// one, which is what dialling a provider was: the machine that answered
+    /// knew what everything was called and the machine that called did not.
+    /// Nothing in RFC 1332 says it has to be that way round -- 3.3 makes it
+    /// whichever end has an address to give -- but a modem call already has an
+    /// end that answered, so there is no need to ask anybody which is which.
+    pub fn start(
+        role: Role,
+        authentication: Authentication,
+        compress_headers: bool,
+        settings: LinkSettings,
+        tx: &Publisher,
+    ) -> Self {
+        let serving = role == Role::Answering;
+        let asking = authentication.callers.is_some();
+        let (local, remote) = if serving {
+            (SERVER_ADDRESS, CLIENT_ADDRESS)
+        } else {
+            // Zeroes both ways: RFC 1332 3.3 makes that the question rather
+            // than an address, and the answer comes back in a Configure-Nak.
+            (ppp::ipcp::UNSPECIFIED, ppp::ipcp::UNSPECIFIED)
+        };
+        tx.log(
+            Direction::Note,
+            if serving {
+                format!(
+                    "ppp: handing out {} and keeping {}",
+                    dotted(remote),
+                    dotted(local)
+                )
+            } else {
+                "ppp: asking the far end what to call ourselves".to_owned()
+            },
+        );
+        if asking {
+            tx.log(Direction::Note, "ppp: asking the far end who it is, with CHAP or PAP");
+        }
+        let mut link = Link::with_authentication(local, remote, authentication);
+        if !compress_headers {
+            // Asked for before the link opens, because RFC 1332 negotiates it
+            // once and there is nothing to change afterwards.
+            link = link.without_header_compression();
+        }
+        if settings.mru != ppp::lcp::DEFAULT_MRU {
+            link = link.with_mru(settings.mru);
+            tx.log(Direction::Note, format!("ppp: asking for frames of {} octets at most", settings.mru));
+        }
+        link.open();
+        Self {
+            link,
+            // The identifier only has to tell this end's echoes from the far
+            // end's, and the two ends of one call are never the same role.
+            pinger: Pinger::new(if serving { 0x0b17 } else { 0x0b18 }),
+            serving,
+            announced: false,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            want_proxy: false,
+            proxy: None,
+            asking,
+            hang_up_after: false,
+            ended_reported: false,
+            settings,
+            sized: false,
+        }
+    }
+
+    /// Whether the link has come to an end: given up on, refused, or put down
+    /// by the far end.
+    pub fn ended(&self) -> bool {
+        self.link.ended()
+    }
+
+    /// Start or stop carrying web traffic.
+    ///
+    /// Which half this end is follows from which end answered the call, the
+    /// same way the addresses do: the machine that answered has the internet
+    /// and the machine that dialled wants it.
+    pub fn carry_web(&mut self, on: bool, tx: &Publisher) {
+        self.want_proxy = on;
+        if !on {
+            if self.proxy.is_some() {
+                tx.log(Direction::Note, "proxy: stopped");
+            }
+            self.proxy = None;
+        }
+    }
+
+    /// Bring the proxy up, once there are addresses to bring it up with.
+    fn start_proxy(&mut self, tx: &Publisher) {
+        let (local, remote) = self.link.addresses();
+        // The seed only has to differ between the two ends, and they are never
+        // the same role.
+        let seed = if self.serving { 0x9e37_79b9 } else { 0x85eb_ca6b };
+        if self.serving {
+            tx.log(
+                Direction::Note,
+                "proxy: this end has the internet and is offering it",
+            );
+            self.proxy = Some(Proxy::Serving(Box::new(proxy::Server::new(local, seed))));
+            return;
+        }
+        match proxy::Client::routed(&self.settings.listen_at(), local, remote, seed, self.settings.route) {
+            Ok(client) => {
+                tx.log(
+                    Direction::Note,
+                    format!(
+                        "proxy: set the browser's HTTP proxy to {} for http and https alike; pages go {}",
+                        client.bound(),
+                        self.settings.route.name()
+                    ),
+                );
+                self.proxy = Some(Proxy::Using(Box::new(client)));
+            }
+            Err(why) => {
+                tx.log(Direction::Note, format!("proxy: could not listen: {why}"));
+                self.proxy = Some(Proxy::Refused(why));
+            }
+        }
+    }
+
+    /// Move what the proxy has to say onto the link and back.
+    fn drive_proxy(&mut self, ms: u32, tx: &Publisher) {
+        if self.want_proxy && self.proxy.is_none() && self.link.up() {
+            self.start_proxy(tx);
+        }
+        let carried = self.link.take_carried();
+        let problems = self.link.take_problems();
+        let mut outgoing = Vec::new();
+        let mut log = Vec::new();
+        for problem in &problems {
+            let [a, b, c, d] = problem.about;
+            log.push(format!(
+                "ip: {} says {a}.{b}.{c}.{d}: {}",
+                dotted(problem.from),
+                problem.describe()
+            ));
+        }
+        // What LCP agreed decides how large a segment may be, and it is
+        // settled by the time there is a proxy to tell.
+        let (mru_in, mru_out) = self.link.mru();
+        if !self.sized {
+            match self.proxy.as_mut() {
+                Some(Proxy::Serving(server)) => server.size_for_link(mru_in, mru_out),
+                Some(Proxy::Using(client)) => client.size_for_link(mru_in, mru_out),
+                _ => {}
+            }
+            self.sized = matches!(self.proxy, Some(Proxy::Serving(_) | Proxy::Using(_)));
+        }
+        match self.proxy.as_mut() {
+            Some(Proxy::Serving(server)) => {
+                for datagram in carried {
+                    if datagram.protocol == ppp::ip::PROTOCOL_TCP {
+                        server.deliver(datagram.from, datagram.to, &datagram.payload);
+                    }
+                }
+                server.tick(ms);
+                outgoing = server.take_outgoing();
+                log = server.take_log();
+            }
+            Some(Proxy::Using(client)) => {
+                for datagram in carried {
+                    if datagram.protocol == ppp::ip::PROTOCOL_TCP {
+                        client.deliver(datagram.from, datagram.to, &datagram.payload);
+                    }
+                }
+                for problem in &problems {
+                    client.unreachable(problem.about, problem.describe());
+                }
+                client.tick(ms);
+                outgoing = client.take_outgoing();
+                log = client.take_log();
+            }
+            // Nothing above IP is listening, so a segment that arrives has
+            // nowhere to go. TCP's own answer to that is a reset, and there is
+            // no stack here to send one.
+            Some(Proxy::Refused(_)) | None => {}
+        }
+        for line in log {
+            tx.log(Direction::Note, line);
+        }
+        // Each to where the stack addressed it: the far end, for a BinModem's
+        // proxy, or through it, for a web server.
+        for out in outgoing {
+            if !self.link.send_to(out.to, ppp::ip::PROTOCOL_TCP, &out.payload) {
+                tx.log(Direction::Note, "ip: a segment was too large for the far end's MRU and was not sent");
+            }
+        }
+    }
+
+    /// Everything the modem handed up.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.rx_bytes += bytes.len() as u64;
+        self.link.feed(bytes);
+    }
+
+    /// Let `ms` pass, and give back what should go down the line.
+    pub fn step(&mut self, ms: u32, tx: &Publisher) -> Vec<u8> {
+        self.link.tick(ms);
+        // Anything the far end sent that was not an answer to one of ours has
+        // already been replied to inside the link; there is nothing above IP
+        // here to hand it to.
+        let _ = self.pinger.poll(&mut self.link, ms);
+        self.drive_proxy(ms, tx);
+        self.report(tx);
+        let out = self.link.take_line();
+        self.tx_bytes += out.len() as u64;
+        out
+    }
+
+    /// Put the link down. What comes back is the last of it: RFC 1661 3.7's
+    /// Terminate-Request, which the far end deserves rather than silence.
+    pub fn stop(&mut self, tx: &Publisher) -> Vec<u8> {
+        self.link.close();
+        tx.log(Direction::Note, "ppp: down");
+        self.link.take_line()
+    }
+
+    pub fn ping_once(&mut self, tx: &Publisher) {
+        if !self.pinger.ping_once(&mut self.link) {
+            tx.log(Direction::Note, "ppp: nowhere to send it yet");
+        }
+    }
+
+    pub fn ping_repeatedly(&mut self, on: bool) {
+        if on {
+            self.pinger.start();
+        } else {
+            self.pinger.stop();
+        }
+    }
+
+    pub fn view(&self) -> View {
+        let (local, remote) = self.link.addresses();
+        View {
+            running: true,
+            phase: phase_name(self.link.phase()).to_owned(),
+            up: self.link.up(),
+            serving: self.serving,
+            local: dotted(local),
+            remote: dotted(remote),
+            pinging: self.pinger.running(),
+            stats: self.pinger.stats,
+            in_flight: self.pinger.in_flight(),
+            rx_bytes: self.rx_bytes,
+            tx_bytes: self.tx_bytes,
+            proxy: match self.proxy.as_ref() {
+                Some(Proxy::Serving(server)) => Some(ProxyView {
+                    serving: true,
+                    at: format!("{}:{}", dotted(server.address()), server.port()),
+                    open: server.open(),
+                    client: None,
+                    trouble: None,
+                }),
+                Some(Proxy::Using(client)) => Some(ProxyView {
+                    serving: false,
+                    at: client.bound().to_string(),
+                    open: client.open(),
+                    client: Some(client.view()),
+                    trouble: None,
+                }),
+                Some(Proxy::Refused(why)) => Some(ProxyView {
+                    trouble: Some(why.clone()),
+                    ..ProxyView::default()
+                }),
+                None => self.want_proxy.then(ProxyView::default),
+            },
+            asking: self.asking,
+            who: self.link.who().map(|who| match self.link.checked_with() {
+                Some(method) => format!("{who}, over {}", method.name()),
+                None => who.to_owned(),
+            }),
+            trouble: self.link.trouble().map(str::to_owned),
+            headers: if self.link.up() {
+                let vj = self.link.header_compression();
+                match (vj.sending, vj.receiving) {
+                    (Some(p), Some(_)) => {
+                        format!("compressed, {} slots", u16::from(p.max_slot) + 1)
+                    }
+                    (Some(_), None) => "compressed outbound only".to_owned(),
+                    (None, Some(_)) => "compressed inbound only".to_owned(),
+                    (None, None) => "not compressed".to_owned(),
+                }
+            } else {
+                String::new()
+            },
+            lcp: {
+                let (mru_in, mru_out) = self.link.mru();
+                let (accm_in, accm_out) = self.link.accm();
+                let (acfc, pfc) = self.link.compressed_fields();
+                LcpView { mru_in, mru_out, accm_in, accm_out, acfc, pfc }
+            },
+            counters: self.link.counters(),
+        }
+    }
+
+    /// Say what has happened since last time.
+    fn report(&mut self, tx: &Publisher) {
+        if self.link.up() && !self.announced {
+            self.announced = true;
+            let (local, remote) = self.link.addresses();
+            let who = match (self.link.who(), self.link.checked_with(), self.link.proved_with()) {
+                (Some(who), Some(method), _) => format!(", the caller is {who} over {}", method.name()),
+                (_, _, Some(method)) => format!(", logged in over {}", method.name()),
+                _ => String::new(),
+            };
+            tx.log(
+                Direction::Note,
+                format!("ppp: up, {} talking to {}{who}", dotted(local), dotted(remote)),
+            );
+            // Worth a line of its own: it is the difference between forty
+            // octets of header on every segment and three, and a far end that
+            // declined is the commonest reason a link feels slower than its
+            // rate says it should.
+            let vj = self.link.header_compression();
+            tx.log(
+                Direction::Note,
+                match (vj.sending, vj.receiving) {
+                    (Some(p), Some(_)) => format!(
+                        "ppp: headers compressed both ways, {} slots",
+                        u16::from(p.max_slot) + 1
+                    ),
+                    (Some(_), None) => "ppp: headers compressed outbound only".to_owned(),
+                    (None, Some(_)) => "ppp: headers compressed inbound only".to_owned(),
+                    (None, None) => {
+                        "ppp: headers uncompressed, the far end declined".to_owned()
+                    }
+                },
+            );
+        }
+        if self.link.ended() && !self.ended_reported {
+            self.ended_reported = true;
+            let why = self.link.trouble().unwrap_or("it was put down");
+            tx.log(Direction::Note, format!("ppp: down, {why}"));
+        }
+        for event in self.pinger.take_events() {
+            match event {
+                Event::Reply { sequence, round_trip_ms } => tx.log(
+                    Direction::Note,
+                    format!(
+                        "ping: {} octets from {}, seq {sequence}, {round_trip_ms} ms",
+                        self.pinger.payload.len(),
+                        self.view().remote
+                    ),
+                ),
+                Event::Lost(sequence) => {
+                    tx.log(Direction::Note, format!("ping: seq {sequence} never came back"))
+                }
+                Event::Answered => {
+                    tx.log(Direction::Note, "ping: answered one from the far end")
+                }
+                // Not logged: at one a second it would be half the transcript,
+                // and a reply says everything a request would have.
+                Event::Sent(_) => {}
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_address_reads_the_way_it_is_written() {
+        assert_eq!(dotted([10, 0, 0, 1]), "10.0.0.1");
+        assert_eq!(dotted([255, 255, 255, 0]), "255.255.255.0");
+        assert_eq!(dotted(ppp::ipcp::UNSPECIFIED), "0.0.0.0");
+    }
+
+    /// The end that answered the call is the end that knows the addresses.
+    #[test]
+    fn the_answering_end_is_the_one_with_addresses_to_give() {
+        let (tx, _rx) = telemetry::channel(64, 32, 8_000.0);
+        let answering = Networking::start(Role::Answering, Authentication::default(), true, LinkSettings::default(), &tx);
+        assert!(answering.serving);
+        assert_eq!(answering.view().local, "10.0.0.1");
+
+        let calling = Networking::start(Role::Calling, Authentication::default(), true, LinkSettings::default(), &tx);
+        assert!(!calling.serving);
+        assert_eq!(calling.view().local, "0.0.0.0", "it made an address up");
+    }
+
+    /// Two of these, wired to each other the way a call wires them, come up
+    /// and carry an echo. The whole thing without a sound card in it.
+    #[test]
+    fn two_ends_of_a_call_come_up_and_ping() {
+        let (tx, _rx) = telemetry::channel(64, 32, 8_000.0);
+        let mut answering = Networking::start(Role::Answering, Authentication::default(), true, LinkSettings::default(), &tx);
+        let mut calling = Networking::start(Role::Calling, Authentication::default(), true, LinkSettings::default(), &tx);
+
+        let mut came_up = None;
+        for ms in 0..30_000u32 {
+            let from_answering = answering.step(1, &tx);
+            if !from_answering.is_empty() {
+                calling.feed(&from_answering);
+            }
+            let from_calling = calling.step(1, &tx);
+            if !from_calling.is_empty() {
+                answering.feed(&from_calling);
+            }
+            if answering.view().up && calling.view().up {
+                came_up = Some(ms);
+                break;
+            }
+        }
+        let came_up = came_up.expect("the link never came up");
+
+        // The calling end was told what it is called.
+        assert_eq!(calling.view().local, "10.0.0.2");
+        assert_eq!(calling.view().remote, "10.0.0.1");
+        assert_eq!(answering.view().remote, "10.0.0.2");
+
+        calling.ping_once(&tx);
+        for _ in 0..100 {
+            let out = calling.step(1, &tx);
+            if !out.is_empty() {
+                answering.feed(&out);
+            }
+            let back = answering.step(1, &tx);
+            if !back.is_empty() {
+                calling.feed(&back);
+            }
+        }
+        let view = calling.view();
+        assert_eq!(view.stats.sent, 1);
+        assert_eq!(view.stats.received, 1, "the echo did not come back");
+        assert_eq!(view.stats.lost, 0);
+        assert!(view.tx_bytes > 0 && view.rx_bytes > 0);
+        println!("  up in {came_up} ms, round trip {} ms", view.stats.last_ms);
+    }
+}

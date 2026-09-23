@@ -1,0 +1,33 @@
+[package]
+name    = "modem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+at       = { path = "../at" }
+fax      = { path = "../fax" }
+datapump = { path = "../datapump" }
+ec       = { path = "../ec" }
+line     = { path = "../line" }
+v8       = { path = "../v8" }
+
+[dev-dependencies]
+datapump = { path = "../datapump" }
+fax      = { path = "../fax" }
+# For the end-to-end test: a file crossing a call, which is the only place the
+# whole stack is exercised at once.
+transfer = { path = "../transfer" }
+# And one taller than that: a ping, which needs the frames as well as the
+# octets under them.
+ppp      = { path = "../ppp" }
+# And the login in front of it, which is text over the call until it is not.
+login    = { path = "../login" }
+# And the tallest of all: a web page, which needs the proxy, the TCP
+# under it and a real socket at the far end.
+proxy    = { path = "../proxy" }
+# A softphone's sample rate conversion, for a V.90 server behind one.
+dsp      = { path = "../dsp" }
+
+[lints]
+workspace = true

@@ -1,0 +1,91 @@
+--- v34rx.c
++++ v34rx.c
+@@ -170,6 +170,7 @@
+ static void l1_l2_analysis_init(v34_rx_state_t *s);
+ static void s_signal_detector_init(v34_rx_state_t *s);
+ static void s_signal_detector(v34_rx_state_t *s, const int16_t amp[], int len);
++static void s_not_s_detector(v34_rx_state_t *s, const int16_t amp[], int len);
+ 
+ static int descramble(v34_rx_state_t *s, int in_bit)
+ {
+@@ -1433,6 +1434,68 @@
+     s->s_det_power = 0.0f;
+     s->s_det_count = 0;
+     s->s_det_hits = 0;
++    s->s_not_s_seen = false;
++    s->s_det_short_count = 0;
++    s->s_det_short_re = 0.0f;
++    s->s_det_short_im = 0.0f;
++    s->s_det_phase_short = 0;
++    s->s_det_rate_short = dds_phase_ratef(fc);
++    s->s_det_ref_valid = false;
++    s->s_det_nots_hits = 0;
++}
++/*- End of function --------------------------------------------------------*/
++
++static void s_not_s_detector(v34_rx_state_t *s, const int16_t amp[], int len)
++{
++    int i;
++
++    if (!s->s_signal_seen  ||  s->s_not_s_seen)
++        return;
++    /*endif*/
++    for (i = 0;  i < len;  i++)
++    {
++        complexf_t z = dds_lookup_complexf(s->s_det_phase_short);
++        float x = amp[i];
++        s->s_det_short_re += x*z.re;
++        s->s_det_short_im -= x*z.im;
++        dds_advancef(&s->s_det_phase_short, s->s_det_rate_short);
++        if (++s->s_det_short_count >= 16)
++        {
++            float phase = atan2f(s->s_det_short_im, s->s_det_short_re);
++            float magnitude = hypotf(s->s_det_short_re, s->s_det_short_im)/16.0f;
++            if (!s->s_det_ref_valid)
++            {
++                s->s_det_ref_phase = phase;
++                s->s_det_ref_valid = magnitude > 300.0f;
++            }
++            else if (magnitude > 300.0f)
++            {
++                float coherence = cosf(phase - s->s_det_ref_phase);
++                if (coherence < -0.45f)
++                    s->s_det_nots_hits++;
++                else if (coherence > 0.45f)
++                {
++                    s->s_det_nots_hits = 0;
++                    s->s_det_ref_phase = phase;
++                }
++                /*endif*/
++                if (s->s_det_nots_hits >= 2)
++                {
++                    s->s_not_s_seen = true;
++                    span_log(s->logging, SPAN_LOG_FLOW,
++                             "Rx - S-to-!S transition detected from carrier phase reversal\n");
++                    return;
++                }
++                /*endif*/
++            }
++            /*endif*/
++            s->s_det_short_count = 0;
++            s->s_det_short_re = 0.0f;
++            s->s_det_short_im = 0.0f;
++        }
++        /*endif*/
++    }
++    /*endfor*/
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
+@@ -3028,6 +3091,11 @@
+ static int primary_channel_rx(v34_rx_state_t *s, const int16_t amp[], int len)
+ {
+     int i;
++
++    /* Once S has been acquired, track its coherent phase until the specified
++       S-to-!S reversal arrives.  This event, rather than elapsed time, releases
++       the answer modem's J and starts receive equalizer training. */
++    s_not_s_detector(s, amp, len);
+     int step;
+ #if defined(SPANDSP_USE_FIXED_POINT)
+     complexi16_t z;

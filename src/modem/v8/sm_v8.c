@@ -74,6 +74,18 @@ sm_v8_t *sm_v8_create(bool calling_party,
         free(v);
         return NULL;
     }
+    {
+        /* V8_TRACE=1 enables the spanDSP V.8 exchange logging (CM/JM/CJ and
+           state transitions), which is otherwise suppressed. */
+        const char *t = getenv("V8_TRACE");
+        if (t  &&  atoi(t))
+        {
+            logging_state_t *log = v8_get_logging_state(v->v8);
+            span_log_set_level(log, SPAN_LOG_SHOW_SEVERITY | SPAN_LOG_SHOW_TAG | SPAN_LOG_FLOW | SPAN_LOG_DEBUG);
+            span_log_set_tag(log, "v8");
+        }
+        /*endif*/
+    }
     (void) log_level;
     return v;
 }

@@ -108,41 +108,42 @@ static void make_v34_16_state_convolutional_encoder(void)
 
 static void make_v34_16_state_convolutional_decoder(void)
 {
-#if 1
     int state;
-    int y;
+    int j;
     int previous_state;
-    int branch;
     int i;
 
+    /* The trellis transition depends only on the low two bits of the encoder
+       input, so there are four transitions into each state. For each next state
+       and trellis input, find the single previous state that leads there, and
+       pack it with the trellis input as the branch index used by the metrics
+       update and the trace back. */
     printf("static const uint8_t v34_conv16_decode_table[16][4] =\n");
     printf("{\n");
     for (state = 0;  state < 16;  state++)
     {
         printf("    {");
-        for (y = 0;  y < 4;  y++)
+        for (j = 0;  j < 4;  j++)
         {
             previous_state = -1;
             for (i = 0;  i < 16;  i++)
             {
-                if (v34_conv16_encode_table[i][y] == state)
+                if (v34_conv16_encode_table[i][j] == state)
                     previous_state = i;
                 /*endif*/
             }
             /*endfor*/
-            branch = (y << 1) | (previous_state & 1);
-            printf("0x%02X", (previous_state << 3) | branch);
-            //printf("(0x%02X << 3) | 0x%02x", previous_state, branch);
-            if (y < 3)
+            printf("0x%02X", (previous_state << 3) | j);
+            if (j < 3)
                 printf(", ");
             /*endif*/
         }
+        /*endfor*/
         printf("}%s\n", (state < 15)  ?  ","  :  "");
     }
     /*endfor*/
     printf("};\n");
     printf("\n");
-#endif
 }
 /*- End of function --------------------------------------------------------*/
 

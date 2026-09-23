@@ -1,0 +1,12 @@
+[package]
+name    = "proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+http  = { path = "../http" }
+tcp   = { path = "../tcp" }
+
+[lints]
+workspace = true

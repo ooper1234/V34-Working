@@ -1,0 +1,1337 @@
+//! ITU-T V.22bis — 2400 bit/s duplex, 600 baud, 16-QAM.
+//!
+//! Full duplex by frequency division (V.22bis 2.1): the calling modem occupies
+//! the low channel on a 1200 Hz carrier and the answering modem the high channel
+//! on 2400 Hz. Because the two directions sit in different bands, no echo
+//! canceller is needed — that requirement only arrives with V.32.
+//!
+//! Data is carried in quadbits. The first two bits are a *change* of phase
+//! quadrant relative to the previous symbol (V.22bis Table 1), which makes the
+//! link immune to a constant carrier phase offset that is a multiple of 90
+//! degrees. The last two bits pick one of four points inside the new quadrant
+//! (Figure 2).
+
+pub mod handshake;
+
+use dsp::filter::OnePole;
+use dsp::{ComplexFir, Equalizer, Gardner, Nco, fir_lowpass, rrc_at, rrc_taps};
+
+/// Modulation rate (V.22bis 2.5.1).
+pub const BAUD: f64 = 600.0;
+/// Low channel carrier, used by the calling modem (V.22bis 2.1).
+pub const CARRIER_LOW: f64 = 1200.0;
+/// High channel carrier, used by the answering modem.
+pub const CARRIER_HIGH: f64 = 2400.0;
+/// Root-raised-cosine roll-off (V.22bis 2.4).
+pub const ROLLOFF: f64 = 0.75;
+/// Pulse span in symbols.
+const SPAN: usize = 8;
+
+/// Signalling rate (V.22bis 2.5.1). Both run at 600 baud.
+///
+/// At 2400 the four bits of a quadbit split into a quadrant change and a point
+/// within that quadrant. At 1200 a dibit gives only the quadrant change, and
+/// the point transmitted is always the one labelled 01, which V.22bis 2.5.2.2
+/// nominates "irrespective of the quadrant concerned" for compatibility with
+/// V.22. Its magnitude is the root of ten, the root-mean-square of the whole
+/// constellation, so both rates carry the same average power.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rate {
+    Bps1200,
+    Bps2400,
+}
+
+impl Rate {
+    /// Data bits carried by each symbol.
+    pub fn bits_per_symbol(self) -> usize {
+        match self {
+            Self::Bps1200 => 2,
+            Self::Bps2400 => 4,
+        }
+    }
+
+    pub fn bits_per_second(self) -> u32 {
+        match self {
+            Self::Bps1200 => 1200,
+            Self::Bps2400 => 2400,
+        }
+    }
+}
+
+/// Index of the point V.22 uses at 1200 bit/s.
+const V22_POINT: usize = 0b01;
+
+/// Which channel this modem transmits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// Calling modem: transmits low, receives high.
+    Calling,
+    /// Answering modem: transmits high, receives low.
+    Answering,
+}
+
+impl Channel {
+    pub fn transmit_carrier(self) -> f64 {
+        match self {
+            Self::Calling => CARRIER_LOW,
+            Self::Answering => CARRIER_HIGH,
+        }
+    }
+
+    pub fn receive_carrier(self) -> f64 {
+        match self {
+            Self::Calling => CARRIER_HIGH,
+            Self::Answering => CARRIER_LOW,
+        }
+    }
+}
+
+/// Quadrant change for the first two bits of a quadbit (V.22bis Table 1),
+/// indexed by those bits as `Q1 << 1 | Q2`. Values are quadrants anticlockwise.
+const QUADRANT_CHANGE: [u8; 4] = [1, 0, 2, 3];
+
+/// The inverse: quadrant change back to the pair of bits that caused it.
+const CHANGE_TO_BITS: [u8; 4] = [0b01, 0b00, 0b10, 0b11];
+
+/// First-quadrant points selected by the last two bits, `Q3 << 1 | Q4`
+/// (V.22bis Figure 2).
+///
+/// `01` sits at (3,1), whose magnitude is the root of ten. That is exactly the
+/// root-mean-square magnitude of the whole sixteen-point constellation, which is
+/// why V.22bis 2.5.2.2 nominates it as the point used at 1200 bit/s: the slower
+/// signal then has the same average power as the faster one.
+const QUADRANT_POINTS: [(f64, f64); 4] = [(1.0, 1.0), (3.0, 1.0), (1.0, 3.0), (3.0, 3.0)];
+
+/// Root-mean-square magnitude of the constellation, used to scale the
+/// transmitted signal to unit power.
+pub const CONSTELLATION_RMS: f64 = 3.162_277_660_168_379_5; // sqrt(10)
+
+/// Mean power of the sixteen points, which is the square of the above.
+pub const CONSTELLATION_MEAN_POWER: f64 = 10.0;
+
+/// Ceiling on receiver gain, so silence cannot be amplified into nonsense.
+const MAX_GAIN: f64 = 400.0;
+
+/// Symbol power below which the signal is treated as absent, relative to what
+/// gain control is aiming at.
+const SQUELCH: f64 = 1.0e-7;
+
+/// Received level at which a carrier is declared present, and the lower level
+/// at which it is declared gone again.
+///
+/// V.22bis 6.5.2 puts these at -43 dBm and -48 dBm, five decibels apart so
+/// that a signal hovering at the threshold does not chatter. The decibels are
+/// referred to a milliwatt on the line, which a recording carries no
+/// calibration for, so the figures here are in whatever units the line hands
+/// us and keep the five decibels. They sit some 26 dB below the level of the
+/// captures and 40 dB above their silence, which is margin enough for a file;
+/// a live line will want calibrating against a known tone.
+const CARRIER_ON: f64 = 1.0e-3;
+const CARRIER_OFF: f64 = 5.62e-4;
+
+/// Rotate a first-quadrant point into `quadrant` (0 to 3, anticlockwise).
+fn rotate(point: (f64, f64), quadrant: u8) -> (f64, f64) {
+    match quadrant & 3 {
+        0 => point,
+        1 => (-point.1, point.0),
+        2 => (-point.0, -point.1),
+        _ => (point.1, -point.0),
+    }
+}
+
+/// Which quadrant a point lies in.
+fn quadrant_of(point: (f64, f64)) -> u8 {
+    match (point.0 >= 0.0, point.1 >= 0.0) {
+        (true, true) => 0,
+        (false, true) => 1,
+        (false, false) => 2,
+        (true, false) => 3,
+    }
+}
+
+/// The self-synchronising scrambler of V.22bis 5.1.
+///
+/// A single polynomial, 1 + x^-14 + x^-17, serves both directions. V.22 and
+/// V.22bis differ from V.26ter and V.32 here, which use a different polynomial
+/// at each end.
+#[derive(Debug, Clone, Default)]
+pub struct Scrambler {
+    register: u32,
+    /// Consecutive ones seen at the output.
+    ones: u32,
+}
+
+impl Scrambler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Scramble one bit. `Ds = Di + Ds(n-14) + Ds(n-17)`, modulo 2.
+    pub fn scramble(&mut self, bit: bool) -> bool {
+        // V.22bis 5.1: sixty-four consecutive ones at the output invert the
+        // next input, which stops a lock-up being read as a remote loop request.
+        let input = bit ^ (self.ones >= 64);
+        if self.ones >= 64 {
+            self.ones = 0;
+        }
+        let feedback = ((self.register >> 13) ^ (self.register >> 16)) & 1;
+        let out = input ^ (feedback != 0);
+        self.register = (self.register << 1) | u32::from(out);
+        self.count(out);
+        out
+    }
+
+    /// Descramble one bit. `Do = Ds + Ds(n-14) + Ds(n-17)`, modulo 2.
+    pub fn descramble(&mut self, bit: bool) -> bool {
+        let feedback = ((self.register >> 13) ^ (self.register >> 16)) & 1;
+        let out = bit ^ (feedback != 0);
+        self.register = (self.register << 1) | u32::from(bit);
+
+        // The detector watches the scrambled stream, which is identical at both
+        // ends. The counter must be reset *before* the current bit is counted,
+        // exactly as the scrambler does: resetting afterwards discards this
+        // bit's contribution at one end but not the other, and the two counters
+        // then drift apart and invert at different places.
+        let inverted = self.ones >= 64;
+        if inverted {
+            self.ones = 0;
+        }
+        self.count(bit);
+        if inverted { !out } else { out }
+    }
+
+    fn count(&mut self, bit: bool) {
+        if bit {
+            self.ones += 1;
+        } else {
+            self.ones = 0;
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.register = 0;
+        self.ones = 0;
+    }
+}
+
+/// What the transmitter puts on the line when it has no data to send.
+///
+/// The handshake of V.22bis 6.3.1 is conducted entirely in these: neither
+/// modem sends anything resembling data until it is over, and each recognises
+/// what the other can do purely by which of them it hears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Signal {
+    /// Nothing at all. The calling modem begins here and stays silent until
+    /// it has heard the answering modem (6.3.1.1.1 a).
+    Silent,
+    /// The answering tone of V.25, 2100 Hz.
+    AnswerTone,
+    /// Binary 1 with the scrambler bypassed. Every dibit is 11, so the
+    /// constellation turns 270 degrees each symbol and the line carries a
+    /// single tone 150 Hz below the carrier.
+    UnscrambledOnes,
+    /// The repetitive double dibit of 00 and 11 (6.3.1.1.1 b), which is how a
+    /// modem says it can work at 2400. A V.22 modem, which cannot, never sends
+    /// it and does not look for it.
+    DoubleDibit,
+    /// Scrambled binary 1: what fills the line for the last part of the
+    /// handshake, and between one byte of data and the next.
+    #[default]
+    ScrambledOnes,
+}
+
+/// Frequency of the V.25 answering tone.
+pub const ANSWER_TONE: f64 = 2100.0;
+
+/// V.22bis transmitter.
+///
+/// The pulse is evaluated at arbitrary offsets rather than read from a tap
+/// table, because the sample rate need not be a whole multiple of 600 baud.
+#[derive(Debug)]
+pub struct Transmitter {
+    fs: f64,
+    carrier: f64,
+    rate: Rate,
+    nco: Nco,
+    scrambler: Scrambler,
+    quadrant: u8,
+    /// Symbols still contributing to the pulse, oldest first.
+    history: Vec<(f64, f64)>,
+    /// Position within the current symbol period, in symbols.
+    phase: f64,
+    pending: Vec<bool>,
+    /// What to send when nothing is queued.
+    signal: Signal,
+    /// Generator for the answering tone, which does not go through the
+    /// modulator at all.
+    answer: Nco,
+    /// Alternates the two halves of the double dibit pattern.
+    dibit_high: bool,
+}
+
+impl Transmitter {
+    pub fn new(channel: Channel, fs: f64) -> Self {
+        Self::at_rate(channel, Rate::Bps2400, fs)
+    }
+
+    pub fn at_rate(channel: Channel, rate: Rate, fs: f64) -> Self {
+        let carrier = channel.transmit_carrier();
+        Self {
+            fs,
+            carrier,
+            rate,
+            nco: Nco::new(carrier, fs),
+            scrambler: Scrambler::new(),
+            // V.22bis encodes a change of quadrant, so any starting quadrant
+            // works as long as the receiver also tracks changes.
+            quadrant: 0,
+            history: vec![(0.0, 0.0); 2 * SPAN + 1],
+            phase: 0.0,
+            pending: Vec::new(),
+            signal: Signal::default(),
+            answer: Nco::new(ANSWER_TONE, fs),
+            dibit_high: false,
+        }
+    }
+
+    /// What to send when nothing is queued.
+    pub fn set_signal(&mut self, signal: Signal) {
+        self.signal = signal;
+    }
+
+    pub fn signal(&self) -> Signal {
+        self.signal
+    }
+
+    pub fn rate(&self) -> Rate {
+        self.rate
+    }
+
+    /// Change signalling rate part way through, as the handshake does.
+    pub fn set_rate(&mut self, rate: Rate) {
+        self.rate = rate;
+    }
+
+    pub fn carrier(&self) -> f64 {
+        self.carrier
+    }
+
+    /// Queue bits for transmission, most significant first within each byte.
+    pub fn push_bits(&mut self, bits: &[bool]) {
+        self.pending.extend_from_slice(bits);
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            for i in (0..8).rev() {
+                self.pending.push(b & (1 << i) != 0);
+            }
+        }
+    }
+
+    /// Map the next dibit or quadbit to a constellation point
+    /// (V.22bis 2.5.2.1 and 2.5.2.2).
+    fn next_symbol(&mut self) -> (f64, f64) {
+        let mut bits = [false; 4];
+        // The two unscrambled signals are patterns of dibits rather than of
+        // data, so they go round the scrambler rather than through it. Its
+        // state does not advance either: nothing has been scrambled.
+        let unscrambled = self.pending.is_empty()
+            && matches!(self.signal, Signal::UnscrambledOnes | Signal::DoubleDibit);
+        if unscrambled {
+            let dibit = match self.signal {
+                // Binary 1 is the dibit 11 throughout.
+                Signal::UnscrambledOnes => 0b11,
+                // Alternating 00 and 11 (6.3.1.1.1 b).
+                _ => {
+                    self.dibit_high = !self.dibit_high;
+                    if self.dibit_high { 0b11 } else { 0b00 }
+                }
+            };
+            bits[0] = dibit & 0b10 != 0;
+            bits[1] = dibit & 0b01 != 0;
+        } else {
+            for slot in bits.iter_mut().take(self.rate.bits_per_symbol()) {
+                let bit = if self.pending.is_empty() {
+                    // Idle fills with ones, which is what the last part of the
+                    // handshake sends and what keeps a data connection up.
+                    true
+                } else {
+                    self.pending.remove(0)
+                };
+                *slot = self.scrambler.scramble(bit);
+            }
+        }
+        let change = QUADRANT_CHANGE[usize::from(bits[0]) << 1 | usize::from(bits[1])];
+        self.quadrant = (self.quadrant + change) & 3;
+        let index = match self.rate {
+            // At 1200 the point is fixed and only the quadrant carries data.
+            Rate::Bps1200 => V22_POINT,
+            // So it is for the unscrambled patterns, which are always sent at
+            // 1200 whatever rate the connection is heading for.
+            Rate::Bps2400 if unscrambled => V22_POINT,
+            Rate::Bps2400 => usize::from(bits[2]) << 1 | usize::from(bits[3]),
+        };
+        rotate(QUADRANT_POINTS[index], self.quadrant)
+    }
+
+    /// Produce one line sample.
+    pub fn next_sample(&mut self) -> f64 {
+        // Two of the signals are not modulation at all.
+        if self.pending.is_empty() {
+            match self.signal {
+                Signal::Silent => return 0.0,
+                Signal::AnswerTone => {
+                    let (cos, _) = self.answer.step();
+                    // At the same power as the constellation carries, so a
+                    // level detector reads the two alike.
+                    return cos;
+                }
+                _ => {}
+            }
+        }
+        // Advance the symbol clock, pulling a new symbol when it wraps.
+        self.phase += BAUD / self.fs;
+        while self.phase >= 1.0 {
+            self.phase -= 1.0;
+            self.history.remove(0);
+            let symbol = self.next_symbol();
+            self.history.push(symbol);
+        }
+
+        // Sum the shaped contributions of every symbol still in range.
+        //
+        // Output runs SPAN symbols behind the newest symbol so the pulse can be
+        // centred on data that has already arrived. The offset must *grow* with
+        // the phase within a symbol: when the phase wraps and the history
+        // shifts, the two changes cancel and each symbol's offset advances
+        // smoothly. Subtracting the phase instead makes it jump by two symbol
+        // periods at every boundary, which puts a step in the waveform and
+        // splatters energy right across the neighbouring channel.
+        let centre = SPAN as f64;
+        let mut baseband = (0.0, 0.0);
+        for (i, &(re, im)) in self.history.iter().enumerate() {
+            let offset = self.phase + centre - i as f64;
+            let tap = rrc_at(offset, ROLLOFF);
+            baseband.0 += re * tap;
+            baseband.1 += im * tap;
+        }
+
+        // Up-convert: the real part of the baseband times the carrier phasor.
+        let (cos, sin) = self.nco.step();
+        (baseband.0 * cos - baseband.1 * sin) / CONSTELLATION_RMS
+    }
+
+    pub fn pending_bits(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+/// What the receiver hears, in the terms the handshake is conducted in.
+///
+/// Detection works on the quadrant changes rather than on the waveform,
+/// because that is where the difference actually lives. Unscrambled binary 1
+/// turns the same way every symbol; the double dibit alternates between two
+/// turns; scrambled binary 1 turns unpredictably but descrambles back to ones.
+///
+/// The last two cannot be told apart by their descrambled output alone. A
+/// self-synchronising descrambler adds a bit to two of its predecessors, so a
+/// stream of ones that never went through a scrambler comes out as ones just
+/// the same. Only the raw turns separate them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pattern {
+    /// Nothing recognised, which includes data.
+    None,
+    UnscrambledOnes,
+    DoubleDibit,
+    ScrambledOnes,
+}
+
+/// Symbols a pattern must hold for before it is believed.
+///
+/// The shortest thing the handshake has to measure is the 100 ms of double
+/// dibit in 6.3.1.1.1 b), which is 60 symbols at 600 baud. A twelfth of that
+/// is short enough to see it and long enough that data does not imitate it:
+/// five turns of scrambled data agreeing by chance is a one in a thousand
+/// event, and it has to survive being asked again.
+const PATTERN_SYMBOLS: u32 = 5;
+
+/// Symbols of no turn at all before the symbol clock is judged half out.
+///
+/// Nothing in 6.3.1 sends the same point twice in a row for any length of
+/// time: the answering modem's signal is unscrambled binary 1, which is a turn
+/// of 270 degrees every symbol, and the double dibit that offers 2400
+/// alternates 90 and 270. A run of no turn at all is not a V.22bis handshake
+/// signal, and there is exactly one thing it is.
+///
+/// The double dibit alternates between two points a quarter turn apart, so its
+/// midpoints are all the same point -- sample there and every symbol reads
+/// identical and the turn reads zero. It is a stable place for a timing loop
+/// to sit, and nothing before it can tell: unscrambled binary 1 is a pure tone
+/// and reads the same turn wherever it is sampled, so a clock can be half a
+/// symbol out for the whole of the answering modem's signal and give no sign.
+///
+/// This is the sign, and it costs the connection its rate. On a real call the
+/// far end offered 2400 for 135 milliseconds and the receiver read
+/// `0000000000...` throughout, saw no offer, and settled at 1200 on a line
+/// that had just carried the offer at eighteen decibels. Eight symbols is
+/// thirteen milliseconds, which leaves the rest of the offer to read once the
+/// clock has been moved.
+const NO_TURN_RUN: u32 = 8;
+
+/// V.22bis receiver.
+#[derive(Debug)]
+pub struct Receiver {
+    nco: Nco,
+    /// Channel selection, applied at baseband after downconversion.
+    select: ComplexFir,
+    matched: ComplexFir,
+    gardner: Gardner,
+    /// Samples until the next timing instant.
+    countdown: f64,
+    /// Previous matched-filter output, for interpolating between samples.
+    previous_filtered: (f64, f64),
+    /// Carrier phase correction, in turns.
+    phase: f64,
+    frequency: f64,
+    agc: OnePole,
+    equalizer: Equalizer,
+    /// Symbols seen since a carrier appeared, so that adaptation can wait for
+    /// the other loops to settle on it.
+    ///
+    /// Since the carrier, not since the receiver was made. Those are the same
+    /// thing only on a line that was already carrying a signal when the modem
+    /// was switched on, and no call has ever begun that way: a call begins
+    /// with an answer tone, a pause, and a handshake, and by the time the far
+    /// end's carrier arrives a counter started at construction has run out
+    /// many times over. Which left the equaliser adapting through exactly the
+    /// transient the counter exists to protect it from.
+    since_carrier: u64,
+    quadrant: Option<u8>,
+    /// Rate in use, once enough symbols have been seen to tell.
+    rate: Rate,
+    /// Symbols seen since the rate was last judged, and the first two moments
+    /// of their power, which is what tells the two rates apart.
+    decisions: u32,
+    power_sum: f64,
+    power_squared_sum: f64,
+    descrambler: Scrambler,
+    bits: Vec<bool>,
+    last_symbol: (f64, f64),
+    last_error: f64,
+    level: OnePole,
+    /// Whether a carrier is present, with hysteresis.
+    carrier: bool,
+    /// Runs of each handshake signal, in symbols.
+    unscrambled_run: u32,
+    /// Consecutive symbols with no phase change at all.
+    zero_run: u32,
+    dibit_run: u32,
+    scrambled_run: u32,
+    previous_change: u8,
+}
+
+impl Receiver {
+    pub fn new(channel: Channel, fs: f64) -> Self {
+        let carrier = channel.receive_carrier();
+        let sps = fs / BAUD;
+        // Channel selection happens at baseband, with a linear-phase filter.
+        //
+        // The two directions very nearly abut: the low channel reaches 1725 Hz
+        // and the high one starts at 1875. An earlier attempt used a steep
+        // Butterworth on the passband and made matters worse, which was read at
+        // the time as selectivity costing more than it bought. That was the
+        // wrong conclusion: the fault was not steepness but phase. A
+        // Butterworth delays different frequencies by different amounts and
+        // smears the pulse, while a symmetric finite impulse response delays
+        // them all equally and can be as sharp as wanted.
+        //
+        // Applying one real tap set to both parts of the complex signal gives a
+        // response symmetric about zero, so a low-pass here is a band-pass
+        // about the carrier, which is what a double-sideband signal wants.
+        //
+        // Four hundred taps put the passband edge at 525 Hz within a hundredth
+        // of a decibel and hold the whole of the other channel, which begins at
+        // 675 Hz once downconverted, at least 55 dB down. Measured end to end
+        // against a transmitter of our own it rejects 67 dB, and that is the
+        // number that matters here. A real modem has a hybrid, which separates
+        // the two directions by ten or twenty decibels before its filter sees
+        // them. Written to a virtual cable there is no hybrid at all: what goes
+        // out comes back at full strength, in the channel this end is not
+        // listening to, and this filter is the only thing standing between the
+        // two.
+        //
+        // Sixty-seven decibels is enough, and was measured to be enough rather
+        // than assumed to be. A Kaiser-windowed design asking for ninety was
+        // tried here -- six hundred taps, and dsp::fir_lowpass_kaiser remains
+        // if it is ever wanted -- and changed nothing at any level our own
+        // transmit actually comes back at. It only began to help once that was
+        // twelve decibels louder than the far end, which is not a line, it is a
+        // fault. What it did do was cost two frames of a recorded call. So it
+        // is not here.
+        //
+        // The twelve milliseconds of delay four hundred taps costs sits in no
+        // feedback loop.
+        Self {
+            nco: Nco::new(carrier, fs),
+            select: ComplexFir::new(fir_lowpass(600.0, 401, fs)),
+            matched: ComplexFir::new(rrc_taps(sps, ROLLOFF, SPAN)),
+            // The timing loop has to *acquire*, not merely track. An earlier
+            // gain of 0.005 could shift the sampling instant by five
+            // thousandths of a sample per symbol, so over a whole call it
+            // never travelled the half symbol that separates the worst
+            // starting phase from the right one. It sampled wherever the group
+            // delay of the filters ahead of it happened to land, and passed
+            // its tests only because that guess was lucky. This gain crosses a
+            // half symbol in a few tens of symbols.
+            gardner: Gardner::new(sps, 0.1),
+            countdown: sps / 2.0,
+            previous_filtered: (0.0, 0.0),
+            phase: 0.0,
+            frequency: 0.0,
+            // Started at the target so the first symbols do not see a
+            // division by nearly zero.
+            agc: OnePole::starting_at(CONSTELLATION_MEAN_POWER, 0.050, fs / sps),
+            // Fed unit-power symbols, so the textbook constant-modulus target
+            // applies unchanged. Its gradient goes as the cube of the
+            // magnitude, so handing it the raw scale where mean power is ten
+            // would make every update a thousand times too large.
+            equalizer: Equalizer::new(21, 1.32),
+            since_carrier: 0,
+            quadrant: None,
+            // Assume the faster rate and fall back once the constellation
+            // says otherwise.
+            rate: Rate::Bps2400,
+            decisions: 0,
+            power_sum: 0.0,
+            power_squared_sum: 0.0,
+            descrambler: Scrambler::new(),
+            bits: Vec::new(),
+            last_symbol: (0.0, 0.0),
+            last_error: 0.0,
+            level: OnePole::new(0.020, fs),
+            carrier: false,
+            unscrambled_run: 0,
+            zero_run: 0,
+            dibit_run: 0,
+            scrambled_run: 0,
+            previous_change: 4,
+        }
+    }
+
+    /// Feed one line sample. Recovered bits accumulate; drain with `take_bits`.
+    pub fn feed(&mut self, sample: f64) {
+        // Down-convert by the conjugate carrier, select the channel, then apply
+        // the matched root-raised-cosine.
+        //
+        // Both filters are linear phase, so the matched pair still meets the
+        // Nyquist criterion and the pulse arrives undistorted. That is what
+        // makes it safe to put real selectivity here, which an earlier
+        // Butterworth in the same position was not.
+        let (cos, sin) = self.nco.step();
+        let selected = self.select.process((sample * cos, sample * -sin));
+        let level = self
+            .level
+            .process((selected.0 * selected.0 + selected.1 * selected.1).sqrt());
+        let had_carrier = self.carrier;
+        self.carrier = if self.carrier {
+            level > CARRIER_OFF
+        } else {
+            level > CARRIER_ON
+        };
+        if self.carrier != had_carrier {
+            // The settling clock starts when there is something to settle on,
+            // and starts again when it goes away. Everything downstream is
+            // about to be handed a signal it has never seen.
+            self.since_carrier = 0;
+        }
+        let filtered = self.matched.process(selected);
+
+        let previous = std::mem::replace(&mut self.previous_filtered, filtered);
+        let before = self.countdown;
+        self.countdown -= 1.0;
+        if self.countdown > 0.0 {
+            return;
+        }
+        // The wanted instant almost never lands on a sample: 16 kHz against
+        // 600 baud is 26.67 samples per symbol. Taking the nearest sample would
+        // mistime every symbol by up to half a sample, which shows up as
+        // occasional symbol errors rather than an obvious failure. Interpolate
+        // to where the instant actually falls, `before` samples past the
+        // previous one.
+        let mu = before.clamp(0.0, 1.0);
+        let at = (
+            previous.0 + mu * (filtered.0 - previous.0),
+            previous.1 + mu * (filtered.1 - previous.1),
+        );
+        self.countdown += self.gardner.interval();
+        let Some(symbol) = self.gardner.feed(at) else { return };
+        self.on_symbol(symbol);
+    }
+
+    fn on_symbol(&mut self, symbol: (f64, f64)) {
+        // Automatic gain control on mean power, not mean magnitude: for this
+        // constellation those differ by five per cent, since the mean of the
+        // sixteen magnitudes is 2.995 while their root-mean-square is 3.162.
+        // Matching power to power keeps the decision boundaries where the
+        // slicer expects them.
+        let power = symbol.0 * symbol.0 + symbol.1 * symbol.1;
+        let mean_power = self.agc.process(power);
+        // Floored, rather than allowed to run down to nothing.
+        //
+        // A quiet line has no level to measure, and measuring it anyway gives
+        // an answer that falls towards zero with the smoothing time constant.
+        // The gain is the reciprocal, so within a second of silence it is
+        // pinned to the clamp below -- and then the first symbols of the
+        // carrier that eventually arrives are multiplied by four hundred. What
+        // the equaliser is handed at that moment is not a constellation, and it
+        // spends the rest of the call unlearning it.
+        //
+        // That was the whole of the trouble a call starting after any real
+        // pause was having, and every call starts after one: there is an answer
+        // tone, and a pause, and a handshake, long before the far end's carrier
+        // arrives.
+        //
+        // Put back where it started rather than frozen where it stopped.
+        // Freezing sounds tidier and is worse: the carrier flag flaps on a real
+        // line, and freezing hands the next moment a level measured during the
+        // last one, which cost two frames of a recorded call. Nominal is a
+        // guess, but it is the guess the receiver is built with and it is never
+        // far wrong.
+        // Bound the gain. Between calls a capture contains answer tones,
+        // silence before the carrier and silence after the hangup, and during
+        // those the mean power falls towards zero. An unbounded gain then sends
+        // the symbol to infinity, which the equaliser turns into NaN within a
+        // few symbols and never recovers from.
+        let gain = (CONSTELLATION_MEAN_POWER / mean_power.max(1e-9))
+            .sqrt()
+            .clamp(0.0, MAX_GAIN);
+
+        // Rotate by the tracked carrier phase.
+        let turn = self.phase * std::f64::consts::TAU;
+        let (c, s) = (turn.cos(), turn.sin());
+        let point = (
+            (symbol.0 * c - symbol.1 * s) * gain,
+            (symbol.0 * s + symbol.1 * c) * gain,
+        );
+        // The carrier loop works on the unequalised symbol. Putting it after
+        // the equaliser would add that filter's delay inside the loop, and a
+        // loop with ten symbols of delay in it will not stay stable.
+        let coarse = nearest_point(point, self.rate);
+        // Decision-directed phase error: the angle between what arrived and
+        // what it should have been.
+        let error = (point.1 * coarse.0 - point.0 * coarse.1)
+            / (coarse.0 * coarse.0 + coarse.1 * coarse.1 + 1e-9);
+        self.last_error = error;
+        // A second-order loop, so a residual frequency offset is also removed.
+        // V.22bis 2.6 requires tolerating up to seven hertz.
+        self.frequency += -1.5e-5 * error;
+        self.frequency = self.frequency.clamp(-0.02, 0.02);
+        self.phase += -0.008 * error + self.frequency;
+        self.phase -= self.phase.floor();
+
+        // Equalise, then slice. A real line smears the constellation far
+        // beyond what a sixteen-point decision can survive.
+        let normalized = (point.0 / CONSTELLATION_RMS, point.1 / CONSTELLATION_RMS);
+        let equalized = self.equalizer.equalize(normalized);
+        let scaled = (
+            equalized.0 * CONSTELLATION_RMS,
+            equalized.1 * CONSTELLATION_RMS,
+        );
+        let decision = nearest_point(scaled, self.rate);
+        // Hold the equaliser still until gain control and the carrier loop have
+        // settled. Adapting against the acquisition transient teaches it
+        // nonsense that it then has to unlearn.
+        self.since_carrier += 1;
+        // Nothing worth learning from silence or from a steady answer tone,
+        // and plenty to unlearn afterwards.
+        // Asked of carrier detection rather than of the mean power. It is the
+        // same question, answered by the one thing built to answer it: the
+        // power reaching here has been through gain control, whose entire
+        // purpose is to make a weak signal and a strong one look alike, so a
+        // threshold on it is a threshold on a number chosen to be constant.
+        if self.since_carrier > 64 && mean_power > SQUELCH {
+            self.equalizer.adapt(
+                equalized,
+                (
+                    decision.0 / CONSTELLATION_RMS,
+                    decision.1 / CONSTELLATION_RMS,
+                ),
+            );
+        }
+        self.last_symbol = scaled;
+
+        let quadrant = quadrant_of(decision);
+        let Some(previous) = self.quadrant.replace(quadrant) else {
+            // The first symbol only establishes a reference; a change needs two.
+            return;
+        };
+        let change = (quadrant + 4 - previous) & 3;
+        let leading = CHANGE_TO_BITS[change as usize];
+        let trailing = point_bits(decision, quadrant);
+
+        // Tell the two rates apart by where the points land. At 1200 every
+        // symbol sits on the single point V.22 uses, so the constellation shows
+        // four clusters at one radius rather than sixteen at three. Decoding a
+        // 1200 signal as though it were 2400 yields two real bits followed by
+        // two meaningless ones, which descrambles into convincing noise.
+        // Judge by radius, not by which point index was decided.
+        //
+        // With only four points in use the carrier loop has stable lock points
+        // the full constellation does not. Rotating the ring at radius root ten
+        // by 53 degrees lands it exactly on the other ring at the same radius,
+        // taking (3,1) to (1,3), and every point is still a legal constellation
+        // point so the loop is perfectly content to sit there. The quadrant is
+        // preserved, so the data decodes either way, but the point index does
+        // not survive. The radius does.
+        // Measure what arrived, not what was decided. The decision is made
+        // against whichever rate is currently believed, so judging by it lets a
+        // wrong belief confirm itself; the radius of the received point owes
+        // nothing to that belief, nor to where the carrier loop has settled,
+        // since rotating a ring does not change it. At 1200 every symbol sits
+        // on the ring at root ten. At 2400 half of the sixteen points do, and
+        // the rest are at root two or root eighteen.
+        //
+        // Take it from before the equaliser, where gain control has just set
+        // the mean power to ten and the radius means what it says. Measured
+        // after, an equaliser that has collapsed the constellation reports
+        // small radii, the rate reads as 2400, the slicer then offers sixteen
+        // points to a signal with four, and the wrong decisions keep the
+        // equaliser collapsed. The receiver had no way out of that.
+        //
+        // Judge by how much the power varies, not by how near each symbol
+        // comes to root ten. A line distorts the constellation enough that
+        // individual symbols wander well off their ring while the shape of the
+        // whole is still plain, so asking of each symbol whether it is close
+        // enough answers a harder question than the one that matters. With the
+        // mean power held at ten, a single ring contributes nothing to the
+        // variance and three rings at two, ten and eighteen contribute
+        // thirty-two before any noise at all.
+        //
+        // Only while there is something to judge. Gain control drives its
+        // output to the same mean power whether it is given a signal or the
+        // silence after a hangup, so the variance of amplified silence is a
+        // perfectly convincing measurement of nothing. Left ungated the rate
+        // shown on screen changed the moment the call ended.
+        //
+        // The condition is not really silence but resolvability: a
+        // constellation the receiver cannot resolve cannot be counted, whether
+        // it is falling apart because the carrier is going away at the end of
+        // a call or because it has not yet been acquired at the start of one.
+        // Carrier detection answers it, and answers quickly: the equaliser's
+        // running error would do as a measure of resolvability but it is an
+        // average a hundred symbols long, and a carrier goes away in thirty.
+        // Judged by that, the last thing a call did before ending was change
+        // its rate.
+        //
+        // Throw away a part-gathered window rather than carrying it across the
+        // gap, since half a window of a call ending and half of the next one
+        // beginning describes neither.
+        let magnitude_squared = point.0 * point.0 + point.1 * point.1;
+        if self.carrier {
+            self.decisions += 1;
+            self.power_sum += magnitude_squared;
+            self.power_squared_sum += magnitude_squared * magnitude_squared;
+        } else {
+            self.decisions = 0;
+            self.power_sum = 0.0;
+            self.power_squared_sum = 0.0;
+        }
+        if self.decisions >= 128 {
+            let n = f64::from(self.decisions);
+            let mean = self.power_sum / n;
+            let variance = (self.power_squared_sum / n - mean * mean).max(0.0);
+            // Relative to the mean power, so nothing depends on the scale.
+            // A single ring measures about a tenth on a real line; three rings
+            // measure a third before noise widens them further.
+            self.rate = if variance < 0.16 * mean * mean {
+                Rate::Bps1200
+            } else {
+                Rate::Bps2400
+            };
+            self.decisions = 0;
+            self.power_sum = 0.0;
+            self.power_squared_sum = 0.0;
+        }
+
+        let all = [
+            leading & 0b10 != 0,
+            leading & 0b01 != 0,
+            trailing & 0b10 != 0,
+            trailing & 0b01 != 0,
+        ];
+
+        // Handshake signals, recognised from the turn just made.
+        //
+        // Unscrambled binary 1 is the dibit 11 every time, which is a turn of
+        // 270 degrees; the double dibit alternates 00 and 11, which alternates
+        // turns of 90 and 270. Both are sent at 1200 whatever rate is being
+        // negotiated, so only the leading dibit is ever looked at.
+        self.unscrambled_run = if change == 3 { self.unscrambled_run + 1 } else { 0 };
+        self.zero_run = if change == 0 { self.zero_run + 1 } else { 0 };
+        let alternating = change != self.previous_change
+            && (change == 1 || change == 3)
+            && (self.previous_change == 1 || self.previous_change == 3);
+        self.dibit_run = if alternating { self.dibit_run + 1 } else { 0 };
+        self.previous_change = change;
+
+        for &bit in all.iter().take(self.rate.bits_per_symbol()) {
+            let out = self.descrambler.descramble(bit);
+            self.scrambled_run = if out { self.scrambled_run + 1 } else { 0 };
+            self.bits.push(out);
+        }
+    }
+
+    /// Take the bits recovered so far.
+    pub fn take_bits(&mut self) -> Vec<bool> {
+        std::mem::take(&mut self.bits)
+    }
+
+    /// Take whole octets, most significant bit first, leaving any remainder.
+    pub fn take_bytes(&mut self) -> Vec<u8> {
+        let whole = self.bits.len() / 8;
+        let bits: Vec<bool> = self.bits.drain(..whole * 8).collect();
+        bits.as_chunks::<8>().0.iter()
+            .map(|c| c.iter().fold(0u8, |acc, &b| (acc << 1) | u8::from(b)))
+            .collect()
+    }
+
+    /// The most recent equalised symbol, for a constellation display.
+    pub fn constellation_point(&self) -> (f64, f64) {
+        (
+            self.last_symbol.0 / CONSTELLATION_RMS,
+            self.last_symbol.1 / CONSTELLATION_RMS,
+        )
+    }
+
+    /// Residual carrier phase error, as a measure of lock quality.
+    pub fn phase_error(&self) -> f64 {
+        self.last_error
+    }
+
+    /// Mean distance between equalised symbols and their decisions. Small means
+    /// a clean, well-equalised constellation.
+    /// Fix the signalling rate, when something else knows it.
+    ///
+    /// The handshake does: it negotiated the thing. Left to itself the
+    /// receiver works the rate out from the shape of the constellation, which
+    /// is what a recording of somebody else's call demands but is slower and
+    /// less certain than being told.
+    pub fn set_rate(&mut self, rate: Rate) {
+        self.rate = rate;
+        self.decisions = 0;
+        self.power_sum = 0.0;
+        self.power_squared_sum = 0.0;
+    }
+
+    /// Which handshake signal is on the line, if any.
+    ///
+    /// Unscrambled binary 1 is reported ahead of scrambled, because it also
+    /// descrambles to ones and the raw turns are what distinguish it.
+    pub fn pattern(&self) -> Pattern {
+        if !self.carrier {
+            Pattern::None
+        } else if self.unscrambled_run >= PATTERN_SYMBOLS {
+            Pattern::UnscrambledOnes
+        } else if self.dibit_run >= PATTERN_SYMBOLS {
+            Pattern::DoubleDibit
+        } else if self.scrambled_run >= PATTERN_SYMBOLS * 2 {
+            Pattern::ScrambledOnes
+        } else {
+            Pattern::None
+        }
+    }
+
+    /// Whether the symbol clock has settled half a symbol away from the truth.
+    ///
+    /// See [`NO_TURN_RUN`]. Only meaningful during the handshake, which is why
+    /// acting on it is left to the thing that knows the handshake is still
+    /// going: scrambled data turns by nothing a quarter of the time, and a run
+    /// of eight comes up about once a minute at 600 baud, which would be a
+    /// receiver that threw its own timing away twice an hour of a call.
+    pub fn half_symbol_out(&self) -> bool {
+        self.carrier && self.zero_run >= NO_TURN_RUN
+    }
+
+    /// Push the sampling instant half a symbol on, and start the run again.
+    ///
+    /// A kick rather than a correction, and deliberately so. The midpoint of
+    /// an alternation is a *stable* place for this timing loop to sit -- the
+    /// error it measures is zero there, exactly as it is at the right instant
+    /// -- so nothing it does on its own will leave. Delaying the next sample
+    /// puts it somewhere the error is not zero and lets it converge again,
+    /// and repeating that while the turns stay flat is what gets it out.
+    ///
+    /// Relabelling the loop's midpoints as its symbols was tried first, which
+    /// is the exact half-symbol move and disturbs nothing. It is worse: an
+    /// exact move to the other stable point is still a move between two stable
+    /// points, and on the recording this came from it left one call in ten at
+    /// the wrong rate where this leaves none.
+    pub fn shift_half_symbol(&mut self) {
+        self.countdown += self.gardner.samples_per_symbol() / 2.0;
+        self.zero_run = 0;
+    }
+
+    /// Whether a carrier is present (V.22bis 6.5.2).
+    pub fn carrier(&self) -> bool {
+        self.carrier
+    }
+
+    pub fn residual_error(&self) -> f64 {
+        self.equalizer.error()
+    }
+
+    /// True while the equaliser is still adapting blind.
+    pub fn equalizer_blind(&self) -> bool {
+        self.equalizer.is_blind()
+    }
+
+    /// The signalling rate the constellation says is in use.
+    pub fn rate(&self) -> Rate {
+        self.rate
+    }
+
+    pub fn level(&self) -> f64 {
+        self.level.value()
+    }
+
+    /// Carrier loop state, for diagnostics.
+    #[doc(hidden)]
+    pub fn loop_state(&self) -> (f64, f64, f64) {
+        (self.phase, self.frequency, self.gardner.error())
+    }
+}
+
+/// The constellation point nearest `p`.
+fn nearest_point(p: (f64, f64), rate: Rate) -> (f64, f64) {
+    match rate {
+        // At 1200 bit/s only four points are ever sent, one to a quadrant, and
+        // the slicer has to know that. Offered all sixteen it will decide
+        // points that were never transmitted, and since the carrier loop takes
+        // its error from that decision it then has somewhere false to settle:
+        // the ring at radius root ten can be rotated onto itself, and the
+        // points at radius root two and root eighteen sit either side of the
+        // real one at an angle it can also sit at. On a real call the
+        // constellation came out doubled, every point split into a pair the
+        // loop dithered between, and the equaliser went on to adapt against
+        // decisions that were wrong half the time.
+        Rate::Bps1200 => {
+            // The four points are (3,1) turned into each quadrant, so their
+            // boundaries fall 45 degrees away from each: turn the point by
+            // that much and the ordinary quadrant test applies.
+            const COS: f64 = 2.0 / SQRT_5;
+            const SIN: f64 = 1.0 / SQRT_5;
+            let turned = (p.0 * COS - p.1 * SIN, p.0 * SIN + p.1 * COS);
+            rotate(QUADRANT_POINTS[V22_POINT], quadrant_of(turned))
+        }
+        // The sixteen points are the odd coordinates from -3 to 3, so rounding
+        // to the nearest odd value in each axis finds the closest without a
+        // search.
+        Rate::Bps2400 => {
+            let snap = |v: f64| {
+                let odd = ((v - 1.0) / 2.0).round() * 2.0 + 1.0;
+                odd.clamp(-3.0, 3.0)
+            };
+            (snap(p.0), snap(p.1))
+        }
+    }
+}
+
+/// Root of five, for turning a point by the angle of (2,1).
+const SQRT_5: f64 = 2.236_067_977_499_79;
+
+/// Recover the last two bits of a quadbit from a decided point.
+fn point_bits(point: (f64, f64), quadrant: u8) -> u8 {
+    // Rotate back to the first quadrant, then match against the four points.
+    let base = rotate(point, (4 - quadrant) & 3);
+    let mut best = 0usize;
+    let mut best_distance = f64::MAX;
+    for (i, &(x, y)) in QUADRANT_POINTS.iter().enumerate() {
+        let d = (base.0 - x).powi(2) + (base.1 - y).powi(2);
+        if d < best_distance {
+            best_distance = d;
+            best = i;
+        }
+    }
+    best as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+
+    #[test]
+    fn the_channels_face_each_other() {
+        assert_eq!(Channel::Calling.transmit_carrier(), CARRIER_LOW);
+        assert_eq!(Channel::Calling.receive_carrier(), CARRIER_HIGH);
+        assert_eq!(Channel::Answering.transmit_carrier(), CARRIER_HIGH);
+        assert_eq!(Channel::Answering.receive_carrier(), CARRIER_LOW);
+    }
+
+    #[test]
+    fn the_quadrant_changes_match_table_1() {
+        // 00 turns by one quadrant, 01 stays, 10 turns by two, 11 by three.
+        assert_eq!(QUADRANT_CHANGE[0b00], 1);
+        assert_eq!(QUADRANT_CHANGE[0b01], 0);
+        assert_eq!(QUADRANT_CHANGE[0b10], 2);
+        assert_eq!(QUADRANT_CHANGE[0b11], 3);
+        // And the inverse agrees.
+        for (bits, &change) in QUADRANT_CHANGE.iter().enumerate() {
+            assert_eq!(CHANGE_TO_BITS[change as usize], bits as u8);
+        }
+    }
+
+    #[test]
+    fn the_constellation_matches_figure_2() {
+        assert_eq!(QUADRANT_POINTS[0b00], (1.0, 1.0));
+        assert_eq!(QUADRANT_POINTS[0b01], (3.0, 1.0));
+        assert_eq!(QUADRANT_POINTS[0b10], (1.0, 3.0));
+        assert_eq!(QUADRANT_POINTS[0b11], (3.0, 3.0));
+    }
+
+    #[test]
+    fn the_v22_compatibility_point_carries_the_average_power() {
+        // V.22bis 2.5.2.2 nominates 01 for 1200 bit/s. Its magnitude is the
+        // root-mean-square of the whole constellation, so the slower signal has
+        // the same average power as the faster one.
+        let (x, y) = QUADRANT_POINTS[0b01];
+        let magnitude = (x * x + y * y).sqrt();
+        let mut sum = 0.0;
+        for q in 0..4u8 {
+            for p in QUADRANT_POINTS {
+                let r = rotate(p, q);
+                sum += r.0 * r.0 + r.1 * r.1;
+            }
+        }
+        let rms = (sum / 16.0).sqrt();
+        assert!((magnitude - rms).abs() < 1e-12, "{magnitude} against {rms}");
+        assert!((rms - CONSTELLATION_RMS).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rotation_walks_the_quadrants() {
+        let p = (1.0, 3.0);
+        assert_eq!(rotate(p, 0), (1.0, 3.0));
+        assert_eq!(rotate(p, 1), (-3.0, 1.0));
+        assert_eq!(rotate(p, 2), (-1.0, -3.0));
+        assert_eq!(rotate(p, 3), (3.0, -1.0));
+        assert_eq!(quadrant_of(rotate(p, 1)), 1);
+        assert_eq!(quadrant_of(rotate(p, 3)), 3);
+    }
+
+    #[test]
+    fn every_constellation_point_decodes_to_its_own_bits() {
+        for quadrant in 0..4u8 {
+            for (bits, &base) in QUADRANT_POINTS.iter().enumerate() {
+                let point = rotate(base, quadrant);
+                assert_eq!(quadrant_of(point), quadrant);
+                assert_eq!(point_bits(point, quadrant), bits as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn slicing_snaps_to_the_nearest_point() {
+        let at = |p| nearest_point(p, Rate::Bps2400);
+        assert_eq!(at((0.9, 1.1)), (1.0, 1.0));
+        assert_eq!(at((2.7, -3.4)), (3.0, -3.0));
+        assert_eq!(at((-1.2, 2.6)), (-1.0, 3.0));
+        // Beyond the constellation, clamp rather than run away.
+        assert_eq!(at((9.0, -9.0)), (3.0, -3.0));
+    }
+
+    /// Squared magnitude of the point V.22 uses, which is also the
+    /// constellation's mean power. Eight of the sixteen points share it:
+    /// (3,1), (1,3) and their rotations.
+    const V22_MAGNITUDE_SQUARED: f64 = 10.0;
+
+    /// Send one signal for `ms` and report what the far end made of it.
+    fn hear(signal: Signal, rate: Rate, ms: f64) -> Pattern {
+        let fs = 16_000.0;
+        let mut tx = Transmitter::at_rate(Channel::Calling, rate, fs);
+        let mut rx = Receiver::new(Channel::Answering, fs);
+        tx.set_signal(signal);
+        for _ in 0..(fs * ms / 1000.0) as usize {
+            rx.feed(tx.next_sample());
+        }
+        rx.pattern()
+    }
+
+    #[test]
+    fn each_handshake_signal_is_recognised_for_what_it_is() {
+        // Long enough to acquire and then hold: the handshake never asks about
+        // anything shorter than the 100 ms double dibit.
+        for rate in [Rate::Bps1200, Rate::Bps2400] {
+            assert_eq!(
+                hear(Signal::UnscrambledOnes, rate, 500.0),
+                Pattern::UnscrambledOnes,
+                "unscrambled ones at {rate:?}"
+            );
+            assert_eq!(
+                hear(Signal::DoubleDibit, rate, 500.0),
+                Pattern::DoubleDibit,
+                "double dibit at {rate:?}"
+            );
+            assert_eq!(
+                hear(Signal::ScrambledOnes, rate, 500.0),
+                Pattern::ScrambledOnes,
+                "scrambled ones at {rate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn silence_is_not_mistaken_for_a_signal() {
+        assert_eq!(hear(Signal::Silent, Rate::Bps1200, 500.0), Pattern::None);
+    }
+
+    #[test]
+    fn unscrambled_ones_are_not_reported_as_scrambled() {
+        // They descramble to ones as well, so only the turns separate them.
+        // Reporting the wrong one would have the calling modem believe the
+        // handshake was further along than it is.
+        assert_eq!(
+            hear(Signal::UnscrambledOnes, Rate::Bps1200, 500.0),
+            Pattern::UnscrambledOnes
+        );
+    }
+
+    #[test]
+    fn the_answer_tone_is_at_2100_hertz() {
+        let fs = 16_000.0;
+        let mut tx = Transmitter::new(Channel::Answering, fs);
+        tx.set_signal(Signal::AnswerTone);
+        let n = 16_000usize;
+        let samples: Vec<f64> = (0..n).map(|_| tx.next_sample()).collect();
+        let at = |f: f64| {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, &s) in samples.iter().enumerate() {
+                let w = std::f64::consts::TAU * f * i as f64 / fs;
+                re += s * w.cos();
+                im -= s * w.sin();
+            }
+            (re * re + im * im).sqrt() / n as f64
+        };
+        let wanted = at(ANSWER_TONE);
+        for other in [1800.0, 2000.0, 2200.0, 2400.0] {
+            assert!(
+                at(other) < wanted / 100.0,
+                "{other} Hz carries {:.4} against {wanted:.4} at the answer tone",
+                at(other)
+            );
+        }
+    }
+
+    #[test]
+    fn the_carrier_detector_follows_the_signal_and_holds_between() {
+        let fs = 16_000.0;
+        let mut tx = Transmitter::new(Channel::Calling, fs);
+        let mut rx = Receiver::new(Channel::Answering, fs);
+        tx.push_bytes(&[0x55; 200]);
+
+        assert!(!rx.carrier(), "carrier claimed before anything arrived");
+        for _ in 0..(fs as usize / 5) {
+            rx.feed(tx.next_sample());
+        }
+        assert!(rx.carrier(), "carrier not detected while one is present");
+
+        // Silence, and it goes away again rather than latching.
+        for _ in 0..(fs as usize / 5) {
+            rx.feed(0.0);
+        }
+        assert!(!rx.carrier(), "carrier still claimed after the line went quiet");
+    }
+
+    #[test]
+    fn the_carrier_detector_does_not_chatter_at_its_threshold() {
+        // Five decibels of hysteresis, so a signal sitting on the boundary
+        // holds whichever state it is in rather than flickering.
+        let fs = 16_000.0;
+        let mut tx = Transmitter::new(Channel::Calling, fs);
+        let mut rx = Receiver::new(Channel::Answering, fs);
+        tx.push_bytes(&[0x55; 400]);
+        for _ in 0..(fs as usize / 5) {
+            rx.feed(tx.next_sample());
+        }
+        assert!(rx.carrier());
+
+        // Between the two thresholds: too quiet to acquire, loud enough to hold.
+        let between = (CARRIER_ON + CARRIER_OFF) / 2.0;
+        let scale = between / rx.level();
+        for _ in 0..(fs as usize / 5) {
+            rx.feed(tx.next_sample() * scale);
+        }
+        assert!(rx.carrier(), "dropped a carrier still above the lower threshold");
+    }
+
+    #[test]
+    fn slicing_at_1200_only_offers_the_four_points_in_use() {
+        let at = |p| nearest_point(p, Rate::Bps1200);
+        // The point itself, and each of its turns into the other quadrants.
+        for quadrant in 0..4 {
+            let point = rotate(QUADRANT_POINTS[V22_POINT], quadrant);
+            assert_eq!(at(point), point, "quadrant {quadrant}");
+            // Nudged, and still decided the same way.
+            assert_eq!(at((point.0 * 0.8, point.1 * 1.3)), point);
+        }
+        // Points a 2400 slicer would have chosen are never returned, however
+        // close the arriving symbol comes to them.
+        for probe in [(1.0, 1.0), (3.0, 3.0), (1.0, 3.0), (-3.0, -3.0)] {
+            let decided = at(probe);
+            let magnitude = decided.0 * decided.0 + decided.1 * decided.1;
+            assert!(
+                (magnitude - V22_MAGNITUDE_SQUARED).abs() < 1e-9,
+                "{probe:?} decided as {decided:?}, off the ring at root ten"
+            );
+        }
+        // The boundary sits midway between neighbouring points, 45 degrees
+        // from each, not on the axes.
+        assert_eq!(at((3.0, 1.0)), (3.0, 1.0));
+        assert_eq!(at((0.5, 3.0)), rotate(QUADRANT_POINTS[V22_POINT], 1));
+    }
+
+    #[test]
+    fn the_scrambler_is_self_inverse() {
+        let mut tx = Scrambler::new();
+        let mut rx = Scrambler::new();
+        let input: Vec<bool> = (0..2000).map(|i| (i * 37 + 11) % 5 < 2).collect();
+        let recovered: Vec<bool> = input
+            .iter()
+            .map(|&b| rx.descramble(tx.scramble(b)))
+            .collect();
+        assert_eq!(recovered, input);
+    }
+
+    #[test]
+    fn the_scrambler_breaks_up_a_constant_input() {
+        // Its purpose: a run of identical bits must not become a line spectrum.
+        let mut s = Scrambler::new();
+        let out: Vec<bool> = (0..4000).map(|_| s.scramble(true)).collect();
+        let ones = out.iter().filter(|b| **b).count();
+        let ratio = ones as f64 / out.len() as f64;
+        assert!(
+            (0.4..0.6).contains(&ratio),
+            "all-ones input produced {ratio} ones, which is not scrambled"
+        );
+    }
+
+    #[test]
+    fn the_scrambler_recovers_from_a_lock_up() {
+        // V.22bis 5.1: sixty-four ones at the output invert the next input, so
+        // the pathological all-ones state cannot persist.
+        let mut s = Scrambler::new();
+        s.register = 0;
+        let mut longest = 0;
+        let mut run = 0;
+        for _ in 0..20_000 {
+            if s.scramble(false) {
+                run += 1;
+                longest = longest.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        assert!(longest <= 64, "a run of {longest} ones escaped the detector");
+    }
+}

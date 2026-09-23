@@ -55,7 +55,13 @@ typedef float cc_rx_shaper_t[V34_RX_CC_PULSESHAPER_COEFF_SETS][V34_RX_FILTER_STE
 #endif
 
 typedef const uint8_t conv_encode_table_t[64][16];
-typedef const uint8_t conv_decode_table_t[16][16];
+/* The generated decode table has 16 states and 4 branches per state
+   (v34_conv16_decode_table[16][4] in v34_convolutional_coders.h). The
+   declaration must use the same row length: with [16][16] the compiler
+   strides rows by 16 while the data rows are 4 bytes, so every state except
+   0 read the wrong table entry and the decoder produced roughly random
+   bits. */
+typedef const uint8_t conv_decode_table_t[16][4];
 
 enum
 {
@@ -128,6 +134,13 @@ enum v34_tx_stages_e
     V34_TX_STAGE_J,
     /*! \brief J' is being transmitted */
     V34_TX_STAGE_J_DASHED,
+    /*! \brief Phase 3 post-J training wait (answer modem silence while the
+               call modem's PP, TRN and J are received) */
+    V34_TX_STAGE_TRAIN_WAIT,
+    /*! \brief Phase 4 preamble S */
+    V34_TX_STAGE_PHASE4_S,
+    /*! \brief Phase 4 preamble !S */
+    V34_TX_STAGE_PHASE4_NOT_S,
     /*! \brief MP is being transmitted */
     V34_TX_STAGE_MP,
     /*! \brief Primary-channel data mode (addition over upstream) */
@@ -394,6 +407,25 @@ typedef struct
     float guard_level;
     /*! \brief The current fractional phase of the baud timing. */
     int baud_phase;
+    /*! \brief The current fractional phase of the control-channel baud timing.
+        Kept separate from the primary channel's phase so that the primary
+        symbol grid survives the control-channel exchanges, and the data phase
+        continues the grid the training sequence established. */
+    int cc_baud_phase;
+    /*! \brief Control-channel carrier phase accumulator. Separate from the
+        primary channel's, so the control exchange is unaffected by the
+        primary channel's carrier choice. */
+    uint32_t cc_carrier_phase;
+    /*! \brief The control-channel RRC pulse shaping filter buffer and offset.
+        Separate from the primary channel's buffers for the same reason. */
+#if defined(SPANDSP_USE_FIXED_POINT)
+    int16_t cc_rrc_filter_re[V34_INFO_TX_FILTER_STEPS];
+    int16_t cc_rrc_filter_im[V34_INFO_TX_FILTER_STEPS];
+#else
+    float cc_rrc_filter_re[V34_INFO_TX_FILTER_STEPS];
+    float cc_rrc_filter_im[V34_INFO_TX_FILTER_STEPS];
+#endif
+    int cc_rrc_filter_step;
 
     int stage;
     int convolution;
@@ -440,10 +472,16 @@ typedef struct
     bool trn_after_j;
     /*! \brief Count of MP' copies sent in phase 4 (addition). */
     int mp_tx_count;
+    /*! \brief One-shot latch: the INFO1c-requested minimum TX power reduction
+               has already been folded into gain, so it never compounds across
+               transmit blocks (addition over upstream spanDSP). */
+    bool power_reduction_applied;
     /*! \brief Primary-channel data generator state (addition). One mapping
                frame produces eight 2D symbols, served one per baud. */
     int data_baud_pos;
     int16_t data_bits[16];
+    /*! \brief Upstream's data-start flag, kept so the HEAD transmit code can
+        also be built against this header during bisection. */
     bool data_first_baud;
 
 
@@ -455,6 +493,9 @@ typedef struct
     span_sample_timer_t sample_time;
 
     logging_state_t *logging;
+
+    /*! \brief Per-instance CC baud counter for V34_TRACE_MP diagnostics. */
+    long tx_baud_count;
 } v34_tx_state_t;
 
 typedef struct
@@ -512,6 +553,11 @@ typedef struct
                    to which a sequence of 2D points has been sliced.
                    indexed from 0 to 15 --> 8 points for 16 past 4D symbols */
         complexi16_t bb[2][8];
+        /*! \brief The two received (prediction error filtered) points of the
+                   step, kept so the carrier tracking loop can pair a decision
+                   from the trace back with the received point of the same
+                   symbol time. */
+        complexi16_t rx_pt[2];
     } vit[16];
     /*! \brief Latest viterbi table slot. */
     int ptr;
@@ -583,6 +629,17 @@ typedef struct
     bitstream_state_t bs;
     uint32_t bitstream;
 
+    /*! \brief When true, CC is at 1200 bit/s (2 bits/baud, 4-QAM). Only I bits
+       (bits[0],bits[1]) are scrambled. Q bits are zero on TX and must not be
+       fed through the descrambler on RX. */
+    int cc_1200_mode;
+
+    /*! \brief Separate bitstream for E detection that only tracks I bits.
+       At 1200 bit/s CC the Q bits are unscrambled, so mixing them into
+       the descrambler corrupts its state and E (20 consecutive 1-bits)
+       can never be detected. */
+    uint32_t e_bitstream;
+
     /*! \brief Mapping frame output */
     uint32_t r0;
     uint16_t qbits[8];
@@ -614,6 +671,10 @@ typedef struct
 
     /*! \brief The current phase of the carrier (i.e. the DDS parameter). */
     uint32_t carrier_phase;
+    /*! \brief Control-channel carrier phase accumulator. Separate from the
+        primary channel's, so the control exchange is unaffected by the
+        primary channel's carrier choice. */
+    uint32_t cc_carrier_phase;
     /*! \brief The carrier update rate saved for reuse when using short training. */
     int32_t carrier_phase_rate_save;
 
@@ -621,6 +682,13 @@ typedef struct
     int32_t cc_carrier_phase_rate;
     /*! \brief The update rate for the phase of the V.34 carrier (i.e. the DDS increment). */
     int32_t v34_carrier_phase_rate;
+    /* 16-point control-channel receiver state: carrier phase offset (rad),
+       gain normalization, differential-rotation accumulator, and a one-shot
+       init flag for the phase/gain acquisition. */
+    float cc16_theta;
+    float cc16_gain;
+    int cc16_zn;
+    int cc16_inited;
 
     /*! \brief The root raised cosine (RRC) pulse shaping filter buffer. */
 #if defined(SPANDSP_USE_FIXED_POINT)
@@ -661,6 +729,10 @@ typedef struct
     /*! \brief The integral part of the carrier tracking filter. */
     float carrier_track_i;
 #endif
+    /*! \brief Decision directed carrier recovery diagnostics. */
+    long carrier_updates;
+    double carrier_abs_error_sum;
+    float carrier_last_error;
 
     const v34_rx_shaper_t *shaper_re;
     const v34_rx_shaper_t *shaper_im;
@@ -721,6 +793,27 @@ typedef struct
     int mp_len;
     int mp_and_fill_len;
     int mp_seen;
+    /*! \brief True after a valid far-end MP' (acknowledge bit set) is received. */
+    bool mp_acknowledged_seen;
+
+    /* Direct primary-channel QPSK front end used for duplex MP/MP'/E. */
+    float mp_mix_i[81];
+    float mp_mix_q[81];
+    int mp_mix_step;
+    float mp_symbol_phase;
+    bool mp_direct;
+    int mp_timing_lock;
+    int mp_dibit_xor;
+    bool mp_dibit_swap;
+    float mp_timing_phase[160];
+    complexf_t mp_timing_last[160];
+    uint32_t mp_timing_scramble[160];
+    uint32_t mp_timing_stream[160];
+    bool mp_timing_valid[160];
+    uint16_t mp_timing_crc[160];
+    int mp_timing_count[160];
+    int mp_timing_len[160];
+    int mp_energy_hits;
 
     /* Phase-3 S signal detection (addition over upstream spanDSP).
        The S/!S alignment signal is the first phase-3 signal transmitted on
@@ -741,6 +834,50 @@ typedef struct
     float s_det_acc_b_re;
     float s_det_acc_b_im;
     float s_det_power;
+    /*! \brief Second carrier correlator for the S detector: the far end's
+        phase-3 carrier is not always the one its INFO1 message suggests, so
+        both candidates are checked and the one that hits is adopted. */
+    uint32_t s_det_phase_fc2;
+    int32_t s_det_rate_fc2;
+    float s_det_acc_a2_re;
+    float s_det_acc_a2_im;
+    bool s_det_fc2_high;
+    /*! \brief Last sample_time at which the S detector processed a batch, so
+        multiple demodulator paths owning the same samples do not feed the same
+        block more than once. */
+    uint64_t s_det_last_sample_time;
+    /*! \brief Multi-carrier S detection: coherence at every supported baud
+        rate's low and high carrier is checked, because the far end's phase-3
+        symbol rate (and hence carrier) is not known before the S is seen. */
+    uint32_t s_det_phase_multi[12];
+    int32_t s_det_rate_multi[12];
+    float s_det_acc_multi_re[12];
+    float s_det_acc_multi_im[12];
+    int s_det_multi_baud[12];
+    int s_det_multi_high[12];
+    int s_det_multi_count;
+    bool s_det_multi_carrier_high;
+    int s_det_multi_baud_rate;
+    bool s_det_hit_high;
+    /*! \brief S->!S transition detection. V.34 11.3.1.2.4 requires the answer
+        modem to detect the S-to-!S (180 degree phase reversal) transition, not
+        mere S presence, before it leaves phase 3. After V34_EVENT_S the
+        detector keeps running and tracks the coherent carrier phase in short
+        windows; a ~180 degree phase jump raises s_not_s_seen. */
+    bool s_not_s_seen;
+    /*! \brief Set only after the primary-channel receiver recognizes the
+        repeated, descrambled J sequence.  This drives the answer modem from
+        Phase 3 into Phase 4 without a guessed elapsed-time handoff. */
+    bool j_signal_seen;
+    int j_rx_samples;
+    int s_det_short_count;
+    float s_det_short_re;
+    float s_det_short_im;
+    uint32_t s_det_phase_short;
+    int32_t s_det_rate_short;
+    float s_det_ref_phase;
+    bool s_det_ref_valid;
+    int s_det_nots_hits;
     /*! \brief Primary-channel receive state (addition). Eight 2D symbols
                per mapping frame are collected and demapped. */
     bool data_rx_active;
@@ -778,6 +915,9 @@ typedef struct
     span_sample_timer_t tone_ab_hop_time;
 
     logging_state_t *logging;
+
+    /*! \brief Per-instance CC baud counter for V34_TRACE_MP diagnostics. */
+    long cc_baud_count;
 } v34_rx_state_t;
 
 /*!

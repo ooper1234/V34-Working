@@ -21,6 +21,9 @@
 #define SM_SIP_MAX_HEADERS  32
 #define SM_SIP_RTP_MAXPAY   1024
 
+/* Incoming RTP frames queued for paced (20 ms clock) playout to the daemon. */
+#define SM_SIP_RXQ          32
+
 typedef struct {
     int bind_port;                  /* SIP signalling port (default 5060) */
     char bind_addr[64];             /* default 0.0.0.0 */
