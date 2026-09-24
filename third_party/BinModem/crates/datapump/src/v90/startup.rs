@@ -330,6 +330,12 @@ pub struct Digital {
     phase2_gain: f64,
     /// V.90 start-ups that have failed in a row.
     failed_starts: u32,
+    /// Why the last V.90 start-up failed, kept after the start-up that
+    /// failed is put away: a start-up that retrains takes its reason with
+    /// it otherwise, and the transcript is left with nothing to say.
+    last_failure: Option<&'static str>,
+    /// Lines for the transcript not yet taken (see [`Self::take_notes`]).
+    notes: Vec<String>,
     /// Renegotiations in V.90 data modes a retrain has since replaced.
     renegotiations: u32,
     habits: digital::Habits,
@@ -349,10 +355,23 @@ impl Digital {
             v90: None,
             phase2_gain,
             failed_starts: 0,
+            last_failure: None,
+            notes: Vec::new(),
             renegotiations: 0,
             habits: digital::Habits::default(),
             connected_once: false,
         }
+    }
+
+    /// Why the last V.90 start-up failed, kept after the start-up itself is
+    /// put away (see the field).
+    pub fn last_failure(&self) -> Option<&'static str> {
+        self.last_failure
+    }
+
+    /// Lines for the transcript not yet taken (see [`Self::take_notes`]).
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
     }
 
     /// Go about phase 3 this way.
@@ -515,14 +534,32 @@ impl Digital {
     pub fn step(&mut self, input: f64) -> f64 {
         if let Some(m) = self.v90.as_mut() {
             let out = m.step(input);
-            let failed = matches!(m.status(), digital::Status::Failed(_));
-            if matches!(m.status(), digital::Status::Connected { .. }) {
-                self.failed_starts = 0;
-                self.connected_once = true;
+            let failed = match m.status() {
+                digital::Status::Failed(why) => Some(why),
+                digital::Status::Connected { .. } => {
+                    self.failed_starts = 0;
+                    self.connected_once = true;
+                    None
+                }
+                _ => None,
+            };
+            let retrain = m.take_retrain();
+            if let Some(why) = failed {
+                // 9.5.1.1: tone B and phase 2, capabilities not exchanged
+                // again. One that will not train this many times in a row
+                // gets V.34's INFO1a in the next phase 2 (9.2.2.1.9 is the
+                // analogue modem's own side of that: the digital modem gets
+                // there by answering what it sends), so the call goes on as
+                // V.34 instead of dying on a far end that keeps asking for
+                // V.90.
+                self.last_failure = Some(why);
+                self.failed_starts += 1;
+                if self.failed_starts > V90_RETRAINS {
+                    self.notes.push("V.34 next time round, not V.90".into());
+                    self.v34.decline_pcm();
+                }
             }
-            if m.take_retrain() || (failed && self.failed_starts < V90_RETRAINS) {
-                // 9.5.1: tone B and phase 2.
-                self.failed_starts += u32::from(failed);
+            if retrain || failed.is_some() {
                 self.renegotiations += m.renegotiations();
                 self.v90 = None;
                 self.v34.restart_phase2();

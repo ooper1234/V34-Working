@@ -245,6 +245,9 @@ pub struct Answerer {
     stage: Stage,
     status: c_int,
     failure: &'static str,
+    /// The V.90 start-up's last failure reason, once told to the transcript:
+    /// V.90 retrains in place, so C never sees a status for it.
+    v90_failure: Option<&'static str>,
     rate_tx: c_int,
     rate_rx: c_int,
     rx_total: u64,
@@ -322,6 +325,7 @@ impl Answerer {
             stage: Stage::V8(Box::new(v8m)),
             status: BM_RUNNING,
             failure: "",
+            v90_failure: None,
             rate_tx: 0,
             rate_rx: 0,
             rx_total: 0,
@@ -396,7 +400,14 @@ impl Answerer {
     /// as the digital modem: V.90's start-up at the line's own rate, saying
     /// in INFO0d what a real server says (µ-law, the 1664-point upstream).
     fn start_v90(&mut self) {
-        self.stage = Stage::V90(Box::new(v90::startup::Digital::new(v90::server::ours())));
+        /* LIVE_SERVER is the habit for a real analogue modem on the far end
+           rather than another engine: 4.05 s of TRN1d, where PROMPT's 0.3 s
+           is all datapump's own analogue modem needs. 2040T (9.3.1.4) is a
+           floor, and a real modem's downstream equalizer uses the time. */
+        self.stage = Stage::V90(Box::new(
+            v90::startup::Digital::new(v90::server::ours())
+                .with_habits(v90::digital::Habits::LIVE_SERVER),
+        ));
         self.status = BM_RUNNING;
     }
 
@@ -412,16 +423,27 @@ impl Answerer {
     }
 
     /// One 8 kHz line sample through the `bm_create_v90` path: V.8 first,
-    /// then V.90's start-up, with no resampler, boundary gain or boundary
-    /// echo canceller between them. The digital modem already runs at the
-    /// network's 8000 Hz, its levels are the exact codeword values the far
-    /// end's G.711 encoder must see at unity gain, and this mode has no
-    /// engine-to-engine waveform to protect from boundary scaling; the 16 kHz
-    /// V.34 path in `bm_step` is the one that needs all of those. When V.8
-    /// does not pair this end digital, [`Self::fall_to_v34`] switches the
-    /// object over to that proven path for the rest of the call.
+    /// then V.90's start-up, with no resampler or boundary gain between
+    /// them. The digital modem already runs at the network's 8000 Hz, its
+    /// levels are the exact codeword values the far end's G.711 encoder must
+    /// see at unity gain, and this mode has no engine-to-engine waveform to
+    /// protect from boundary scaling; the 16 kHz V.34 path in `bm_step` is
+    /// the one that needs all of those. When V.8 does not pair this end
+    /// digital, [`Self::fall_to_v34`] switches the object over to that
+    /// proven path for the rest of the call.
+    ///
+    /// The echo canceller runs here as it does there, and on the real line it
+    /// is what phase 3 needs: the far hybrid reflects our own transmit back
+    /// some 190 ms late and about 14 dB down, which lands inside the analogue
+    /// modem's S, and an equalizer handed an S at 11 dB of SNR never trains
+    /// ("the analogue modem's training sequence did not train this end", 9.5.1
+    /// retrain, twice, then the call dies) -- the capture notes on the filter
+    /// above are why it exists. It is never frozen here: the V.90 digital
+    /// modem's own PCM downstream comes back through that same path for the
+    /// whole call, data mode included.
     fn linear_step(&mut self, input: c_int) -> c_int {
-        let x = input as f64 / 32768.0;
+        self.echo.frozen = false;
+        let x = self.echo.sample(input as f64 / 32768.0);
         let y = match &mut self.stage {
             Stage::V8(m) => {
                 // V.8 at the line's rate, at the level the digital server's
@@ -477,6 +499,17 @@ impl Answerer {
             }
             Stage::V90(m) => {
                 let out = m.step(x);
+                for note in m.take_notes() {
+                    eprintln!("BinModem V.90: {note}");
+                }
+                // V.90 retrains in place, so C is handed no status for one
+                // failing: the reason goes to the transcript here or nowhere.
+                if let Some(why) = m.last_failure()
+                    && self.v90_failure != Some(why)
+                {
+                    self.v90_failure = Some(why);
+                    eprintln!("BinModem V.90 start-up failed: {why} (retrain, 9.5.1.1)");
+                }
                 self.status = match m.status() {
                     v90::startup::Status::Running => BM_RUNNING,
                     v90::startup::Status::Connected { transmit, receive } => {
@@ -518,6 +551,7 @@ impl Answerer {
         if y > 1.0 || y < -1.0 {
             self.clips += 1;
         }
+        self.echo.push(y);
         (y * 32768.0).clamp(-32768.0, 32767.0) as c_int
     }
 
@@ -704,7 +738,9 @@ pub extern "C" fn bm_create(
 /// caller to take over. The bit callbacks work exactly as `bm_create`'s.
 ///
 /// This mode runs V.8 and V.90 at the line's 8 kHz with no boundary scaling
-/// or echo canceller, and carries raw bits: no V.42 yet.
+/// -- but with the same near-end echo canceller the V.34 path runs, which
+/// phase 3 against a real analogue modem cannot do without, and it carries
+/// raw bits: no V.42 yet.
 #[unsafe(no_mangle)]
 pub extern "C" fn bm_create_v90(
     answer: c_int,
