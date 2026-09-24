@@ -53,6 +53,10 @@ typedef struct {
                                        receive data path is not finished yet) */
     int use_binmodem;               /* answer with the vendored BinModem
                                        engine (V.8 + V.34 in one object) */
+    int use_v90;                    /* BinModem V.90 mode: V.8 offering the
+                                       digital PCM category, V.90 when the
+                                       far end pairs, V.34 fallback below
+                                       that (implies use_binmodem) */
     int v34_baud;                   /* V.34 symbol rate for the engine */
     int v34_rate;                   /* V.34 maximum bit rate for the engine */
     sm_log_level_t log_level;

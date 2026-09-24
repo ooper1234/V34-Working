@@ -35,6 +35,18 @@ bm_answerer *bm_create(int answer, int want_v34,
                        bm_get_bit_fn get_bit, void *get_ud,
                        bm_put_bit_fn put_bit, void *put_ud);
 
+/* The digital end of a V.90 call instead: V.8 offering the digital PCM
+   category, then V.90's start-up at the line's 8 kHz. answer should be
+   nonzero (V.8 pairs the answering end digital). One object carries the
+   fallback ladder: digital pairing -> V.90; V.34 agreed without it, or
+   V.8 lost or unsettled -> the same 16 kHz V.34 stage bm_create runs;
+   V.22bis -> BM_AGREED_V22 for the caller to take over. On the V.90 path
+   it runs raw bits -- no V.42 yet -- and, like every other entry point,
+   one sample per bm_step. */
+bm_answerer *bm_create_v90(int answer,
+                           bm_get_bit_fn get_bit, void *get_ud,
+                           bm_put_bit_fn put_bit, void *put_ud);
+
 /* One 8 kHz line sample in, the corresponding outgoing sample out (s16).
    Deterministic: exactly one out per in, after a few milliseconds of
    resampler priming at the start. */

@@ -6,7 +6,9 @@ license.workspace = true
 publish = false
 
 [lib]
-crate-type = ["staticlib"]
+# rlib beside staticlib so the integration tests in tests/ can link against
+# the same crate; C builds keep using target/release/libbinmodemffi.a.
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 datapump = { path = "../datapump" }

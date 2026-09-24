@@ -202,17 +202,25 @@ void sm_call_init(sm_call_t *c, const sm_call_config_t *cfg, int call_id)
     {
         /* The vendored BinModem answerer owns the whole start-up: its own
            V.8 (ANSam, CM/JM) and then V.34 through phase 4 into data mode.
-           sm_v8, the answer tone and the spanDSP V.34 engine stay out of
-           it entirely -- until the engine hands a V.22bis call back, which
+           --v90 switches it to the V.90 mode: V.8 offering the digital PCM
+           category, V.90's start-up when the far end pairs as the analogue
+           half, and -- because one object carries the whole ladder -- the
+           same 16 kHz V.34 stage as the fallback when it does not. sm_v8,
+           the answer tone and the spanDSP V.34 engine stay out of it
+           entirely -- until the engine hands a V.22bis call back, which
            bm_poll does. The V.22bis engine is still initialised here: the
            hand-back runs it. */
-        c->bm = bm_create(1 /* answer */, cfg->use_v34,
-                          call_get_bit, c, call_put_bit, c);
+        c->bm = cfg->use_v90
+                    ? bm_create_v90(1 /* answer */,
+                                    call_get_bit, c, call_put_bit, c)
+                    : bm_create(1 /* answer */, cfg->use_v34,
+                                call_get_bit, c, call_put_bit, c);
         if (c->bm)
         {
             c->phase = SM_CALL_V8;
-            sm_log_message(&c->log, SM_LOG_FLOW,
-                           "BinModem answerer started (V.8 + V.34, 16 kHz engine)");
+            sm_log_message(&c->log, SM_LOG_FLOW, cfg->use_v90
+                           ? "BinModem answerer started (V.90 + V.34 fallback, 8 kHz line path)"
+                           : "BinModem answerer started (V.8 + V.34, 16 kHz engine)");
             v22bis_init(&c->modem, false /* answerer */, cfg->rate,
                         call_get_bit, c, call_put_bit, c, call_status, c);
             c->modem.log.call_id = call_id;
@@ -528,8 +536,8 @@ static void bm_poll(sm_call_t *c, int n)
             c->phase = SM_CALL_DATA;
             c->negotiated_rate = rate;
             sm_log_message(&c->log, SM_LOG_FLOW,
-                           "==> DATA MODE at %d bps rx, %d bps tx (BinModem V.34)",
-                           rate, bm_rate_tx(c->bm));
+                           "==> DATA MODE at %d bps rx, %d bps tx (%s)",
+                           rate, bm_rate_tx(c->bm), ph);
             sm_log_message(&c->log, SM_LOG_FLOW,
                            "binmodem: error control=%s compression=%s damaged_frames=%llu",
                            bm_error_control(c->bm) ? "V.42 LAPM" : "none",

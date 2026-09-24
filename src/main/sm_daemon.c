@@ -47,6 +47,10 @@ static void usage(void)
             "  --binmodem           answer with the vendored BinModem engine: its\n"
             "                       own V.8 and V.34 start-up, 16 kHz internally.\n"
             "                       Needs --v34 to offer V.34.\n"
+            "  --v90                BinModem V.90 mode (implies --binmodem): V.8\n"
+            "                       offering the digital PCM category, V.90 when\n"
+            "                       the far end pairs as the analogue half, V.34\n"
+            "                       fallback when it does not.\n"
             "  --debug              verbose logging\n"
             "  --shim FD            internal pppd relay (do not use)\n",
             prog, DEFAULT_PORT);
@@ -151,6 +155,11 @@ int main(int argc, char **argv)
             cfg.use_v34 = 1;
         else if (strcmp(argv[i], "--binmodem") == 0)
             cfg.use_binmodem = 1;
+        else if (strcmp(argv[i], "--v90") == 0)
+        {
+            cfg.use_v90 = 1;
+            cfg.use_binmodem = 1;
+        }
         else if (strcmp(argv[i], "--debug") == 0)
             cfg.log_level = SM_LOG_FLOW;
         else if (strcmp(argv[i], "--help") == 0)
