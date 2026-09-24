@@ -1153,6 +1153,12 @@ impl Modem {
                         return;
                     }
                     if let Some(cp) = self.cps.feed(bit) {
+                        // Every sequence that parses is said out loud, not
+                        // only the ones acted on: on a live call, whether a
+                        // far end's CP is read as CPt or CP, and what it asks
+                        // for, is the difference between a phase 4 that goes
+                        // on and one that does not.
+                        self.say(format!("CP sequence parsed: {}", cp.describe()));
                         self.heard_cp(cp);
                     }
                 }
