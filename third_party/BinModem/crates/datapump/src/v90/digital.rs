@@ -20,6 +20,7 @@
 //! ```
 
 use std::collections::VecDeque;
+use std::io::Write;
 
 use crate::v32::{Mode, Scrambler};
 use crate::v34::data::{Decoder as UpstreamDecoder, Params};
@@ -31,6 +32,7 @@ use crate::v34::training::{RetrainWatch, SWatch, Watched};
 use crate::v34::qam::Band;
 use crate::v34::receiver::{self, Heard, Receiver, Reference};
 use crate::v34::signals::{self, Reader, Size};
+use crate::v90::sequences::points;
 use crate::v34::trellis::Code;
 
 use super::INTERVALS;
@@ -559,6 +561,8 @@ pub struct Modem {
     /// sending sequences this end cannot parse and a far end that has gone
     /// quiet look the same from the CP tally alone, and do not from this.
     far_peak: f64,
+    /// When phase 4 last said what the receiver thought of the signal.
+    phase4_note: u64,
     /// The analogue modem's S after Ja, and when it has to have come by.
     s_heard: bool,
     s_deadline: Option<u64>,
@@ -612,6 +616,7 @@ impl Modem {
             retrain_why: None,
             trace: Vec::new(),
             far_peak: 0.0,
+            phase4_note: 0,
             s_heard: false,
             s_deadline: None,
             s_watch: SWatch::default(),
@@ -805,6 +810,28 @@ impl Modem {
         self.now += 1;
         self.far_peak = self.far_peak.max(input.abs());
         self.rx.feed(input);
+        // Phase 4's own account of the far end, every half second: what the
+        // receiver thinks of the signal, so a live call's transcript says
+        // whether sequences that do not parse arrived on a locked receiver
+        // or a lost one.
+        if matches!(self.stage, Stage::Phase4Cpt | Stage::Phase4Cp) && self.now - self.phase4_note >= FS as u64 / 2 {
+            self.phase4_note = self.now;
+            self.say(format!(
+                "phase 4: snr {:.1} dB, trained {:.1} dB, drift {:+.0} ppm, {} points, {} slips{}, receiver at {} bit/s on {} Hz, {}",
+                self.rx.snr_db(),
+                self.rx.trained_snr_db(),
+                self.rx.drift_ppm(),
+                match self.rx.size() {
+                    Size::Four => 4,
+                    Size::Sixteen => 16,
+                },
+                self.rx.slips(),
+                if self.rx.is_lost() { ", LOST" } else { "" },
+                self.rx.band().rate.nominal(),
+                self.rx.band().carrier(),
+                self.cp_tally()
+            ));
+        }
         match self.watching() {
             Some(learn) => {
                 self.far_end.feed(input, learn);
@@ -1051,6 +1078,7 @@ impl Modem {
     fn begin_phase4(&mut self, s_bar: u64) {
         self.say(format!("phase 4: Ri for {RI_SYMBOLS}T, waiting for the analogue modem's CPt"));
         self.far_peak = 0.0;
+        self.phase4_note = 0;
         self.stage = Stage::Phase4Cpt;
         self.rx.resume(s_bar + 2 * signals::S_BAR_SYMBOLS as u64);
         self.rx.set_size(self.cp_size());
@@ -1063,6 +1091,11 @@ impl Modem {
     }
 
     fn symbol(&mut self, symbol: receiver::Symbol) {
+        if points().is_some() && matches!(self.stage, Stage::Phase4Cpt | Stage::Phase4Cp) {
+            if let Some(mut f) = points() {
+                let _ = writeln!(f, "{} {:.6} {:.6}", self.now, symbol.point.re, symbol.point.im);
+            }
+        }
         match self.stage {
             Stage::ReadJa => {
                 if self.in_trn {
@@ -1162,7 +1195,7 @@ impl Modem {
                     self.fail("the analogue modem's CPt is not one this end can send");
                     return;
                 };
-                self.say(format!("CPt heard (drn {}): R-bar-i then TRN2d going out", cp.drn));
+                self.say(format!("CPt heard: {}: R-bar-i then TRN2d going out", cp.describe()));
                 self.source.training = Some(training);
                 self.source.mp = Some(self.make_mp());
                 self.source.change(Out::RiBar);
@@ -1182,8 +1215,9 @@ impl Modem {
             return;
         };
         self.say(format!(
-            "CP heard (drn {}, acknowledge {}): MP' after this MP",
-            cp.drn, cp.acknowledge
+            "CP heard (acknowledge {}): {}: MP' after this MP",
+            cp.acknowledge,
+            cp.describe()
         ));
         self.source.data_mode = Some(data_mode);
         // 9.4.1.3: "After receiving the analogue modem's CP sequence, the

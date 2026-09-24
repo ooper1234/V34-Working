@@ -77,6 +77,14 @@ const ECHO_PEAK_MIN: f64 = 0.3; /* correlation needed to lock a delay */
 const ECHO_QUIET_DB: f64 = -30.0; /* input loudness the far end must be under */
 const ECHO_MU: f64 = 0.5;
 
+/// Whether the echo filter may adapt with the far end talking, gated by
+/// `ECHO_DOUBLE_TALK` in the environment: see [`Echo::double_talk`].
+fn double_talk() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ECHO_DOUBLE_TALK").is_some())
+}
+
 /// The boundary's own transmit, delayed and filtered, subtracted from the
 /// boundary's receive.
 struct Echo {
@@ -89,6 +97,11 @@ struct Echo {
     w: Vec<f64>,
     seen: Vec<f64>,
     frozen: bool,
+    /// The double-talk gate's running sums over one window: the energy the
+    /// echo accounts for, and the energy it does not.
+    echo_energy: f64,
+    residual_energy: f64,
+    gate_samples: usize,
 }
 
 impl Echo {
@@ -101,6 +114,9 @@ impl Echo {
             w: vec![0.0; ECHO_TAPS],
             seen: Vec::with_capacity(ECHO_WINDOW),
             frozen: false,
+            echo_energy: 0.0,
+            residual_energy: 0.0,
+            gate_samples: 0,
         }
     }
 
@@ -176,6 +192,34 @@ impl Echo {
         let een: f64 = self.seen.iter().map(|x| x * x).sum();
         let rms = (een / self.seen.len() as f64).sqrt();
         rms < 10f64.powf(ECHO_QUIET_DB / 20.0)
+    }
+
+    /// Whether the filter may keep adapting with the far end talking, which
+    /// `ECHO_DOUBLE_TALK` in the environment asks for: over a whole window,
+    /// only while the echo accounts for most of what has arrived, so the
+    /// filter follows a reflection that has grown without learning the far
+    /// end's signal. Measured on the 2026-09-24 call and left as it stands:
+    /// the echo there is only 1.5 to 4.3 times the residual, so the gate is
+    /// shut almost as often as the wanted signal is, and opening it changed
+    /// nothing that could be measured -- one phase 4 read four of five
+    /// sequences that way and another none, against two of 27 without it.
+    #[allow(dead_code)]
+    fn double_talk(&mut self, x: f64, yhat: f64) -> bool {
+        if !double_talk() {
+            return false;
+        }
+        let residual = x - yhat;
+        self.echo_energy += yhat * yhat;
+        self.residual_energy += residual * residual;
+        self.gate_samples += 1;
+        if self.gate_samples < ECHO_WINDOW {
+            return false;
+        }
+        let opens = self.echo_energy > 4.0 * self.residual_energy + 1e-9;
+        self.echo_energy = 0.0;
+        self.residual_energy = 0.0;
+        self.gate_samples = 0;
+        opens
     }
 
     /// One line sample: subtract the filter's estimate of our reflection,

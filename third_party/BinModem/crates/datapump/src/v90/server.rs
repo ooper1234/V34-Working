@@ -38,7 +38,10 @@ const SLACK: usize = 8;
 
 /// What this end says it is in INFO0d: μ-law, the 1664-point upstream
 /// constellation, and the powers of a real server's (−10 dBm0 nominal, a
-/// ceiling of −12 dBm0 on what the analogue modem may ask for).
+/// ceiling of −12 dBm0 on what the analogue modem may ask for). The nominal
+/// is what this end *says*, not what it scales by: the digital modem puts
+/// the codeword levels on the line as they are, so the far end's G.711
+/// encoder reproduces the codewords (see [`Line`]).
 pub fn ours() -> Info0d {
     Info0d {
         v34: Info0 { constellation_1664: true, ..Info0::default() },

@@ -342,6 +342,34 @@ impl Cp {
         Self { acknowledge: true, ..self.clone() }
     }
 
+    /// A one-line reading of everything a CP asked for, for the transcript:
+    /// a far end's CP is the whole of what phase 4 negotiates, and on a live
+    /// call it is worth saying out loud rather than inferring from what
+    /// happened next.
+    pub fn describe(&self) -> String {
+        let rates: Vec<String> = (0..13)
+            .filter(|i| self.upstream_rates >> i & 1 == 1)
+            .map(|i| (4800 + 2400 * i).to_string())
+            .collect();
+        let redundancy = match self.redundancy {
+            Redundancy::None => 0,
+            Redundancy::One => 1,
+            Redundancy::Two => 2,
+            Redundancy::Three => 3,
+        };
+        format!(
+            "{} drn {} ({} bit/s), constellations {}{}, S{redundancy} ld{}, shaping {:?}, upstream can {}",
+            if self.data_mode { "CP" } else { "CPt" },
+            self.drn,
+            super::rate_for(u32::from(self.drn) + if self.data_mode { 20 } else { 8 }),
+            self.intervals.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","),
+            if self.codec.is_some() { " plus the codec's own" } else { "" },
+            self.lookahead,
+            self.shaping,
+            if rates.is_empty() { "nothing".into() } else { rates.join(",") }
+        )
+    }
+
     /// The frame bits D this CP's rate carries.
     pub fn frame_bits(&self) -> usize {
         if self.data_mode { data_bits(self.drn) } else { training_bits(self.drn) }
@@ -445,6 +473,28 @@ impl Cp {
 /// an eighteenth would make the run fill or the last of something else --
 /// and how long it is follows from its first few blocks. Every place that
 /// could be a start is kept until there are enough bits to read it there.
+/// Whether a live call's CP candidates are worth printing whole, bits and
+/// `V90_CP_TRACE` in the environment, for when a far end's sequences arrive
+/// and do not parse and the only way to know what they said is to read them.
+fn trace() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("V90_CP_TRACE").is_some())
+}
+
+/// Where `V90_POINTS` asks for the phase 4 receiver's decided constellation
+/// points to be written, sample number first: a far end's phase 4 signal on
+/// a receiver that cannot read it is otherwise invisible.
+pub(crate) fn points() -> Option<std::fs::File> {
+    use std::sync::Mutex;
+    static PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+    let mut guard = PATH.lock().ok()?;
+    if guard.is_none() {
+        *guard = std::env::var_os("V90_POINTS").map(std::path::PathBuf::from);
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(guard.as_ref()?).ok()
+}
+
 #[derive(Debug, Clone)]
 struct Finder<T> {
     bits: Vec<bool>,
@@ -505,6 +555,15 @@ impl<T> Finder<T> {
             }
             found = parse(&bits[start..start + needed]);
             self.taken += usize::from(found.is_some());
+            if trace() {
+                let taken = found.is_some();
+                let hex: String = bits[start..start + needed.min(1200)]
+                    .chunks(8)
+                    .map(|b| b.iter().map(|&x| if x { '1' } else { '0' }).collect::<String>())
+                    .map(|s| u8::from_str_radix(&s, 2).map(|v| format!("{v:02x}")).unwrap_or_default())
+                    .collect();
+                eprintln!("[cp-trace] candidate {needed} bits, {}: {hex}", if taken { "TAKEN" } else { "rejected" });
+            }
             false
         });
         if found.is_some() {
