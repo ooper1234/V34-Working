@@ -451,6 +451,11 @@ struct Finder<T> {
     ones: usize,
     /// Where candidates start, in `bits`.
     starts: Vec<usize>,
+    /// Candidates the sync pattern has begun, and how many of those the
+    /// parser took: on a live call the difference is the whole story when
+    /// a far end's sequences arrive and do not parse.
+    seen: usize,
+    taken: usize,
     /// Bits needed to know the length, and the length from them.
     header: usize,
     length: fn(&[bool]) -> usize,
@@ -459,11 +464,26 @@ struct Finder<T> {
 
 impl<T> Finder<T> {
     fn new(header_blocks: usize, length: fn(&[bool]) -> usize, parse: fn(&[bool]) -> Option<T>) -> Self {
-        Self { bits: Vec::new(), ones: 0, starts: Vec::new(), header: SYNC_ONES + header_blocks * (BLOCK + 1), length, parse }
+        Self {
+            bits: Vec::new(),
+            ones: 0,
+            starts: Vec::new(),
+            seen: 0,
+            taken: 0,
+            header: SYNC_ONES + header_blocks * (BLOCK + 1),
+            length,
+            parse,
+        }
+    }
+
+    /// Candidates begun, and taken.
+    fn tally(&self) -> (usize, usize) {
+        (self.seen, self.taken)
     }
 
     fn feed(&mut self, bit: bool) -> Option<T> {
         if !bit && self.ones == SYNC_ONES {
+            self.seen += 1;
             self.starts.push(self.bits.len() - SYNC_ONES);
         }
         self.ones = if bit { self.ones + 1 } else { 0 };
@@ -484,6 +504,7 @@ impl<T> Finder<T> {
                 return true;
             }
             found = parse(&bits[start..start + needed]);
+            self.taken += usize::from(found.is_some());
             false
         });
         if found.is_some() {
@@ -555,6 +576,12 @@ impl Default for CpFinder {
 impl CpFinder {
     pub fn feed(&mut self, bit: bool) -> Option<Cp> {
         self.0.feed(bit)
+    }
+
+    /// CP candidates begun on the line, and how many parsed: sequences the
+    /// far end sent that this end could not read say so here.
+    pub fn tally(&self) -> (usize, usize) {
+        self.0.tally()
     }
 }
 

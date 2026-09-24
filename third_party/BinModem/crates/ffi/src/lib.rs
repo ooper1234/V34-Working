@@ -261,6 +261,10 @@ pub struct Answerer {
     mid: Vec<f64>,
     out: VecDeque<f64>,
     echo: Echo,
+    /// The call's line audio, when `BM_CAPTURE` named a directory for it.
+    capture: Option<Capture>,
+    /// Line samples stepped, for the transcript's own timestamps.
+    samples: u64,
     get_bit: GetBitFn,
     get_ud: *mut c_void,
     put_bit: PutBitFn,
@@ -339,6 +343,8 @@ impl Answerer {
             mid: Vec::new(),
             out: VecDeque::new(),
             echo: Echo::new(),
+            capture: std::env::var_os("BM_CAPTURE").map(|d| Capture::new(std::path::Path::new(&d))),
+            samples: 0,
             get_bit,
             get_ud,
             put_bit,
@@ -499,8 +505,9 @@ impl Answerer {
             }
             Stage::V90(m) => {
                 let out = m.step(x);
+                let at = self.samples as f64 / LINE_FS;
                 for note in m.take_notes() {
-                    eprintln!("BinModem V.90: {note}");
+                    eprintln!("[{at:8.3}s] BinModem V.90: {note}");
                 }
                 // V.90 retrains in place, so C is handed no status for one
                 // failing: the reason goes to the transcript here or nowhere.
@@ -508,7 +515,7 @@ impl Answerer {
                     && self.v90_failure != Some(why)
                 {
                     self.v90_failure = Some(why);
-                    eprintln!("BinModem V.90 start-up failed: {why} (retrain, 9.5.1.1)");
+                    eprintln!("[{at:8.3}s] BinModem V.90 start-up failed: {why} (retrain, 9.5.1.1)");
                 }
                 self.status = match m.status() {
                     v90::startup::Status::Running => BM_RUNNING,
@@ -764,40 +771,113 @@ pub extern "C" fn bm_create_v90(
 #[unsafe(no_mangle)]
 pub extern "C" fn bm_step(a: *mut Answerer, input: c_int) -> c_int {
     let a = unsafe { &mut *a };
-    if a.want_v90 {
-        return a.linear_step(input);
+    let out = a.step_inner(input);
+    // The raw line either way round, before the canceller takes the echo
+    // off, so a capture says what was on the wire and not only what the
+    // engine was shown.
+    if let Some(c) = a.capture.as_mut() {
+        c.push(input as i16, out as i16);
     }
-    /* Frozen in data mode: with no MP left to protect, the two ends' idle
-       scramblers are the only thing a lock could mistake for echo. */
-    a.echo.frozen = a.status == BM_CONNECTED;
-    let line = a.echo.sample(input as f64 / 32768.0);
-    let x = line / BOUNDARY_GAIN;
-    a.up.process(x, &mut a.mid);
-    let engine_in = std::mem::take(&mut a.mid);
-    if engine_in.len() != 2 {
-        a.up_odd += 1;
-        a.up_odd_last = engine_in.len() as u8;
-    }
-    for s in engine_in {
-        let y = a.engine_step(s);
-        a.down.process(y, &mut a.mid);
-        for &z in a.mid.iter() {
-            a.out.push_back(z);
+    out
+}
+
+impl Answerer {
+    fn step_inner(&mut self, input: c_int) -> c_int {
+        self.samples += 1;
+        if self.want_v90 {
+            return self.linear_step(input);
         }
-        a.mid.clear();
+        /* Frozen in data mode: with no MP left to protect, the two ends' idle
+           scramblers are the only thing a lock could mistake for echo. */
+        self.echo.frozen = self.status == BM_CONNECTED;
+        let line = self.echo.sample(input as f64 / 32768.0);
+        let x = line / BOUNDARY_GAIN;
+        self.up.process(x, &mut self.mid);
+        let engine_in = std::mem::take(&mut self.mid);
+        if engine_in.len() != 2 {
+            self.up_odd += 1;
+            self.up_odd_last = engine_in.len() as u8;
+        }
+        for s in engine_in {
+            let y = self.engine_step(s);
+            self.down.process(y, &mut self.mid);
+            for &z in self.mid.iter() {
+                self.out.push_back(z);
+            }
+            self.mid.clear();
+        }
+        if self.out.is_empty() {
+            self.underruns += 1;
+        }
+        let y8 = self.out.pop_front().unwrap_or(0.0) * BOUNDARY_GAIN;
+        self.echo.push(y8);
+        if y8.abs() > self.peak {
+            self.peak = y8.abs();
+        }
+        if y8 > 1.0 || y8 < -1.0 {
+            self.clips += 1;
+        }
+        (y8 * 32768.0).clamp(-32768.0, 32767.0) as c_int
     }
-    if a.out.is_empty() {
-        a.underruns += 1;
+}
+
+/// One call's line audio, kept when `BM_CAPTURE` names a directory to put it
+/// in: what arrived in channel 0, what went out in channel 1, at the line's
+/// own rate, so a capture can be replayed through an engine the way the
+/// notes on the echo canceller came about (see `RetrainWatch::heard_before`).
+struct Capture {
+    path: std::path::PathBuf,
+    samples: Vec<(i16, i16)>,
+}
+
+impl Capture {
+    fn new(dir: &std::path::Path) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        Self { path: dir.join(format!("line-{:08}-{n}.wav", std::process::id())), samples: Vec::new() }
     }
-    let y8 = a.out.pop_front().unwrap_or(0.0) * BOUNDARY_GAIN;
-    a.echo.push(y8);
-    if y8.abs() > a.peak {
-        a.peak = y8.abs();
+
+    fn push(&mut self, rx: i16, tx: i16) {
+        // Ten minutes is longer than any call here, and bounds the memory.
+        if self.samples.len() < 4_800_000 {
+            self.samples.push((rx, tx));
+        }
     }
-    if y8 > 1.0 || y8 < -1.0 {
-        a.clips += 1;
+
+    /// A 16-bit stereo WAV at the line's rate: header, then the samples.
+    fn write(&self) {
+        let (n, fs) = (self.samples.len(), LINE_FS as u32);
+        let mut w: Vec<u8> = Vec::with_capacity(44 + n * 4);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + n as u32 * 4).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes()); /* PCM */
+        w.extend_from_slice(&2u16.to_le_bytes()); /* channels */
+        w.extend_from_slice(&fs.to_le_bytes());
+        w.extend_from_slice(&(fs * 4).to_le_bytes());
+        w.extend_from_slice(&4u16.to_le_bytes());
+        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(n as u32 * 4).to_le_bytes());
+        for &(rx, tx) in &self.samples {
+            w.extend_from_slice(&rx.to_le_bytes());
+            w.extend_from_slice(&tx.to_le_bytes());
+        }
+        match std::fs::write(&self.path, w) {
+            Ok(()) => eprintln!("BinModem: captured {} line samples to {}", n, self.path.display()),
+            Err(why) => eprintln!("BinModem: could not capture to {}: {why}", self.path.display()),
+        }
     }
-    (y8 * 32768.0).clamp(-32768.0, 32767.0) as c_int
+}
+
+impl Drop for Answerer {
+    fn drop(&mut self) {
+        if let Some(capture) = &self.capture {
+            capture.write();
+        }
+    }
 }
 
 /// Times the engine's own output went outside [-1, 1] before the s16 clamp.

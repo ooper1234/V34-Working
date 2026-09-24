@@ -164,6 +164,30 @@ enum Out {
     Data,
 }
 
+impl Out {
+    /// The signal's own name, for the transcript.
+    fn name(self) -> &'static str {
+        match self {
+            Out::Silence => "silence",
+            Out::Sd => "Sd",
+            Out::SdBar => "S-bar-d",
+            Out::Trn1d => "TRN1d",
+            Out::Jd => "Jd",
+            Out::JdPrime => "Jd'",
+            Out::Dil => "DIL",
+            Out::Ri => "Ri",
+            Out::RiBar => "R-bar-i",
+            Out::Rd => "Rd",
+            Out::RdBar => "R-bar-d",
+            Out::Trn2d => "TRN2d",
+            Out::Mp => "MP",
+            Out::Ed => "Ed",
+            Out::B1d => "B1d",
+            Out::Data => "data",
+        }
+    }
+}
+
 /// The levels the digital modem sends, one symbol at a time.
 #[derive(Debug, Clone)]
 struct Source {
@@ -201,12 +225,15 @@ struct Source {
     r_codes: [u8; INTERVALS],
     data: VecDeque<bool>,
     trn1d_symbols: usize,
+    /// The last signal `start` moved to, for the transcript to notice.
+    changed: Option<Out>,
 }
 
 impl Source {
     fn new(law: Law, uinfo: u8, jd: Jd, trn1d: f64) -> Self {
         Self {
             trn1d_symbols: (trn1d * FS) as usize,
+            changed: None,
             law,
             uinfo,
             out: Out::Silence,
@@ -239,6 +266,9 @@ impl Source {
     }
 
     fn start(&mut self, out: Out) {
+        if self.out != out {
+            self.changed = Some(out);
+        }
         self.out = out;
         self.count = 0;
         self.bits.clear();
@@ -525,6 +555,10 @@ pub struct Modem {
     /// What phases 3 and 4 have done, a line each, for the transcript
     /// (see [`Self::take_trace`]).
     trace: Vec<String>,
+    /// The loudest thing to have arrived since phase 4 began: a far end
+    /// sending sequences this end cannot parse and a far end that has gone
+    /// quiet look the same from the CP tally alone, and do not from this.
+    far_peak: f64,
     /// The analogue modem's S after Ja, and when it has to have come by.
     s_heard: bool,
     s_deadline: Option<u64>,
@@ -577,6 +611,7 @@ impl Modem {
             wants_retrain: false,
             retrain_why: None,
             trace: Vec::new(),
+            far_peak: 0.0,
             s_heard: false,
             s_deadline: None,
             s_watch: SWatch::default(),
@@ -709,6 +744,14 @@ impl Modem {
         self.trace.push(line.into());
     }
 
+    /// How the CP finder has done, for the transcript: candidates the far
+    /// end's sequences began, and how many parsed. Zero of many is a far
+    /// end talking and this end not hearing; zero of zero is silence.
+    fn cp_tally(&self) -> String {
+        let (seen, taken) = self.cps.tally();
+        format!("CP sequences: {seen} begun, {taken} parsed, loudest arrival {:.4}", self.far_peak)
+    }
+
     /// Rate renegotiations and cleardowns since the call began, from either
     /// end.
     pub fn renegotiations(&self) -> u32 {
@@ -760,6 +803,7 @@ impl Modem {
     /// One network sample in, one out.
     pub fn step(&mut self, input: f64) -> f64 {
         self.now += 1;
+        self.far_peak = self.far_peak.max(input.abs());
         self.rx.feed(input);
         match self.watching() {
             Some(learn) => {
@@ -779,8 +823,10 @@ impl Modem {
             self.retrain_why = Some("Tone A from the analogue modem (9.5.2.1)");
             if let Some((on, off, held)) = self.retrain_watch.took() {
                 self.say(format!(
-                    "tone A taken for a retrain: {on:.4} on the tone, {off:.4} at 150 Hz either side, held {:.0} ms",
-                    held as f64 / FS * 1e3
+                    "tone A taken for a retrain: {on:.4} on the tone, {off:.4} at 150 Hz either side, held {:.0} ms, at {}. {}",
+                    held as f64 / FS * 1e3,
+                    self.phase(),
+                    self.cp_tally()
                 ));
             }
             self.wants_retrain = true;
@@ -804,11 +850,15 @@ impl Modem {
             // nowhere is a retrain.
             self.deadline = None;
             self.retrain_why = Some(why);
-            self.say(format!("{why}: retrain"));
+            self.say(format!("{why}: retrain. {}", self.cp_tally()));
             self.wants_retrain = true;
         }
         self.stage_step();
-        self.source.next()
+        let out = self.source.next();
+        if let Some(sig) = self.source.changed.take() {
+            self.say(format!("going out: {}", sig.name()));
+        }
+        out
     }
 
     /// From data mode to Rd (9.6.1.1.1, 9.6.1.2.2), and phase 4 after it.
@@ -1000,6 +1050,7 @@ impl Modem {
     /// and is read with the equaliser phase 3 left.
     fn begin_phase4(&mut self, s_bar: u64) {
         self.say(format!("phase 4: Ri for {RI_SYMBOLS}T, waiting for the analogue modem's CPt"));
+        self.far_peak = 0.0;
         self.stage = Stage::Phase4Cpt;
         self.rx.resume(s_bar + 2 * signals::S_BAR_SYMBOLS as u64);
         self.rx.set_size(self.cp_size());
