@@ -534,6 +534,7 @@ impl Digital {
     pub fn step(&mut self, input: f64) -> f64 {
         if let Some(m) = self.v90.as_mut() {
             let out = m.step(input);
+            self.notes.extend(m.take_trace());
             let failed = match m.status() {
                 digital::Status::Failed(why) => Some(why),
                 digital::Status::Connected { .. } => {
@@ -558,6 +559,11 @@ impl Digital {
                     self.notes.push("V.34 next time round, not V.90".into());
                     self.v34.decline_pcm();
                 }
+            } else if retrain {
+                // A retrain the start-up asked for itself: the analogue
+                // modem's tone A, or a deadline that ran out. Said here
+                // rather than kept, since the start-up goes back to phase 2.
+                self.last_failure = m.retrain_why();
             }
             if retrain || failed.is_some() {
                 self.renegotiations += m.renegotiations();

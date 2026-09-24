@@ -519,6 +519,12 @@ pub struct Modem {
     /// whether one is wanted.
     retrain_watch: RetrainWatch,
     wants_retrain: bool,
+    /// What asked for the retrain, for the transcript: the tone, the
+    /// deadline's own words, or the modem above.
+    retrain_why: Option<&'static str>,
+    /// What phases 3 and 4 have done, a line each, for the transcript
+    /// (see [`Self::take_trace`]).
+    trace: Vec<String>,
     /// The analogue modem's S after Ja, and when it has to have come by.
     s_heard: bool,
     s_deadline: Option<u64>,
@@ -569,6 +575,8 @@ impl Modem {
             phase3_snr: None,
             retrain_watch: RetrainWatch::new(Role::Answer, FS),
             wants_retrain: false,
+            retrain_why: None,
+            trace: Vec::new(),
             s_heard: false,
             s_deadline: None,
             s_watch: SWatch::default(),
@@ -682,7 +690,23 @@ impl Modem {
 
     /// Start a retrain (9.5.1.1).
     pub fn start_retrain(&mut self) {
+        self.retrain_why = Some("asked for by the modem above");
         self.wants_retrain = true;
+    }
+
+    /// What asked for the retrain, once one has been asked for.
+    pub fn retrain_why(&self) -> Option<&'static str> {
+        self.retrain_why
+    }
+
+    /// What phases 3 and 4 have done, a line each, kept until whoever is
+    /// above takes them.
+    pub fn take_trace(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.trace)
+    }
+
+    fn say(&mut self, line: impl Into<String>) {
+        self.trace.push(line.into());
     }
 
     /// Rate renegotiations and cleardowns since the call began, from either
@@ -752,6 +776,13 @@ impl Modem {
         }
         // 9.3.1, 9.4.1 and 9.6.1: tone A is the analogue modem retraining.
         if self.stage != Stage::Finished && self.retrain_watch.feed(input, FS) {
+            self.retrain_why = Some("Tone A from the analogue modem (9.5.2.1)");
+            if let Some((on, off, held)) = self.retrain_watch.took() {
+                self.say(format!(
+                    "tone A taken for a retrain: {on:.4} on the tone, {off:.4} at 150 Hz either side, held {:.0} ms",
+                    held as f64 / FS * 1e3
+                ));
+            }
             self.wants_retrain = true;
         }
         while let Some(heard) = self.rx.heard() {
@@ -765,13 +796,15 @@ impl Modem {
             self.md_until = None;
             self.rx.hunt();
         }
-        if let Some((at, _)) = self.deadline
+        if let Some((at, why)) = self.deadline
             && self.now > at
             && self.status == Status::Running
         {
             // 9.4.1 and 9.6.1: a start-up or a renegotiation that goes
             // nowhere is a retrain.
             self.deadline = None;
+            self.retrain_why = Some(why);
+            self.say(format!("{why}: retrain"));
             self.wants_retrain = true;
         }
         self.stage_step();
@@ -855,10 +888,13 @@ impl Modem {
                     let dil = self.descriptor.as_ref().is_some_and(|d| !d.is_empty());
                     self.source.after_jd_prime = if dil { Out::Dil } else { Out::Ri };
                     self.source.change(Out::JdPrime);
+                    self.say("the analogue modem's S is here: Jd' going out");
                     self.stage = Stage::AwaitFirstReversal;
                 } else if self.s_deadline.is_some_and(|at| self.now > at) {
                     // "... it shall initiate a retrain."
                     self.s_deadline = None;
+                    self.retrain_why = Some("no S within 5100 ms of TRN1d (9.3.1.5)");
+                    self.say("no S within 5100 ms of TRN1d, Jd repeated over it: retrain");
                     self.wants_retrain = true;
                 }
             }
@@ -871,6 +907,7 @@ impl Modem {
                 // 9.4.1.4: an MP' sent, and CP' or E heard.
                 let heard_back = self.cp.as_ref().is_some_and(|cp| cp.acknowledge) || self.far_e;
                 if self.source.out == Out::Mp && self.source.acknowledged >= 1 && heard_back && self.source.pending.is_none() {
+                    self.say(if self.far_e { "E heard: Ed going out" } else { "CP' heard: Ed going out" });
                     self.source.change(Out::Ed);
                 }
             }
@@ -882,6 +919,7 @@ impl Modem {
                     && self.decoder.is_some()
                 {
                     let downstream = self.cp.as_ref().and_then(|cp| sequences::data_rate(cp.drn)).unwrap_or(0);
+                    self.say(format!("B1 done: data mode, {downstream} down, {} up", self.upstream_rate));
                     self.status = Status::Connected { downstream, upstream: self.upstream_rate };
                     self.deadline = None;
                 }
@@ -897,18 +935,27 @@ impl Modem {
         match heard {
             // Kept until Jd is going out, which is when 9.3.1.4 has the
             // receiver listen for it.
-            Heard::S if self.stage == Stage::SendJd => self.s_heard = true,
+            Heard::S if self.stage == Stage::SendJd => {
+                if !self.s_heard {
+                    self.say("the analogue modem's S heard");
+                }
+                self.s_heard = true;
+            }
             Heard::S => {}
             Heard::Reversal { at } => self.reversal(at),
             Heard::Trained { snr_db } => {
                 if self.stage == Stage::Training {
+                    self.say(format!("trained on the analogue modem's S at {snr_db:.1} dB"));
                     self.phase3_snr = Some(snr_db);
                     self.stage = Stage::ReadJa;
                     self.in_trn = true;
                     self.trn_symbols = 0;
                 }
             }
-            Heard::Untrained => self.fail("the analogue modem's training sequence did not train this end"),
+            Heard::Untrained => {
+                self.say("the analogue modem's S and TRN did not train this end");
+                self.fail("the analogue modem's training sequence did not train this end")
+            }
             Heard::Symbol(symbol) => self.symbol(symbol),
         }
     }
@@ -923,6 +970,7 @@ impl Modem {
                     self.rx.idle();
                     return;
                 }
+                self.say("the analogue modem's S reversal: training on its PP and TRN");
                 self.rx.train(Reference::PpThenTrn, Mode::Answer, at);
                 self.stage = Stage::Training;
             }
@@ -930,6 +978,7 @@ impl Modem {
                 if self.source.after_jd_prime == Out::Dil {
                     // The S-bar that answers J'd. The one that ends the DIL is
                     // still to come (9.3.1.6).
+                    self.say("S-bar answers Jd': DIL going out");
                     self.stage = Stage::AwaitSecondReversal;
                     self.rx.hunt();
                 } else {
@@ -939,6 +988,7 @@ impl Modem {
             Stage::AwaitSecondReversal => {
                 // 9.3.1.6: "complete sending the current segment of the DIL
                 // and proceed to Phase 4".
+                self.say("the DIL's S reversal: phase 4");
                 self.source.change(Out::Ri);
                 self.begin_phase4(at);
             }
@@ -949,6 +999,7 @@ impl Modem {
     /// Phase 4: the analogue modem's CPt follows its S-bar straight away,
     /// and is read with the equaliser phase 3 left.
     fn begin_phase4(&mut self, s_bar: u64) {
+        self.say(format!("phase 4: Ri for {RI_SYMBOLS}T, waiting for the analogue modem's CPt"));
         self.stage = Stage::Phase4Cpt;
         self.rx.resume(s_bar + 2 * signals::S_BAR_SYMBOLS as u64);
         self.rx.set_size(self.cp_size());
@@ -1029,6 +1080,11 @@ impl Modem {
     fn heard_ja(&mut self, descriptor: Descriptor) {
         // 9.3.1.3: "may wait for up to 500 ms and shall then transmit signal
         // Sd". Not waiting.
+        self.say(format!(
+            "Ja heard: {} segments of DIL {}",
+            descriptor.ucodes.len(),
+            if descriptor.is_empty() { "asked for none" } else { "asked for" }
+        ));
         self.source.dil = descriptor.symbols().collect();
         let mut end = 0;
         self.source.dil_ends = descriptor
@@ -1055,6 +1111,7 @@ impl Modem {
                     self.fail("the analogue modem's CPt is not one this end can send");
                     return;
                 };
+                self.say(format!("CPt heard (drn {}): R-bar-i then TRN2d going out", cp.drn));
                 self.source.training = Some(training);
                 self.source.mp = Some(self.make_mp());
                 self.source.change(Out::RiBar);
@@ -1073,6 +1130,10 @@ impl Modem {
             self.fail("the analogue modem's CP is not one this end can send");
             return;
         };
+        self.say(format!(
+            "CP heard (drn {}, acknowledge {}): MP' after this MP",
+            cp.drn, cp.acknowledge
+        ));
         self.source.data_mode = Some(data_mode);
         // 9.4.1.3: "After receiving the analogue modem's CP sequence, the
         // digital modem shall complete sending the current MP sequence, and
@@ -1091,6 +1152,7 @@ impl Modem {
             return;
         };
         // 9.4.1.6: B1 next, then data.
+        self.say(format!("E heard: B1d going out at {} bit/s, waiting for B1", self.upstream_rate));
         let params = Params { framing, code: Code::States16, nonlinear: ours.non_linear, precoding: [(0, 0); 3], mode: Mode::Answer };
         let decoder = UpstreamDecoder::new(params);
         self.rx.set_grid(decoder.grid_scale(), decoder.extent());

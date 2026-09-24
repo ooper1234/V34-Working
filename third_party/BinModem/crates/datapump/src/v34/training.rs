@@ -244,11 +244,19 @@ pub(crate) struct RetrainWatch {
     floor: f64,
     /// Whether the tone standing now has been taken for a retrain already.
     told: bool,
+    /// What the watch decided on when it took a tone: the tone's amplitude,
+    /// the louder of the two 150 Hz off it, and how long it stood.
+    took: Option<(f64, f64, u64)>,
 }
 
 impl RetrainWatch {
     /// `far` is the tone the far end sends to start a retrain: Tone A at
     /// 2400 Hz from the answer modem, Tone B at 1200 Hz from the call modem.
+    /// V.90's digital modem is the answer modem and 9.5.1.1 has it listen
+    /// for Tone A, so it takes [`Role::Answer`] here; V.90's analogue modem
+    /// is the call modem and 9.5.2.1 has it listen for Tone B, so it takes
+    /// [`Role::Call`] -- which is what the live captures bear out (the
+    /// server's retrain tone is the 1200 Hz one).
     pub(crate) fn new(far: Role, fs: f64) -> Self {
         let freq = match far {
             Role::Call => 1200.0,
@@ -261,7 +269,15 @@ impl RetrainWatch {
             held: 0,
             floor: RETRAIN_TONE_AUDIBLE,
             told: false,
+            took: None,
         }
+    }
+
+    /// What the watch decided on when it took a tone for a retrain: the
+    /// tone's amplitude, the louder of the two detectors 150 Hz either side
+    /// of it, and how many samples it stood clear for.
+    pub(crate) fn took(&self) -> Option<(f64, f64, u64)> {
+        self.took
     }
 
     /// For V.90's analogue modem, whose phase 2 heard the digital modem's
@@ -296,6 +312,13 @@ impl RetrainWatch {
         self.held = if clear { self.held + 1 } else { 0 };
         self.told &= self.held > 0;
         let retrain = !self.told && self.held >= (RETRAIN_TONE_HELD * fs) as u64 && self.on.amplitude() > self.floor;
+        if retrain {
+            self.took = Some((
+                self.on.amplitude(),
+                self.below.amplitude().max(self.above.amplitude()),
+                self.held,
+            ));
+        }
         self.told |= retrain;
         retrain
     }
@@ -2251,9 +2274,9 @@ mod tests {
         }
     }
 
-    /// With no level from phase 2 the watch is the one V.34 and the digital
-    /// modem use, sample for sample: anything audible and clear for 55 ms is
-    /// a retrain, however quiet, and is told once.
+    /// With no level from phase 2 the watch is the one V.34 and the V.90
+    /// digital modem use, sample for sample: anything audible and clear for
+    /// 55 ms is a retrain, however quiet, and is told once.
     #[test]
     fn with_no_level_from_phase_2_the_watch_is_as_it_was() {
         // The watch as it was before it knew of levels.
