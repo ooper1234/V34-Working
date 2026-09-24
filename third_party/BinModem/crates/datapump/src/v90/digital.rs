@@ -32,7 +32,7 @@ use crate::v34::training::{RetrainWatch, SWatch, Watched};
 use crate::v34::qam::Band;
 use crate::v34::receiver::{self, Heard, Receiver, Reference};
 use crate::v34::signals::{self, Reader, Size};
-use crate::v90::sequences::points;
+use crate::v90::sequences::{points, rx_dump, tap_dump};
 use crate::v34::trellis::Code;
 
 use super::INTERVALS;
@@ -598,6 +598,8 @@ pub struct Modem {
     far_peak: f64,
     /// When phase 4 last said what the receiver thought of the signal.
     phase4_note: u64,
+    /// The stage the last sample was in, so a change can be said for.
+    last_stage: Stage,
     /// When R-bar-i last went out, whether an answer is still coming, how
     /// many times the transition has been offered, and when R is to be held
     /// before the next R-bar-i.
@@ -658,6 +660,7 @@ impl Modem {
             trace: Vec::new(),
             far_peak: 0.0,
             phase4_note: 0,
+            last_stage: Stage::AwaitS,
             rbar_at: None,
             rbar_tries: 0,
             retry_at: None,
@@ -852,16 +855,44 @@ impl Modem {
     /// One network sample in, one out.
     pub fn step(&mut self, input: f64) -> f64 {
         self.now += 1;
+        if let Some(mut f) = rx_dump() {
+            let _ = writeln!(f, "{} {:?} {:.6}", self.now, self.stage, input);
+        }
         self.far_peak = self.far_peak.max(input.abs());
         self.rx.feed(input);
         // Phase 4's own account of the far end, every half second: what the
         // receiver thinks of the signal, so a live call's transcript says
         // whether sequences that do not parse arrived on a locked receiver
         // or a lost one.
+        if self.last_stage != self.stage {
+            self.last_stage = self.stage;
+            if !matches!(self.stage, Stage::AwaitS | Stage::Training) {
+                self.say(format!(
+                    "stage {:?}: snr {:.1} dB (trained {:.1}), taps {:.2}, slips {}",
+                    self.stage,
+                    self.rx.snr_db(),
+                    self.rx.trained_snr_db(),
+                    self.tap_norm(),
+                    self.rx.slips()
+                ));
+                if let Some(mut f) = tap_dump() {
+                    let mut text = format!("@stage {:?} {}\n", self.stage, self.now);
+                    self.rx.tap_dump(&mut text);
+                    let _ = f.write_all(text.as_bytes());
+                }
+            }
+        }
         if matches!(self.stage, Stage::Phase4Cpt | Stage::Phase4Cp) && self.now - self.phase4_note >= FS as u64 / 2 {
             self.phase4_note = self.now;
+            if let Some(mut f) = tap_dump() {
+                let mut text = String::new();
+                use std::fmt::Write as _;
+                let _ = writeln!(text, "@ {}", self.now);
+                self.rx.tap_dump(&mut text);
+                let _ = f.write_all(text.as_bytes());
+            }
             self.say(format!(
-                "phase 4: snr {:.1} dB, trained {:.1} dB, drift {:+.0} ppm, {} points, {} slips{}, receiver at {} bit/s on {} Hz, {}",
+                "phase 4: snr {:.1} dB, trained {:.1} dB, drift {:+.0} ppm, {} points, {} slips{}, receiver at {} bit/s on {} Hz, taps {:.2}, turn {:+.4}, {}",
                 self.rx.snr_db(),
                 self.rx.trained_snr_db(),
                 self.rx.drift_ppm(),
@@ -873,6 +904,8 @@ impl Modem {
                 if self.rx.is_lost() { ", LOST" } else { "" },
                 self.rx.band().rate.nominal(),
                 self.rx.band().carrier(),
+                self.tap_norm(),
+                self.rx.carrier_turn(),
                 self.cp_tally()
             ));
         }
@@ -1093,7 +1126,7 @@ impl Modem {
             Heard::Reversal { at } => self.reversal(at),
             Heard::Trained { snr_db } => {
                 if self.stage == Stage::Training {
-                    self.say(format!("trained on the analogue modem's S at {snr_db:.1} dB"));
+                    self.say(format!("trained on the analogue modem's S at {snr_db:.1} dB, taps {:.2}", self.tap_norm()));
                     self.phase3_snr = Some(snr_db);
                     self.stage = Stage::ReadJa;
                     self.in_trn = true;
@@ -1147,15 +1180,31 @@ impl Modem {
     /// Phase 4: the analogue modem's CPt follows its S-bar straight away,
     /// and is read with the equaliser phase 3 left.
     fn begin_phase4(&mut self, s_bar: u64) {
-        self.say(format!("phase 4: Ri for {RI_SYMBOLS}T, waiting for the analogue modem's CPt"));
+        self.say(format!("phase 4: Ri for {RI_SYMBOLS}T, waiting for the analogue modem's CPt, taps {:.2}", self.tap_norm()));
         self.far_peak = 0.0;
         self.phase4_note = 0;
         self.rbar_at = None;
         self.rbar_tries = 0;
         self.retry_at = None;
         self.stage = Stage::Phase4Cpt;
-        self.rx.resume(s_bar + 2 * signals::S_BAR_SYMBOLS as u64);
+        // V90_P4_AT moves where phase 4 starts reading, in half symbols: a
+        // bench hook for how far the CPt's grid is from where the S-bar left
+        // it, which is what the receiver has to find on a real line.
+        let at = std::env::var("V90_P4_AT").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        self.rx.resume((s_bar + 2 * signals::S_BAR_SYMBOLS as u64).saturating_add_signed(at));
+        if let Some(hz) = std::env::var("V90_P4_CARRIER").ok().and_then(|v| v.parse::<f64>().ok()) {
+            self.rx.set_carrier_offset(hz);
+        }
+        if let Some(r) = std::env::var("V90_P4_RATE").ok().and_then(|v| v.parse::<f64>().ok()) {
+            self.rx.set_rate_ratio(r);
+        }
         self.rx.set_size(self.cp_size());
+        // V90_P4_16 reads the CPt against sixteen points instead of four,
+        // phase 3 untouched: the far end's own "constellations" field says
+        // which it is using, and a bench needs to be able to try the other.
+        if std::env::var_os("V90_P4_16").is_some() {
+            self.rx.set_size(Size::Sixteen);
+        }
         self.cps = CpFinder::default();
         self.ones = 0;
     }
@@ -1164,10 +1213,28 @@ impl Modem {
         if self.settings.jd.sixteen_in_training { Size::Sixteen } else { Size::Four }
     }
 
+    /// How big the receiver's equaliser is, for the transcript: whether the
+    /// loops are still where training left them.
+    fn tap_norm(&self) -> f64 {
+        self.rx.taps().iter().map(|w| w.norm_sqr()).sum::<f64>().sqrt()
+    }
+
     fn symbol(&mut self, symbol: receiver::Symbol) {
-        if points().is_some() && matches!(self.stage, Stage::Phase4Cpt | Stage::Phase4Cp) {
+        if points().is_some() {
             if let Some(mut f) = points() {
-                let _ = writeln!(f, "{} {:.6} {:.6}", self.now, symbol.point.re, symbol.point.im);
+                // The stage is here because the whole point of the dump is to
+                // compare one stage's points with another's: phase 3's four
+                // tight clusters say what the far end's grid is, and phase 4's
+                // say whether the far end is still on it.
+                let _ = writeln!(
+                    f,
+                    "{} {:?} {:.6} {:.6} {:?}",
+                    self.now,
+                    self.stage,
+                    symbol.point.re,
+                    symbol.point.im,
+                    symbol.decided
+                );
             }
         }
         match self.stage {

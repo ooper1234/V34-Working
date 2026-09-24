@@ -486,13 +486,34 @@ fn trace() -> bool {
 /// points to be written, sample number first: a far end's phase 4 signal on
 /// a receiver that cannot read it is otherwise invisible.
 pub(crate) fn points() -> Option<std::fs::File> {
+    open(&std::env::var_os("V90_POINTS"))
+}
+
+/// Where `V90_RX_DUMP` asks for every sample the receiver is fed to be
+/// written, with the stage it was fed in: the line a capture holds is the
+/// line as it arrived, and what the echo canceller made of it is a question
+/// only the path itself can answer.
+pub(crate) fn rx_dump() -> Option<std::fs::File> {
+    open(&std::env::var_os("V90_RX_DUMP"))
+}
+
+/// Where `V90_TAPS` asks for the equaliser's weights to be written, one block
+/// per phase 4 heartbeat: a filter that has stopped being the equaliser
+/// training solved for is otherwise invisible.
+pub(crate) fn tap_dump() -> Option<std::fs::File> {
+    open(&std::env::var_os("V90_TAPS"))
+}
+
+fn open(path: &Option<std::ffi::OsString>) -> Option<std::fs::File> {
     use std::sync::Mutex;
-    static PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
-    let mut guard = PATH.lock().ok()?;
-    if guard.is_none() {
-        *guard = std::env::var_os("V90_POINTS").map(std::path::PathBuf::from);
+    static PATHS: Mutex<Vec<(Option<std::path::PathBuf>, Option<std::fs::File>)>> = Mutex::new(Vec::new());
+    let path = path.as_ref()?;
+    let mut guard = PATHS.lock().ok()?;
+    if !guard.iter().any(|(p, _)| p.as_deref() == Some(std::path::Path::new(path))) {
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok();
+        guard.push((Some(std::path::PathBuf::from(path)), file));
     }
-    std::fs::OpenOptions::new().create(true).append(true).open(guard.as_ref()?).ok()
+    guard.iter_mut().find(|(p, _)| p.as_deref() == Some(std::path::Path::new(path))).and_then(|(_, f)| f.as_mut()).map(|f| f.try_clone().ok()).flatten()
 }
 
 #[derive(Debug, Clone)]

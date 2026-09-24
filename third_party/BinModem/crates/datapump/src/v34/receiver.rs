@@ -514,6 +514,55 @@ impl Receiver {
         self.band
     }
 
+    /// Move the carrier this receiver mixes down by `hz`, for a bench that
+    /// has to find out what carrier a far end is really on: the phase the
+    /// loops are carrying on is theirs to find again, and `step` is all that
+    /// says how fast the carrier turns.
+    pub fn set_carrier_offset(&mut self, hz: f64) {
+        self.step = (self.band.carrier() + hz) / 8_000.0;
+    }
+
+    /// The carrier loop's turn, in radians a symbol: how fast the phase this
+    /// receiver is carrying on is advancing.
+    pub fn carrier_turn(&self) -> f64 {
+        self.turn
+    }
+
+    /// Take the symbol rate this receiver assumes to be `ratio` times the one
+    /// its band says, for a bench that has to find out what rate a far end is
+    /// really on: the timing loop can only follow a rate it does not know
+    /// about at its clamp, and a grid that walks off the signal is what a
+    /// smeared constellation is.
+    pub fn set_rate_ratio(&mut self, ratio: f64) {
+        self.half = 8_000.0 / (self.band.baud() * ratio) / 2.0;
+    }
+
+    /// The equaliser's weights and the newest half-symbol samples written
+    /// out, for a bench that has to see what the filter is doing to the
+    /// signal and what it is being given.
+    pub fn tap_dump(&self, out: &mut String) {
+        use std::fmt::Write;
+        for (i, w) in self.taps.iter().enumerate() {
+            let _ = write!(out, "{i} {:.6} {:.6}\n", w.re, w.im);
+        }
+        let _ = writeln!(
+            out,
+            "# norm {:.4} turn {:.5} settled {:.6} error {:.6} first {} next {} made {} rotation {:.4} reach {}",
+            self.taps.iter().map(|w| w.norm_sqr()).sum::<f64>().sqrt(),
+            self.turn,
+            self.settled,
+            self.error,
+            self.first,
+            self.next_symbol,
+            self.made,
+            self.rotation,
+            REACH
+        );
+        for (m, v) in self.halves.iter().rev().take(2048).enumerate() {
+            let _ = writeln!(out, "h {m} {:.6} {:.6}", v.re, v.im);
+        }
+    }
+
     /// Look for S and the change to S-bar.
     pub fn hunt(&mut self) {
         self.mode = Mode3::Hunting(Hunt::default());
@@ -601,6 +650,13 @@ impl Receiver {
     /// The last symbol, equalised, while trained.
     pub fn last_point(&self) -> Option<Complex> {
         self.is_trained().then_some(self.last)
+    }
+
+    /// The equaliser's weights, for a caller that wants to see whether they
+    /// are still an equaliser: their size says whether the loops have walked
+    /// away from what training solved for.
+    pub fn taps(&self) -> &[Complex] {
+        &self.taps
     }
 
     /// The signal's power, as the mixed-down half-symbol samples have it.

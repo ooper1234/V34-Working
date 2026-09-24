@@ -69,6 +69,25 @@ const BOUNDARY_GAIN: f64 = 0.4;
    takes the reflection off before the engine sees it. */
 
 const ECHO_TAPS: usize = 512; /* 64 ms of echo spread */
+
+/**
+ * How many taps the filter has, `ECHO_TAPS` in the environment overriding
+ * the constant. The echo this call path brings back is not 64 ms long: on
+ * the 2026-09-24 23:16 capture a 256-tap model of it accounts for 1.7% of
+ * the line while our TRN2d and MP are out, 512 taps for 3.5%, 1024 for 6.9%
+ * and 2048 for 14.6% -- and what is left over is what stopped the receiver
+ * reading the analogue modem's CPt in phase 4, at 3 dB against the 35 dB it
+ * read the same modem's phase 3 at.
+ */
+fn echo_taps() -> usize {
+    use std::sync::Mutex;
+    static N: Mutex<Option<usize>> = Mutex::new(None);
+    let mut guard = N.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(std::env::var("ECHO_TAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(ECHO_TAPS));
+    }
+    guard.unwrap_or(ECHO_TAPS)
+}
 const ECHO_RING: usize = 8192; /* transmit history, just over a second */
 const ECHO_LAG_LO: usize = 640; /* search from 80 ms ... */
 const ECHO_LAG_HI: usize = 3072; /* ... to 384 ms */
@@ -76,6 +95,25 @@ const ECHO_WINDOW: usize = 1024; /* lock/adapt gate on 128 ms of input */
 const ECHO_PEAK_MIN: f64 = 0.3; /* correlation needed to lock a delay */
 const ECHO_QUIET_DB: f64 = -30.0; /* input loudness the far end must be under */
 const ECHO_MU: f64 = 0.5;
+
+/// The step the echo filter takes while the far end is talking, where its
+/// error is the far end's signal as much as its own. `ECHO_SLOW_MU` in the
+/// environment sets it; it is off by default, which is what the measurement
+/// says: on the 2026-09-24 23:16 capture 0.02 takes phase 4 from 2.8 dB to
+/// 19.0 dB for the half second after the CPt is answered, and 3 to 5 dB
+/// again once TRN2d and MP are out, for four CP sequences parsed either way.
+/// The filter converges on the echo and then on the far modem's CPt with it,
+/// which is the whole of the double-talk problem, and a step small enough not
+/// to do that is too small to converge in the time there is.
+fn slow_mu() -> f64 {
+    use std::sync::Mutex;
+    static MU: Mutex<Option<f64>> = Mutex::new(None);
+    let mut guard = MU.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(std::env::var("ECHO_SLOW_MU").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0));
+    }
+    guard.unwrap_or(0.0)
+}
 
 /// Whether the echo filter may adapt with the far end talking, gated by
 /// `ECHO_DOUBLE_TALK` in the environment: see [`Echo::double_talk`].
@@ -111,7 +149,7 @@ impl Echo {
             tx_pos: 0,
             delay: 0,
             peak: 0.0,
-            w: vec![0.0; ECHO_TAPS],
+            w: vec![0.0; echo_taps()],
             seen: Vec::with_capacity(ECHO_WINDOW),
             frozen: false,
             echo_energy: 0.0,
@@ -228,19 +266,29 @@ impl Echo {
         let mut yhat = 0.0;
         if self.delay != 0 && !self.seen.is_empty() {
             let n = self.tx.len();
-            let d0 = self.delay - ECHO_TAPS / 2; /* taps straddle the lock */
+            let d0 = self.delay - self.w.len() / 2; /* taps straddle the lock */
             let mut norm = 0.0;
-            let mut r = [0.0f64; ECHO_TAPS];
+            let mut r = vec![0.0f64; self.w.len()];
             for (k, slot) in r.iter_mut().enumerate() {
                 let v = self.tx[(self.tx_pos + n - (d0 + k)) % n];
                 *slot = v;
                 norm += v * v;
                 yhat += self.w[k] * v;
             }
-            if !self.frozen && self.quiet() && norm > 1e-4 {
-                let g = ECHO_MU * (x - yhat) / norm;
-                for (k, &v) in r.iter().enumerate() {
-                    self.w[k] = self.w[k] * 0.99995 + g * v;
+            if !self.frozen && norm > 1e-4 {
+                // Fast while the far end is quiet, where the error is the
+                // filter's own; the slow step, where there is one, is for
+                // the far end talking. It is off by default -- see
+                // `slow_mu` -- but the gap it was written to fill is real:
+                // the filter only ever learns from whatever we happened to
+                // send on a quiet window, and the phase 3 TRN1d and Jd are
+                // one G.711 codeword turned over, six samples to the cycle.
+                let mu = if self.quiet() { ECHO_MU } else { slow_mu() };
+                if mu > 0.0 {
+                    let g = mu * (x - yhat) / norm;
+                    for (k, &v) in r.iter().enumerate() {
+                        self.w[k] = self.w[k] * 0.99995 + g * v;
+                    }
                 }
             }
         }
