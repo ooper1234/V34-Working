@@ -52,6 +52,28 @@ const RI_SYMBOLS: usize = 192;
 /// R-bar: "4 repetitions of the 6-symbol sequence" (8.6.4).
 const R_BAR_FRAMES: usize = 4;
 
+/// How long the digital modem waits for a far end to answer an R-bar-i with
+/// CP before offering the transition again, and how many times it offers it.
+/// 9.4.2.1 has the analogue modem condition its receiver for the R-to-R-bar
+/// transition on entering phase 4, and 9.4.2.3 has it answer with CP; a far
+/// end still sending CPt is one that has not seen the transition, which the
+/// live capture of 2026-09-24 22:39 shows in six seconds of CPt and no CP.
+/// The one thing this end can do about that is say the transition again --
+/// R, then R-bar-i once more -- which also covers a far end that reads the
+/// other of the two polarities as the one it watches for. The wait has to
+/// outlast what the far end may spend before its CP: 9.4.2.2 lets it
+/// complete the CPt it is sending and then send SCR for up to 4000 ms, so
+/// anything much under 4.5 s yanks the transmit away from under a far end
+/// that is still allowed to be thinking (and does break the offline calls,
+/// which renegotiate through noise), and the 15 s plus five round trips of
+/// 9.4.1 leaves room for one such retry and little more.
+const R_BAR_ANSWERED: f64 = 4.5;
+const R_BAR_TRIES: u32 = 2;
+
+/// How long R is held before each R-bar-i after the first, so that what
+/// reaches the far end is the pair of signals and not a longer run of one.
+const R_BAR_GUARD: f64 = 0.1;
+
 /// TRN2d: "a minimum of 2040T" (9.4.1.2), in whole frames.
 const TRN2D_FRAMES: usize = 340;
 
@@ -229,6 +251,9 @@ struct Source {
     trn1d_symbols: usize,
     /// The last signal `start` moved to, for the transcript to notice.
     changed: Option<Out>,
+    /// A signal change waiting for the shaper to give up the last frame of
+    /// the one before it (see `frame_boundary_change`).
+    flush_then: Option<Out>,
 }
 
 impl Source {
@@ -236,6 +261,7 @@ impl Source {
         Self {
             trn1d_symbols: (trn1d * FS) as usize,
             changed: None,
+            flush_then: None,
             law,
             uinfo,
             out: Out::Silence,
@@ -439,6 +465,13 @@ impl Source {
     /// the frames are mapped, which with look-ahead is ahead of where they go.
     /// True if it did, or if what the encoder still held went first.
     fn frame_boundary_change(&mut self) -> bool {
+        // A change held back last boundary because the shaper still had a
+        // frame of the old signal to give up. It goes first, and the match
+        // below does not run, so nothing is counted twice.
+        if let Some(out) = self.flush_then.take() {
+            self.start(out);
+            return true;
+        }
         let next = match self.out {
             Out::Trn2d if self.count >= TRN2D_FRAMES => Some(Out::Mp),
             Out::Mp if self.bits.is_empty() => {
@@ -466,10 +499,12 @@ impl Source {
         };
         let Some(out) = next else { return false };
         // B1d starts the coding again and Rd is not coded at all: frames
-        // already mapped carry what they were mapped from, and go first.
+        // already mapped carry what they were mapped from, and go first --
+        // and the change waits for them, rather than being dropped with them.
         let continues = matches!(out, Out::Mp | Out::Ed | Out::Data);
         if !continues && let Some(frame) = self.encoder.as_mut().and_then(|e| e.pop(true)) {
             self.emit(frame);
+            self.flush_then = Some(out);
             return true;
         }
         if self.out == Out::Data {
@@ -563,6 +598,12 @@ pub struct Modem {
     far_peak: f64,
     /// When phase 4 last said what the receiver thought of the signal.
     phase4_note: u64,
+    /// When R-bar-i last went out, whether an answer is still coming, how
+    /// many times the transition has been offered, and when R is to be held
+    /// before the next R-bar-i.
+    rbar_at: Option<u64>,
+    rbar_tries: u32,
+    retry_at: Option<u64>,
     /// The analogue modem's S after Ja, and when it has to have come by.
     s_heard: bool,
     s_deadline: Option<u64>,
@@ -617,6 +658,9 @@ impl Modem {
             trace: Vec::new(),
             far_peak: 0.0,
             phase4_note: 0,
+            rbar_at: None,
+            rbar_tries: 0,
+            retry_at: None,
             s_heard: false,
             s_deadline: None,
             s_watch: SWatch::default(),
@@ -987,6 +1031,33 @@ impl Modem {
                     self.say(if self.far_e { "E heard: Ed going out" } else { "CP' heard: Ed going out" });
                     self.source.change(Out::Ed);
                 }
+                // The transition answered with CP, or it is offered again: a
+                // far end that has not seen it keeps sending CPt, and 9.4.2.3
+                // is the only thing it has to say before that stops. Only
+                // before the first CP, though: a rate renegotiation is in
+                // phase 4 with no CP in hand either, and its CP is a long way
+                // off, and Rd then CP are there to be read (9.6.1).
+                if self.cp.is_none() && !self.renegotiating && self.source.out != Out::Ed {
+                    if let Some(at) = self.retry_at
+                        && self.now >= at
+                        && self.source.out == Out::Ri
+                    {
+                        self.retry_at = None;
+                        self.rbar_at = Some(self.now);
+                        self.rbar_tries += 1;
+                        self.source.change(Out::RiBar);
+                        self.say(format!("R-bar-i again (try {})", self.rbar_tries));
+                    } else if let Some(at) = self.rbar_at
+                        && self.now > at + (R_BAR_ANSWERED * FS) as u64
+                        && self.rbar_tries < R_BAR_TRIES
+                        && self.source.out != Out::Ri
+                    {
+                        self.rbar_at = None;
+                        self.retry_at = Some(self.now + (R_BAR_GUARD * FS) as u64);
+                        self.source.change(Out::Ri);
+                        self.say("no CP after R-bar-i: R again, then R-bar-i once more");
+                    }
+                }
             }
             Stage::Data => {
                 if self.status == Status::Running
@@ -1079,6 +1150,9 @@ impl Modem {
         self.say(format!("phase 4: Ri for {RI_SYMBOLS}T, waiting for the analogue modem's CPt"));
         self.far_peak = 0.0;
         self.phase4_note = 0;
+        self.rbar_at = None;
+        self.rbar_tries = 0;
+        self.retry_at = None;
         self.stage = Stage::Phase4Cpt;
         self.rx.resume(s_bar + 2 * signals::S_BAR_SYMBOLS as u64);
         self.rx.set_size(self.cp_size());
@@ -1205,6 +1279,9 @@ impl Modem {
                 self.source.training = Some(training);
                 self.source.mp = Some(self.make_mp());
                 self.source.change(Out::RiBar);
+                self.rbar_at = Some(self.now);
+                self.rbar_tries += 1;
+                self.retry_at = None;
                 self.cpt = Some(cp);
                 self.stage = Stage::Phase4Cp;
             }
@@ -1230,6 +1307,9 @@ impl Modem {
         // digital modem shall complete sending the current MP sequence, and
         // then send MP' sequences."
         self.source.mp_ack = true;
+        // The transition was answered, so there is nothing left to offer.
+        self.rbar_at = None;
+        self.retry_at = None;
         self.cp = Some(cp);
     }
 
