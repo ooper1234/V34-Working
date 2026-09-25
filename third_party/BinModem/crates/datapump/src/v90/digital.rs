@@ -1497,14 +1497,41 @@ impl Modem {
         let (Some(ours), Some(cp)) = (self.source.mp, self.cp.as_ref()) else { return };
         let rate = upstream_rate(cp, &ours);
         self.upstream_rate = u32::from(rate) * 2400;
-        let Some(framing) = Framing::new(self.settings.upstream.rate, self.upstream_rate, false, ours.expanded_shaping) else {
+        // V90_UP_RATE, in bit/s, takes the upstream rate the masks give: the
+        // rate is the one thing in the CP that both ends work out for
+        // themselves rather than being told, so it is where a real modem and
+        // this one can differ by a step and hand the receiver noise.
+        if let Some(bps) = std::env::var("V90_UP_RATE").ok().and_then(|v| v.parse::<u32>().ok()) {
+            self.upstream_rate = bps;
+        }
+        // V90_UP_EXPANDED, like the two below, takes the shaping the MP asks
+        // the far end's transmitter to use.
+        let expanded = match std::env::var("V90_UP_EXPANDED").ok().as_deref() {
+            Some("1") => true,
+            _ => ours.expanded_shaping,
+        };
+        let Some(framing) = Framing::new(self.settings.upstream.rate, self.upstream_rate, false, expanded) else {
             self.fail("no upstream rate both ends allow");
             return;
         };
         // 9.4.1.6: B1 next, then data.
         self.say(format!("E heard: B1d going out at {} bit/s, waiting for B1", self.upstream_rate));
         self.ed_tries = ED_TRIES;
-        let params = Params { framing, code: Code::States16, nonlinear: ours.non_linear, precoding: [(0, 0); 3], mode: Mode::Answer };
+        // What the analogue modem's transmitter is to do, which the MP asks
+        // for: the trellis, the nonlinear encoder and the shaping. A real
+        // modem need not take the MP's word for it, so V90_UP_TRELLIS (16, 32
+        // or 64), V90_UP_NONLINEAR and V90_UP_EXPANDED take each of them, to
+        // sweep a recording for the set the far end is really using.
+        let code = match std::env::var("V90_UP_TRELLIS").ok().and_then(|v| v.parse::<u8>().ok()) {
+            Some(32) => Code::States32,
+            Some(64) => Code::States64,
+            _ => Code::States16,
+        };
+        let nonlinear = match std::env::var("V90_UP_NONLINEAR").ok().as_deref() {
+            Some("1") => true,
+            _ => ours.non_linear,
+        };
+        let params = Params { framing, code, nonlinear, precoding: [(0, 0); 3], mode: Mode::Answer };
         let decoder = UpstreamDecoder::new(params);
         self.rx.set_grid(decoder.grid_scale(), decoder.extent());
         self.b1_left = framing.n;

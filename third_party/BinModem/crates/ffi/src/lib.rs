@@ -135,6 +135,13 @@ struct Echo {
     w: Vec<f64>,
     seen: Vec<f64>,
     frozen: bool,
+    /// The link is in data mode, where both ends are transmitting wideband and
+    /// the far end never goes quiet: the filter has to follow the reflection
+    /// there or the echo of this end's own data is what the receiver sees.
+    /// Set from the modem's status, which is where the decision belongs: a
+    /// slow step over a start-up sequence would learn the far end's training
+    /// signal instead of the path, and phase 4 stops reading altogether.
+    data: bool,
     /// The double-talk gate's running sums over one window: the energy the
     /// echo accounts for, and the energy it does not.
     echo_energy: f64,
@@ -152,6 +159,7 @@ impl Echo {
             w: vec![0.0; echo_taps()],
             seen: Vec::with_capacity(ECHO_WINDOW),
             frozen: false,
+            data: false,
             echo_energy: 0.0,
             residual_energy: 0.0,
             gate_samples: 0,
@@ -294,7 +302,13 @@ impl Echo {
                 // 5.8, 6.0 dB with it and the same eight without -- because
                 // the analogue modem's S-bar is in that window too, and a fast
                 // step learns it instead of the path.
-                let mu = if self.quiet() { ECHO_MU } else { slow_mu() };
+                let mu = if self.quiet() {
+                    ECHO_MU
+                } else if self.data {
+                    slow_mu()
+                } else {
+                    0.0
+                };
                 if mu > 0.0 {
                     let g = mu * (x - yhat) / norm;
                     for (k, &v) in r.iter().enumerate() {
@@ -565,6 +579,10 @@ impl Answerer {
     /// whole call, data mode included.
     fn linear_step(&mut self, input: c_int) -> c_int {
         self.echo.frozen = false;
+        // Data mode is where the echo path has to keep adapting with the far
+        // end talking: both directions are wideband there, so the reflection
+        // learned on the narrowband start-up sequences does not describe it.
+        self.echo.data = self.status == BM_CONNECTED;
         let x = self.echo.sample(input as f64 / 32768.0);
         let y = match &mut self.stage {
             Stage::V8(m) => {

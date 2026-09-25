@@ -396,6 +396,33 @@ static void pump_ppp(sm_call_t *c)
             return;
         }
 
+        /* SM_PPP_RX_DUMP: the first bytes the line hands over in data mode, as
+           hex, so what the far end's data mode really carries can be read
+           rather than inferred from pppd's silence. Off unless it is set. */
+        {
+            static FILE *dump;
+            static size_t dumped;
+            const char *path = getenv("SM_PPP_RX_DUMP");
+
+            if (n > 0 && path && path[0])
+            {
+                if (!dump)
+                    dump = fopen(path, "w");
+                if (dump && dumped < 512)
+                {
+                    size_t room = 512 - dumped;
+                    int k, upto = (int)(room < (size_t)n ? room : (size_t)n);
+
+                    for (k = 0; k < upto; k++)
+                        fprintf(dump, "%02x%s", tmp[k], (k % 32 == 31) ? "\n" : " ");
+                    if (upto % 32)
+                        fputc('\n', dump);
+                    fflush(dump);
+                    dumped += (size_t)upto;
+                }
+            }
+        }
+
         while (off < n)
         {
             if (c->ppy_out_len >= (int) sizeof(c->ppy_out))
@@ -436,6 +463,32 @@ static void pump_ppp(sm_call_t *c)
                 }
             }
             c->data_bytes_tx += i;
+
+            /* SM_PPP_TX_DUMP: the bytes pppd hands the line, as hex, the
+               counterpart to SM_PPP_RX_DUMP. Off unless it is set. */
+            {
+                static FILE *dump;
+                static size_t dumped;
+                const char *path = getenv("SM_PPP_TX_DUMP");
+
+                if (path && path[0])
+                {
+                    if (!dump)
+                        dump = fopen(path, "w");
+                    if (dump && dumped < 512)
+                    {
+                        size_t room = 512 - dumped;
+                        int k, upto = (int)(room < (size_t)r ? room : (size_t)r);
+
+                        for (k = 0; k < upto; k++)
+                            fprintf(dump, "%02x%s", tmp[k], (k % 32 == 31) ? "\n" : " ");
+                        if (upto % 32)
+                            fputc('\n', dump);
+                        fflush(dump);
+                        dumped += (size_t)upto;
+                    }
+                }
+            }
         }
         else if (r == 0)
         {
