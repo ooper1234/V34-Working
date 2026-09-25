@@ -170,6 +170,26 @@ impl Slicer {
         }
     }
 
+    /// The error past which a decision is not to be learned from.
+    ///
+    /// Four or sixteen points: half the way to the nearest other point, so an
+    /// error past it is more likely a wrong decision than a right one. A dense
+    /// grid is another matter -- every sample lands within half a step of some
+    /// point whatever it is, so this has to be a share of what garbage reads
+    /// there, or the loops never learn the path the data mode runs on: a rate
+    /// near 31 200 bit/s at 3200 baud puts hundreds of points on the grid, and
+    /// half a step squared is then a hundredth of the residual the equaliser
+    /// leaves on a path it was not trained for. Shut like that, the loops never
+    /// move and data mode is noise for good. Two fifths of what garbage reads
+    /// keeps them moving on a path the filter has settled and stops them on a
+    /// line that has gone.
+    fn adapt_level(self) -> f64 {
+        match self {
+            Self::Points(size) => 0.25 * min_distance_squared(size),
+            Self::Grid { .. } => 0.4 * self.min_distance_squared() / 6.0,
+        }
+    }
+
     /// Mean squared error past which the signal is taken to be lost.
     ///
     /// Four or sixteen points are far apart, and a lost signal's error is most
@@ -384,6 +404,10 @@ pub struct Receiver {
     taken: u64,
     /// Where the next half-symbol sample falls, in samples since the start.
     due: f64,
+    /// The slicer is data mode's dense grid: the decisions it makes are for
+    /// the loops to aim at, not to be believed, and there is no start-up to go
+    /// back to. Set with the grid, cleared with a constellation.
+    data_mode: bool,
     /// Samples a half symbol, nominally, and the timing loop's correction to
     /// it as a fraction.
     half: f64,
@@ -480,6 +504,7 @@ impl Receiver {
             history_first: 0,
             taken: 0,
             due: FILTER_TAPS as f64,
+            data_mode: false,
             half: fs / baud / 2.0,
             drift: 0.0,
             table,
@@ -614,6 +639,7 @@ impl Receiver {
     /// The constellation decisions are made against from here on.
     pub fn set_size(&mut self, size: Size) {
         self.size = size;
+        self.data_mode = false;
         self.set_slicer(Slicer::Points(size));
     }
 
@@ -621,9 +647,17 @@ impl Receiver {
         self.size
     }
 
+    /// The recent decision error, and the level past which the loops stop
+    /// learning from decisions: whether the adaptation gate is open, and by
+    /// how much.
+    pub fn gate(&self) -> (f64, f64) {
+        (self.error, self.slicer.adapt_level())
+    }
+
     /// Decide against data mode's grid from here on: `scale` grid units to a
     /// unit-power symbol, out to `limit`.
     pub fn set_grid(&mut self, scale: f64, limit: i32) {
+        self.data_mode = true;
         self.set_slicer(Slicer::Grid { scale, limit });
     }
 
@@ -979,9 +1013,7 @@ impl Receiver {
         let (decided, target) = self.slicer.decide(z);
         let e = z - target;
         let squared = e.norm_sqr();
-        // Half the way to the nearest other point, squared: an error past it
-        // is more likely a wrong decision than a right one.
-        let doubtful = 0.25 * self.slicer.min_distance_squared();
+        let doubtful = self.slicer.adapt_level();
         let (_, judged) = self.slicer.window();
         self.recent.push_back(squared);
         while self.recent.len() > judged {
@@ -989,24 +1021,40 @@ impl Receiver {
         }
         let recent = self.recent.iter().sum::<f64>() / self.recent.len() as f64;
         match self.lost {
-            None if self.recent.len() == judged && recent > self.slicer.lost_threshold(self.settled) => {
+            None if !self.data_mode
+                && self.recent.len() == judged
+                && recent > self.slicer.lost_threshold(self.settled) =>
+            {
                 // The signal has jumped, or gone. Hold everything -- as it was
                 // before the symbols that showed it, which every loop has
                 // been learning from as though they were right.
                 self.lost = Some(0);
                 self.rewind(judged as u64 + EARLIER_EVERY);
             }
-            Some(n) => self.lost = Some(n + 1),
-            None => {}
+            // In data mode there is nothing to resync to -- no S to find, and
+            // no start-up to go back to -- and the test cannot tell a signal
+            // that has gone from a grid whose decisions are not to be believed,
+            // since on a dense grid a locked signal reads about what noise
+            // reads. So the loops below run on and this is left unset.
+            Some(n) if !self.data_mode => self.lost = Some(n + 1),
+            _ => {}
         }
         self.rotation += self.turn;
-        if self.lost.is_none() && squared < doubtful {
-            // The equaliser learns in its own frame, before the carrier is
-            // taken out.
+        // The equaliser learns in its own frame, before the carrier is taken
+        // out. In data mode it does not learn at all: the slicer there is a
+        // coarse quantiser for the loops to aim at, and its error is as large
+        // as noise's, so a step taken from it walks the filter off the path
+        // rather than onto one. The carrier and the timing are averages over
+        // many symbols and are not biased by that, and they have to keep
+        // running: without them the sampling walks out of the symbol, which is
+        // the 581 slips the 2026-09-25 call showed.
+        if self.lost.is_none() && (squared < doubtful || self.data_mode) {
             let energy: f64 = row.iter().map(|x| x.norm_sqr()).sum::<f64>() + 1e-9;
-            let back = e * spin.conj() * (STEP / energy);
-            for (tap, x) in self.taps.iter_mut().zip(row) {
-                *tap -= back * x.conj();
+            if !self.data_mode {
+                let back = e * spin.conj() * (STEP / energy);
+                for (tap, x) in self.taps.iter_mut().zip(row) {
+                    *tap -= back * x.conj();
+                }
             }
             let power = target.norm_sqr().max(0.1);
             let wrong = (z * target.conj()).im / power;

@@ -992,6 +992,26 @@ impl Modem {
                 self.cp_tally()
             ));
         }
+        // The same note once a second in data mode: there the loops are judged
+        // against the data grid, and whether that gate is open is the whole of
+        // whether the receiver is following the far end's signal.
+        if self.stage == Stage::Data && self.now - self.phase4_note >= FS as u64 {
+            self.phase4_note = self.now;
+            let (error, level) = self.rx.gate();
+            self.say(format!(
+                "data mode: snr {:.1} dB, taps {:.2}, drift {:+.0} ppm, turn {:+.4}, {} slips{}, error {:.4} against a gate of {:.4} ({}), {}",
+                self.rx.snr_db(),
+                self.tap_norm(),
+                self.rx.drift_ppm(),
+                self.rx.carrier_turn(),
+                self.rx.slips(),
+                if self.rx.is_lost() { ", LOST" } else { "" },
+                error,
+                level,
+                if error < level { "open" } else { "shut" },
+                self.rx.band().carrier()
+            ));
+        }
         match self.watching() {
             Some(learn) => {
                 self.far_end.feed(input, learn);
