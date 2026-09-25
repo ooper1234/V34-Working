@@ -581,6 +581,21 @@ enum Stage {
     Finished,
 }
 
+/// Where `V90_DATA_POINTS` asks for the equalised points the data-mode decoder
+/// is fed to be written, one per line as re im: what the far end's signal looks
+/// like before anything decides what it meant.
+fn data_points() -> Option<std::fs::File> {
+    use std::sync::Mutex;
+    static PATH: Mutex<Option<(std::path::PathBuf, Option<std::fs::File>)>> = Mutex::new(None);
+    let want = std::env::var_os("V90_DATA_POINTS")?;
+    let mut guard = PATH.lock().ok()?;
+    if guard.is_none() {
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&want).ok();
+        *guard = Some((std::path::PathBuf::from(&want), file));
+    }
+    guard.as_mut()?.1.as_mut()?.try_clone().ok()
+}
+
 /// The digital modem, phase 3 on.
 #[derive(Debug, Clone)]
 pub struct Modem {
@@ -605,6 +620,8 @@ pub struct Modem {
     far_e: bool,
     decoder: Option<UpstreamDecoder>,
     b1_left: usize,
+    /// How many equalised points `V90_DATA_POINTS` has taken this call.
+    points_written: usize,
     received: Vec<bool>,
     upstream_rate: u32,
     phase3_snr: Option<f64>,
@@ -685,6 +702,7 @@ impl Modem {
             far_e: false,
             decoder: None,
             b1_left: 0,
+            points_written: 0,
             received: Vec::new(),
             upstream_rate: 0,
             phase3_snr: None,
@@ -1375,6 +1393,18 @@ impl Modem {
                     }
                 }
                 if let Some(decoder) = self.decoder.as_mut() {
+                    // V90_DATA_POINTS writes the equalised points the data-mode
+                    // decoder is fed, one per line, as re im. What the far end's
+                    // signal looks like before anything decides what it meant is
+                    // the one thing that says whether the receiver is locked:
+                    // clusters are a constellation, a smear is not.
+                    if let Some(mut f) = data_points() {
+                        if self.points_written < 8192 {
+                            let p = symbol.point;
+                            let _ = writeln!(f, "{:.6} {:.6}", p.re, p.im);
+                            self.points_written += 1;
+                        }
+                    }
                     decoder.feed(symbol.point);
                     for bit in decoder.take_bits() {
                         if self.b1_left > 0 {
@@ -1531,7 +1561,17 @@ impl Modem {
             Some("1") => true,
             _ => ours.non_linear,
         };
-        let params = Params { framing, code, nonlinear, precoding: [(0, 0); 3], mode: Mode::Answer };
+        // V90_UP_SCRAMBLER takes the polynomial the far modem's data is
+        // descrambled with. 6.5 names GPA, and `answer` is that; V.34's rule
+        // for the same physical direction -- the modem that placed the call --
+        // is GPC, and `call` is that. A self-synchronising descrambler with the
+        // wrong polynomial never locks, so the two are worth telling apart on a
+        // line rather than on the argument.
+        let mode = match std::env::var("V90_UP_SCRAMBLER").ok().as_deref() {
+            Some("call") => Mode::Call,
+            _ => Mode::Answer,
+        };
+        let params = Params { framing, code, nonlinear, precoding: [(0, 0); 3], mode };
         let decoder = UpstreamDecoder::new(params);
         self.rx.set_grid(decoder.grid_scale(), decoder.extent());
         self.b1_left = framing.n;
@@ -1552,7 +1592,15 @@ impl Modem {
         let most = crate::v34::probe::ceiling(rate);
         let most = if self.settings.wide { most } else { most.min(12) };
         let upstream = ((bits * self.settings.upstream.baud() / 2400.0).floor() as u8).clamp(2, most);
-        let upstream = self.upstream_cap.map_or(upstream, |cap| upstream.min(cap.max(2)));
+        let mut upstream = self.upstream_cap.map_or(upstream, |cap| upstream.min(cap.max(2)));
+        // V90_UP_RATE, in bit/s, takes the maximum analogue-to-digital rate
+        // this end asks for, and with it the rate the receiver takes: the two
+        // have to agree, since the far modem picks its transmit rate from this
+        // MP and this end then has to read what the MP asked for. A bench hook
+        // for the case where the far modem does not follow the MP.
+        if let Some(bps) = std::env::var("V90_UP_RATE").ok().and_then(|v| v.parse::<u32>().ok()) {
+            upstream = (bps / 2400).clamp(2, 14) as u8;
+        }
         Mp {
             call_to_answer: 0,
             // 9.7: "drn = 0 indicates cleardown".
