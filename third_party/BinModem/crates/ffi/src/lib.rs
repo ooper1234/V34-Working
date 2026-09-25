@@ -277,12 +277,20 @@ impl Echo {
             }
             if !self.frozen && norm > 1e-4 {
                 // Fast while the far end is quiet, where the error is the
-                // filter's own; the slow step, where there is one, is for
-                // the far end talking. It is off by default -- see
-                // `slow_mu` -- but the gap it was written to fill is real:
-                // the filter only ever learns from whatever we happened to
-                // send on a quiet window, and the phase 3 TRN1d and Jd are
-                // one G.711 codeword turned over, six samples to the cycle.
+                // filter's own; the slow step, where there is one, is for the
+                // far end talking. It is off by default -- see `slow_mu` --
+                // but the gap it was written to fill is real: the filter only
+                // ever learns from whatever we happened to send on a quiet
+                // window, and the phase 3 TRN1d and Jd are one G.711 codeword
+                // turned over, six samples to the cycle.
+                //
+                // What does not work is a gate that lets it learn from a loud
+                // window, which is what the DIL is -- two seconds of 22 666
+                // bit/s with the far modem silent, the one chance to learn a
+                // wideband path. Measured on the call of 2026-09-25 11:12,
+                // what has arrived is 0.47 of our own echo over that DIL and
+                // 0.43 to 0.46 over phase 4's TRN2d and MP: no threshold
+                // between the two tells the filter which window it is in.
                 let mu = if self.quiet() { ECHO_MU } else { slow_mu() };
                 if mu > 0.0 {
                     let g = mu * (x - yhat) / norm;
