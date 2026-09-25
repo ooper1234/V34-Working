@@ -85,6 +85,24 @@ const R_BAR_GUARD: f64 = 0.1;
 /// TRN2d: "a minimum of 2040T" (9.4.1.2), in whole frames.
 const TRN2D_FRAMES: usize = 340;
 
+/// How long the Ed waits for the far modem's E before being sent again, in
+/// seconds, and how many times it may be sent. 9.4.2.4 makes the Ed a trigger
+/// rather than a handshake: the analogue modem "shall continue sending CP
+/// sequences until it has sent a CP' and received an MP' or Ed", and then
+/// sends its E. An Ed it did not hear is an Ed worth sending twice, and the
+/// Ed is two data frames (8.6.2), so nothing here touches the data path --
+/// which is what the zeroes did: 0.12 s of them the engine's own pair rides
+/// out, 0.4 s and it loses the framing, with the far modem reading them as
+/// data all the while (9.4.2.6).
+///
+/// The wait has to outlast a late E as well as find a missing one. At 0.6 s
+/// the second Ed overtook an E that was on its way, and on the engine's own
+/// pair over a line with holes that cost a retrain each time; the E arrives
+/// 0.12 s after the Ed on a clean line and 0.34 s on hardware, and 1.5 s
+/// leaves both alone.
+const ED_RETRY: f64 = 1.5;
+const ED_TRIES: u32 = 2;
+
 /// B1d: "48 data frames" (8.6.1). Ed: "2 data frames" (8.6.2).
 const B1D_FRAMES: usize = 48;
 const ED_FRAMES: usize = 2;
@@ -608,6 +626,9 @@ pub struct Modem {
     phase4_note: u64,
     /// The stage the last sample was in, so a change can be said for.
     last_stage: Stage,
+    /// When the Ed last went out, and how many times it has been offered.
+    ed_at: Option<u64>,
+    ed_tries: u32,
     /// When R-bar-i last went out, whether an answer is still coming, how
     /// many times the transition has been offered, and when R is to be held
     /// before the next R-bar-i.
@@ -669,6 +690,8 @@ impl Modem {
             far_peak: 0.0,
             phase4_note: 0,
             last_stage: Stage::AwaitS,
+            ed_at: None,
+            ed_tries: 0,
             rbar_at: None,
             rbar_tries: 0,
             retry_at: None,
@@ -1070,8 +1093,26 @@ impl Modem {
                 let heard_back = self.cp.as_ref().is_some_and(|cp| cp.acknowledge) || self.far_e;
                 if self.source.out == Out::Mp && self.source.acknowledged >= 1 && heard_back && self.source.pending.is_none() {
                     self.say(if self.far_e { "E heard: Ed going out" } else { "CP' heard: Ed going out" });
+                    self.ed_at = Some(self.now);
+                    self.ed_tries = 1;
                     self.source.change(Out::Ed);
                 }
+                // The E did not come, and 9.4.2.4 makes the Ed a trigger
+                // rather than a handshake: the far modem is still waiting for
+                // an MP' or an Ed, so it is offered one again.
+                if self.ed_tries > 0
+                    && self.ed_tries < ED_TRIES
+                    && !self.far_e
+                    && self.source.out == Out::Data
+                    && self.source.pending.is_none()
+                    && self.now > self.ed_at.unwrap_or(0) + (ED_RETRY * FS) as u64
+                {
+                    self.ed_tries += 1;
+                    self.ed_at = Some(self.now);
+                    self.source.change(Out::Ed);
+                    self.say(format!("no E: Ed again (try {})", self.ed_tries));
+                }
+
                 // The transition answered with CP, or it is offered again: a
                 // far end that has not seen it keeps sending CPt, and 9.4.2.3
                 // is the only thing it has to say before that stops. Only
@@ -1203,6 +1244,8 @@ impl Modem {
         }
         self.far_peak = 0.0;
         self.phase4_note = 0;
+        self.ed_at = None;
+        self.ed_tries = 0;
         self.rbar_at = None;
         self.rbar_tries = 0;
         self.retry_at = None;
@@ -1411,6 +1454,7 @@ impl Modem {
         };
         // 9.4.1.6: B1 next, then data.
         self.say(format!("E heard: B1d going out at {} bit/s, waiting for B1", self.upstream_rate));
+        self.ed_tries = ED_TRIES;
         let params = Params { framing, code: Code::States16, nonlinear: ours.non_linear, precoding: [(0, 0); 3], mode: Mode::Answer };
         let decoder = UpstreamDecoder::new(params);
         self.rx.set_grid(decoder.grid_scale(), decoder.extent());
