@@ -1,8 +1,10 @@
 #include "sm_call.h"
 
-/* Bytes each SM_PPP_*_DUMP keeps: enough for seconds of data mode, not just
-   the negotiation at its start. */
-#define SM_PPP_DUMP_MAX 8192
+/* Bytes each SM_PPP_*_DUMP keeps. Large enough for a whole read-position sweep
+   in data mode (V90_DATA_BIAS holds each position for half a second, and the
+   upstream can be running at 31200 bit/s), not just the negotiation at the
+   start. Off unless the variable is set. */
+#define SM_PPP_DUMP_MAX 65536
 #include "ppp/sm_pppd.h"
 #include "bbs/bbs.h"
 

@@ -408,6 +408,12 @@ pub struct Receiver {
     /// the loops to aim at, not to be believed, and there is no start-up to go
     /// back to. Set with the grid, cleared with a constellation.
     data_mode: bool,
+    /// Samples to move the next read by, once. A shift and not a rate: `due`
+    /// already advances a half symbol at a time, so a constant added to it
+    /// would change the symbol *rate* rather than where in the symbol the
+    /// sampling falls, and only the latter is in question when the far end
+    /// starts its data mode in a superframe of its own.
+    shift_once: f64,
     /// Samples a half symbol, nominally, and the timing loop's correction to
     /// it as a fraction.
     half: f64,
@@ -505,6 +511,7 @@ impl Receiver {
             taken: 0,
             due: FILTER_TAPS as f64,
             data_mode: false,
+            shift_once: 0.0,
             half: fs / baud / 2.0,
             drift: 0.0,
             table,
@@ -654,6 +661,14 @@ impl Receiver {
         (self.error, self.slicer.adapt_level())
     }
 
+    /// Move the next sample read by `samples`, once. A half symbol is five
+    /// samples at 3200 baud on an 8 kHz line and a whole symbol ten, so a
+    /// sweep of a few tens of samples covers every position within the symbol
+    /// and several symbols of offset besides.
+    pub fn shift_read(&mut self, samples: f64) {
+        self.shift_once = samples;
+    }
+
     /// Decide against data mode's grid from here on: `scale` grid units to a
     /// unit-power symbol, out to `limit`.
     pub fn set_grid(&mut self, scale: f64, limit: i32) {
@@ -743,6 +758,10 @@ impl Receiver {
         while let Some(value) = self.interpolate(self.due) {
             let at = self.due;
             self.due += self.half * (1.0 + self.drift);
+            if self.shift_once != 0.0 {
+                self.due += self.shift_once;
+                self.shift_once = 0.0;
+            }
             self.on_half(value, at);
         }
     }
@@ -1021,23 +1040,15 @@ impl Receiver {
         }
         let recent = self.recent.iter().sum::<f64>() / self.recent.len() as f64;
         match self.lost {
-            None if !self.data_mode
-                && self.recent.len() == judged
-                && recent > self.slicer.lost_threshold(self.settled) =>
-            {
+            None if self.recent.len() == judged && recent > self.slicer.lost_threshold(self.settled) => {
                 // The signal has jumped, or gone. Hold everything -- as it was
                 // before the symbols that showed it, which every loop has
                 // been learning from as though they were right.
                 self.lost = Some(0);
                 self.rewind(judged as u64 + EARLIER_EVERY);
             }
-            // In data mode there is nothing to resync to -- no S to find, and
-            // no start-up to go back to -- and the test cannot tell a signal
-            // that has gone from a grid whose decisions are not to be believed,
-            // since on a dense grid a locked signal reads about what noise
-            // reads. So the loops below run on and this is left unset.
-            Some(n) if !self.data_mode => self.lost = Some(n + 1),
-            _ => {}
+            Some(n) => self.lost = Some(n + 1),
+            None => {}
         }
         self.rotation += self.turn;
         // The equaliser learns in its own frame, before the carrier is taken

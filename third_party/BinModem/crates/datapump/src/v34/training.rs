@@ -1532,6 +1532,16 @@ impl Modem {
         let bits = (1.0 + snr / 10f64.powf(0.6)).log2();
         let receive = ((bits * s.receive.baud() / 2400.0).floor() as u8).clamp(1, probe::ceiling(s.receive.rate));
         let receive = self.receive_cap.map_or(receive, |cap| receive.min(cap.max(1)));
+        // V34_MP_RX: ask for this rate index whatever the line is measured to
+        // be worth. Off unless set, and a bench hook: the V.34 data path
+        // otherwise only ever negotiates 7200 or 9600 upstream, because the
+        // index follows the phase 4 SNR, and every V.90 call negotiates
+        // 31200. Whether the receive path reads the far end at a rate the
+        // working V.34 calls never reached is worth answering on the hardware.
+        let receive = match std::env::var("V34_MP_RX").ok().and_then(|v| v.parse::<u8>().ok()) {
+            Some(v) => v.clamp(1, 14),
+            None => receive,
+        };
         let transmit = probe::ceiling(s.transmit.rate);
         let (call_to_answer, answer_to_call) = match s.role {
             _ if self.clearing && self.initiated => (0, 0),

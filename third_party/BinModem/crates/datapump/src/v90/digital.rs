@@ -581,9 +581,39 @@ enum Stage {
     Finished,
 }
 
+/// The read positions, in samples, `V90_DATA_BIAS` asks to be tried in turn
+/// once data mode starts: the far end begins a superframe of its own for B1
+/// (9.4.2.5), so the sampling instant this receiver locked in phase 4 need not
+/// be the one its first data symbol falls on, and the slicer's grid is coarse
+/// enough that a signal sampled half a symbol out still reads as locked. One
+/// call tries them all; each is held for `V90_DATA_BIAS_HOLD` half symbols.
+fn data_bias() -> &'static [f64] {
+    static BIAS: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    BIAS.get_or_init(|| {
+        std::env::var("V90_DATA_BIAS")
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|part| part.trim().parse::<f64>().ok())
+                    .collect::<Vec<f64>>()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Half symbols each read position is held for.
+fn data_bias_hold() -> u32 {
+    static HOLD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| {
+        std::env::var("V90_DATA_BIAS_HOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(800)
+    })
+}
+
 /// Where `V90_DATA_POINTS` asks for the equalised points the data-mode decoder
 /// is fed to be written, one per line as re im: what the far end's signal looks
-/// like before anything decides what it meant.
+/// like before anything decided what it meant.
 fn data_points() -> Option<std::fs::File> {
     use std::sync::Mutex;
     static PATH: Mutex<Option<(std::path::PathBuf, Option<std::fs::File>)>> = Mutex::new(None);
@@ -622,6 +652,10 @@ pub struct Modem {
     b1_left: usize,
     /// How many equalised points `V90_DATA_POINTS` has taken this call.
     points_written: usize,
+    /// Which of `data_bias()`'s read positions is in use, and how many half
+    /// symbols are left on it.
+    bias_at: usize,
+    bias_left: u32,
     received: Vec<bool>,
     upstream_rate: u32,
     phase3_snr: Option<f64>,
@@ -703,6 +737,8 @@ impl Modem {
             decoder: None,
             b1_left: 0,
             points_written: 0,
+            bias_at: 0,
+            bias_left: 0,
             received: Vec::new(),
             upstream_rate: 0,
             phase3_snr: None,
@@ -1410,6 +1446,27 @@ impl Modem {
                     }
                     if self.renegotiating && !self.far_s_bar && self.decoder.is_none() {
                         return;
+                    }
+                }
+                // V90_DATA_BIAS: move the read, one position at a time, and
+                // say so. A half symbol is five samples here, so the whole
+                // sweep is a handful of seconds of one call.
+                let bias = data_bias();
+                if !bias.is_empty() && self.stage == Stage::Data {
+                    if self.bias_left == 0 {
+                        if self.bias_at < bias.len() {
+                            self.rx.shift_read(bias[self.bias_at]);
+                            self.say(format!(
+                                "data mode: read position {} of {}: {:+.1} samples",
+                                self.bias_at + 1,
+                                bias.len(),
+                                bias[self.bias_at]
+                            ));
+                            self.bias_at += 1;
+                            self.bias_left = data_bias_hold();
+                        }
+                    } else {
+                        self.bias_left -= 1;
                     }
                 }
                 if let Some(decoder) = self.decoder.as_mut() {
