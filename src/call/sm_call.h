@@ -117,7 +117,7 @@ typedef struct {
     sm_log_t log;
 
     /* RX byte assembly for the pty */
-    uint8_t ppy_out[256];
+    uint8_t ppy_out[4096];
     int ppy_out_len;
 
     /* per-frame TX scratch (max AudioSocket payload / 2 samples) */

@@ -1,4 +1,8 @@
 #include "sm_call.h"
+
+/* Bytes each SM_PPP_*_DUMP keeps: enough for seconds of data mode, not just
+   the negotiation at its start. */
+#define SM_PPP_DUMP_MAX 8192
 #include "ppp/sm_pppd.h"
 #include "bbs/bbs.h"
 
@@ -310,6 +314,19 @@ capture_setup:
 
 static void ppp_flush(sm_call_t *c)
 {
+    /* The 2026-09-26 calls: the modem decoded 966 bytes of the far end's LCP
+     * and the relay reported taking none of them, with no drop and no write
+     * error logged anywhere. Say which of the two ways out of here is being
+     * taken, and which is not, once a call. */
+    static int said_full, said_none;
+
+    if (c->ppy_out_len > 0 && c->ppp_fd < 0 && !said_none)
+    {
+        said_none = 1;
+        sm_log_message(&c->log, SM_LOG_WARNING,
+                       "ppp: %d bytes decoded but no pppd to give them to",
+                       c->ppy_out_len);
+    }
     while (c->ppy_out_len > 0 && c->ppp_fd >= 0)
     {
         ssize_t w = write(c->ppp_fd, c->ppy_out, (size_t) c->ppy_out_len);
@@ -318,9 +335,24 @@ static void ppp_flush(sm_call_t *c)
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                static int said_busy;
+                if (!said_busy)
+                {
+                    said_busy = 1;
+                    sm_log_message(&c->log, SM_LOG_WARNING,
+                                   "ppp: the relay is not taking bytes: %s",
+                                   strerror(errno));
+                }
                 return;
+            }
             sm_log_message(&c->log, SM_LOG_WARNING, "ppp write failed: %s", strerror(errno));
             return;
+        }
+        if (!said_full)
+        {
+            said_full = 1;
+            sm_log_message(&c->log, SM_LOG_FLOW, "ppp: relay took %d bytes", (int) w);
         }
         memmove(c->ppy_out, c->ppy_out + w, (size_t) (c->ppy_out_len - w));
         c->ppy_out_len -= (int) w;
@@ -408,9 +440,9 @@ static void pump_ppp(sm_call_t *c)
             {
                 if (!dump)
                     dump = fopen(path, "w");
-                if (dump && dumped < 512)
+                if (dump && dumped < SM_PPP_DUMP_MAX)
                 {
-                    size_t room = 512 - dumped;
+                    size_t room = SM_PPP_DUMP_MAX - dumped;
                     int k, upto = (int)(room < (size_t)n ? room : (size_t)n);
 
                     for (k = 0; k < upto; k++)
@@ -475,9 +507,9 @@ static void pump_ppp(sm_call_t *c)
                 {
                     if (!dump)
                         dump = fopen(path, "w");
-                    if (dump && dumped < 512)
+                    if (dump && dumped < SM_PPP_DUMP_MAX)
                     {
-                        size_t room = 512 - dumped;
+                        size_t room = SM_PPP_DUMP_MAX - dumped;
                         int k, upto = (int)(room < (size_t)r ? room : (size_t)r);
 
                         for (k = 0; k < upto; k++)
