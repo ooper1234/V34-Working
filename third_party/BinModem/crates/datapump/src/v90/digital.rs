@@ -72,6 +72,12 @@ const R_BAR_FRAMES: usize = 4;
 const R_BAR_ANSWERED: f64 = 4.5;
 const R_BAR_TRIES: u32 = 3;
 
+/// The least room phase 4 gets from the moment it starts, in seconds: long
+/// enough for the three R-bar-i offers at `R_BAR_ANSWERED` apart and the
+/// exchange that answers one. 9.4.1's own 15 s plus five round trips from
+/// INFO1a lands near 21 s on a real line, and phase 4 starts at 14 s of it.
+const PHASE4_FLOOR: f64 = 12.0;
+
 /// How long R is held before each R-bar-i after the first, so that what
 /// reaches the far end is the pair of signals and not a longer run of one.
 const R_BAR_GUARD: f64 = 0.1;
@@ -1183,6 +1189,18 @@ impl Modem {
     /// and is read with the equaliser phase 3 left.
     fn begin_phase4(&mut self, s_bar: u64) {
         self.say(format!("phase 4: Ri for {RI_SYMBOLS}T, waiting for the analogue modem's CPt, taps {:.2}", self.tap_norm()));
+        // 9.4.1 has B1 due 15 s plus five round trips after INFO1a, which on a
+        // real line arrives with phase 4 barely inside it: the analogue modem
+        // answers our Jd 4.4 s after our TRN1d begins -- measured over five
+        // calls, and the same 4.4 s whatever TRN1d is given, so it is not
+        // ours to shorten -- and it answers an R-bar-i in the same 4.4 s when
+        // it answers at all. The deadline must therefore not fall before the
+        // R-bar-i has been offered its three goes, or the retry that is there
+        // for a far modem in the middle of its 4 s of SCR never gets to run.
+        let floor = self.samples(PHASE4_FLOOR);
+        if self.deadline.is_none_or(|(at, _)| at < floor) {
+            self.deadline = Some((floor, "no B1 from the analogue modem"));
+        }
         self.far_peak = 0.0;
         self.phase4_note = 0;
         self.rbar_at = None;
