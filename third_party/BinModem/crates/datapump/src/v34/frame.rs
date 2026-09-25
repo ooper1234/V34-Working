@@ -93,6 +93,9 @@ impl Framing {
             SymbolRate::S3200 => 31_200,
             SymbolRate::S3429 => 33_600,
         };
+        // The primary rate is a multiple of 2400. The 200-odd rates in Table 8
+        // are the auxiliary channel's: 8.3 adds 200 to the total, and 9800 is
+        // what 9600 with an auxiliary channel comes to, b=25 and all.
         if !primary.is_multiple_of(2400) || !(lowest..=highest).contains(&primary) {
             return None;
         }
@@ -253,6 +256,76 @@ mod tests {
                 (k, m_min, m_exp, l_min, l_exp),
                 "{rate:?} at {primary} {auxiliary}"
             );
+        }
+    }
+
+    /// Table 8/V.34: [b, SWP] for every data rate and symbol rate, as
+    /// (rate, b, swp) with None for the combinations the table leaves blank.
+    /// A dash means the rate is not available at that symbol rate, which
+    /// `Framing::new` already refuses.
+    const TABLE_8: &[(u32, [Option<(usize, u16)>; 6])] = &[
+        (2_400, [Some((8, 0xfff)), None, None, None, None, None]),
+        (2_600, [Some((9, 0x6db)), None, None, None, None, None]),
+        (4_800, [Some((16, 0xfff)), Some((14, 0xfff)), Some((14, 0x1bb7)), Some((13, 0x3def)), Some((12, 0xffff)), Some((12, 0x0421))]),
+        (5_000, [Some((17, 0x6db)), Some((15, 0x56b)), Some((15, 0x0489)), Some((14, 0x1249)), Some((13, 0x5555)), Some((12, 0x36db))]),
+        (7_200, [Some((24, 0xfff)), Some((21, 0xfff)), Some((21, 0x15ab)), Some((20, 0x0421)), Some((18, 0xffff)), Some((17, 0x3def))]),
+        (7_400, [Some((25, 0x6db)), Some((22, 0x56b)), Some((22, 0x0081)), Some((20, 0x3777)), Some((19, 0x5555)), Some((18, 0x0889))]),
+        (9_600, [Some((32, 0xfff)), Some((28, 0xfff)), Some((28, 0x0a95)), Some((26, 0x2d6b)), Some((24, 0xffff)), Some((23, 0x14a5))]),
+        (9_800, [Some((33, 0x6db)), Some((29, 0x56b)), Some((28, 0x3fff)), Some((27, 0x0081)), Some((25, 0x5555)), Some((23, 0x3f7f))]),
+        (12_000, [Some((40, 0xfff)), Some((35, 0xfff)), Some((35, 0x0489)), Some((32, 0x7fff)), Some((30, 0xffff)), Some((28, 0x7fff))]),
+        (12_200, [Some((41, 0x6db)), Some((36, 0x56b)), Some((35, 0x1fbf)), Some((33, 0x2aab)), Some((31, 0x5555)), Some((29, 0x1555))]),
+        (14_400, [Some((48, 0xfff)), Some((42, 0xfff)), Some((42, 0x0081)), Some((39, 0x14a5)), Some((36, 0xffff)), Some((34, 0x2d6b))]),
+        (14_600, [Some((49, 0x6db)), Some((43, 0x56b)), Some((42, 0x1bb7)), Some((39, 0x3fff)), Some((37, 0x5555)), Some((35, 0x0001))]),
+        (16_800, [Some((56, 0xfff)), Some((49, 0xfff)), Some((48, 0x3fff)), Some((45, 0x3def)), Some((42, 0xffff)), Some((40, 0x0421))]),
+        (17_000, [Some((57, 0x6db)), Some((50, 0x56b)), Some((49, 0x15ab)), Some((46, 0x1249)), Some((43, 0x5555)), Some((40, 0x36db))]),
+        (19_200, [Some((64, 0xfff)), Some((56, 0xfff)), Some((55, 0x1fbf)), Some((52, 0x0421)), Some((48, 0xffff)), Some((45, 0x3def))]),
+        (19_400, [Some((65, 0x6db)), Some((57, 0x56b)), Some((56, 0x0a95)), Some((52, 0x3777)), Some((49, 0x5555)), Some((46, 0x0889))]),
+        (21_600, [Some((72, 0xfff)), Some((63, 0xfff)), Some((62, 0x1bb7)), Some((58, 0x2d6b)), Some((54, 0xffff)), Some((51, 0x14a5))]),
+        (21_800, [Some((73, 0x6db)), Some((64, 0x56b)), Some((63, 0x0489)), Some((59, 0x0081)), Some((55, 0x5555)), Some((51, 0x3f7f))]),
+        (24_000, [None, Some((70, 0xfff)), Some((69, 0x15ab)), Some((64, 0x7fff)), Some((60, 0xffff)), Some((56, 0x7fff))]),
+        (24_200, [None, Some((71, 0x56b)), Some((70, 0x0081)), Some((65, 0x2aab)), Some((61, 0x5555)), Some((57, 0x1555))]),
+        (26_400, [None, Some((77, 0xfff)), Some((76, 0x0a95)), Some((71, 0x14a5)), Some((66, 0xffff)), Some((62, 0x2d6b))]),
+        (26_600, [None, Some((78, 0x56b)), Some((76, 0x3fff)), Some((71, 0x3fff)), Some((67, 0x5555)), Some((63, 0x0001))]),
+        (28_800, [None, None, None, Some((77, 0x3def)), Some((72, 0xffff)), Some((68, 0x0421))]),
+        (29_000, [None, None, None, Some((78, 0x1249)), Some((73, 0x5555)), Some((68, 0x36db))]),
+        (31_200, [None, None, None, None, Some((78, 0xffff)), Some((73, 0x3def))]),
+        (31_400, [None, None, None, None, Some((79, 0x5555)), Some((74, 0x0889))]),
+        (33_600, [None, None, None, None, None, Some((79, 0x14a5))]),
+        (33_800, [None, None, None, None, None, Some((79, 0x3f7f))]),
+    ];
+
+    /// Every row of Table 8, read off the table rather than computed: b and the
+    /// switching pattern are what the far modem's data mode is framed by, and a
+    /// disagreement here is a disagreement on the line.
+    ///
+    /// The rates the digital V.90 modem fails at are the ones this covers
+    /// densest -- 28 800 and 31 200 at 3200 baud are b=72 and b=78, with
+    /// 832- and 1280-point constellations from Table 10 -- and 9 600, where
+    /// the same code path demonstrably reads a real modem, is b=24 with 24
+    /// points.
+    #[test]
+    fn b_and_the_switching_pattern_are_table_8s() {
+        for (primary, row) in TABLE_8 {
+            for (i, rate) in SymbolRate::ALL.iter().enumerate() {
+                let want = row[i];
+                // The row is either the plain rate, or -- where the plain rate
+                // is a dash -- that rate less the auxiliary channel's 200.
+                let (framed, label) = match (want, Framing::new(*rate, *primary, false, false)) {
+                    (Some(_), Some(_)) => (Framing::new(*rate, *primary, false, false), *primary),
+                    (Some(_), None) => (Framing::new(*rate, *primary - 200, true, false), *primary),
+                    (None, _) => {
+                        assert!(
+                            Framing::new(*rate, *primary, false, false).is_none(),
+                            "{rate:?} at {primary}: offered, the table does not"
+                        );
+                        continue;
+                    }
+                };
+                let (b, swp) = want.expect("handled above");
+                let f = framed.unwrap_or_else(|| panic!("{rate:?} at {label}: refused, the table has it"));
+                assert_eq!(f.b, b, "{rate:?} at {label}: b");
+                assert_eq!(f.swp, swp, "{rate:?} at {label}: SWP");
+            }
         }
     }
 
