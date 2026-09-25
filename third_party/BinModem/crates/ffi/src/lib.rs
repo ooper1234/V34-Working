@@ -261,7 +261,8 @@ impl Echo {
     }
 
     /// One line sample: subtract the filter's estimate of our reflection,
-    /// then (on quiet windows, while still in start-up) adapt it.
+    /// then (on quiet windows, or where the modem says the far end is
+    /// silent, and while still in start-up) adapt it.
     fn sample(&mut self, x: f64) -> f64 {
         let mut yhat = 0.0;
         if self.delay != 0 && !self.seen.is_empty() {
@@ -277,20 +278,22 @@ impl Echo {
             }
             if !self.frozen && norm > 1e-4 {
                 // Fast while the far end is quiet, where the error is the
-                // filter's own; the slow step, where there is one, is for the
-                // far end talking. It is off by default -- see `slow_mu` --
-                // but the gap it was written to fill is real: the filter only
-                // ever learns from whatever we happened to send on a quiet
-                // window, and the phase 3 TRN1d and Jd are one G.711 codeword
-                // turned over, six samples to the cycle.
+                // filter's own. The slow step, where there is one, is for the
+                // far end talking; it is off by default -- see `slow_mu`.
                 //
-                // What does not work is a gate that lets it learn from a loud
-                // window, which is what the DIL is -- two seconds of 22 666
-                // bit/s with the far modem silent, the one chance to learn a
-                // wideband path. Measured on the call of 2026-09-25 11:12,
-                // what has arrived is 0.47 of our own echo over that DIL and
-                // 0.43 to 0.46 over phase 4's TRN2d and MP: no threshold
-                // between the two tells the filter which window it is in.
+                // Fast while the far end is quiet, where the error is the
+                // filter's own; the slow step, where there is one, is for the
+                // far end talking. It is off by default -- see `slow_mu`.
+                //
+                // What does not work is learning from the DIL, which is the
+                // one window where the far modem is silent (9.3.1.6) and this
+                // end is transmitting four points of 22 666 bit/s, so the one
+                // chance at a wideband path. Adapting through it was measured
+                // on the captures of 2026-09-25 11:12 and 11:13 and moved
+                // the phase 4 SNR not at all -- 5.8, 2.0, 2.4, 4.7, 5.5, 3.9,
+                // 5.8, 6.0 dB with it and the same eight without -- because
+                // the analogue modem's S-bar is in that window too, and a fast
+                // step learns it instead of the path.
                 let mu = if self.quiet() { ECHO_MU } else { slow_mu() };
                 if mu > 0.0 {
                     let g = mu * (x - yhat) / norm;

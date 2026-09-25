@@ -629,6 +629,11 @@ pub struct Modem {
     /// When the Ed last went out, and how many times it has been offered.
     ed_at: Option<u64>,
     ed_tries: u32,
+    /// The longest run of ones the E search has come to, when, and how many
+    /// E sequences have been read whole.
+    e_near: usize,
+    e_near_at: u64,
+    e_read: u32,
     /// When R-bar-i last went out, whether an answer is still coming, how
     /// many times the transition has been offered, and when R is to be held
     /// before the next R-bar-i.
@@ -692,6 +697,9 @@ impl Modem {
             last_stage: Stage::AwaitS,
             ed_at: None,
             ed_tries: 0,
+            e_near: 0,
+            e_near_at: 0,
+            e_read: 0,
             rbar_at: None,
             rbar_tries: 0,
             retry_at: None,
@@ -830,9 +838,34 @@ impl Modem {
     /// How the CP finder has done, for the transcript: candidates the far
     /// end's sequences began, and how many parsed. Zero of many is a far
     /// end talking and this end not hearing; zero of zero is silence.
+    /// Whether the far modem is known to be sending nothing at this instant.
+    ///
+    /// True over the DIL, and only there: 9.3.1.6 has the analogue modem
+    /// answer Jd' with S-bar and then leave the line to this end until the
+    /// S reversal that ends the DIL. That is the one window in a call where
+    /// the far modem is silent *and* this end is transmitting something wide
+    /// -- the DIL is four points of 22 666 bit/s -- so it is the one window in
+    /// which an echo filter can learn a path that is not one G.711 codeword
+    /// turned over. The echo filter is told; it cannot work it out for itself,
+    /// because a line loud with this end's own transmission is loud in every
+    /// window.
+    pub fn far_end_silent(&self) -> bool {
+        self.stage == Stage::AwaitSecondReversal && self.source.out == Out::Dil
+    }
+
     fn cp_tally(&self) -> String {
         let (seen, taken) = self.cps.tally();
         format!("CP sequences: {seen} begun, {taken} parsed, loudest arrival {:.4}", self.far_peak)
+    }
+
+    /// How close the E search came, and when: the E is twenty unbroken
+    /// descrambled ones, so a run of eighteen or more means something shaped
+    /// like one went past.
+    fn e_run(&self) -> String {
+        if self.e_near == 0 {
+            return "none".to_string();
+        }
+        format!("{} at {:.3} s", self.e_near, self.e_near_at as f64 / FS)
     }
 
     /// Rate renegotiations and cleardowns since the call began, from either
@@ -923,7 +956,7 @@ impl Modem {
                 let _ = f.write_all(text.as_bytes());
             }
             self.say(format!(
-                "phase 4: snr {:.1} dB, trained {:.1} dB, drift {:+.0} ppm, {} points, {} slips{}, receiver at {} bit/s on {} Hz, taps {:.2}, turn {:+.4}, {}",
+                "phase 4: snr {:.1} dB, trained {:.1} dB, drift {:+.0} ppm, {} points, {} slips{}, receiver at {} bit/s on {} Hz, taps {:.2}, turn {:+.4}, {}, {}",
                 self.rx.snr_db(),
                 self.rx.trained_snr_db(),
                 self.rx.drift_ppm(),
@@ -937,6 +970,7 @@ impl Modem {
                 self.rx.band().carrier(),
                 self.tap_norm(),
                 self.rx.carrier_turn(),
+                format!("E: {} read, longest run of ones {}", self.e_read, self.e_run()),
                 self.cp_tally()
             ));
         }
@@ -1246,6 +1280,9 @@ impl Modem {
         self.phase4_note = 0;
         self.ed_at = None;
         self.ed_tries = 0;
+        self.e_near = 0;
+        self.e_near_at = 0;
+        self.e_read = 0;
         self.rbar_at = None;
         self.rbar_tries = 0;
         self.retry_at = None;
@@ -1352,7 +1389,19 @@ impl Modem {
                 for bit in self.reader.differential(symbol.decided, size) {
                     self.ones = if bit { self.ones + 1 } else { 0 };
                     // "20-bit E": twenty ones, which nothing in CP runs to.
+                    // Runs that stop a few short are counted too, and the
+                    // count is in the transcript, because the E is twenty
+                    // unbroken descrambled ones and one wrong bit loses all
+                    // of them: whether the far modem's E arrives and this end
+                    // cannot read it, or never arrives, is the whole of what
+                    // is left to get right, and only the count tells them
+                    // apart.
+                    if self.stage == Stage::Phase4Cp && self.ones >= signals::E_BITS - 2 {
+                        self.e_near = self.e_near.max(self.ones);
+                        self.e_near_at = self.now;
+                    }
                     if self.stage == Stage::Phase4Cp && self.ones >= signals::E_BITS && self.cp.is_some() {
+                        self.e_read += 1;
                         self.heard_e();
                         return;
                     }
