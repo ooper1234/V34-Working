@@ -56,19 +56,21 @@ const R_BAR_FRAMES: usize = 4;
 /// CP before offering the transition again, and how many times it offers it.
 /// 9.4.2.1 has the analogue modem condition its receiver for the R-to-R-bar
 /// transition on entering phase 4, and 9.4.2.3 has it answer with CP; a far
-/// end still sending CPt is one that has not seen the transition, which the
-/// live capture of 2026-09-24 22:39 shows in six seconds of CPt and no CP.
-/// The one thing this end can do about that is say the transition again --
-/// R, then R-bar-i once more -- which also covers a far end that reads the
-/// other of the two polarities as the one it watches for. The wait has to
-/// outlast what the far end may spend before its CP: 9.4.2.2 lets it
-/// complete the CPt it is sending and then send SCR for up to 4000 ms, so
-/// anything much under 4.5 s yanks the transmit away from under a far end
-/// that is still allowed to be thinking (and does break the offline calls,
-/// which renegotiate through noise), and the 15 s plus five round trips of
-/// 9.4.1 leaves room for one such retry and little more.
+/// end still sending CPt is one that has not seen the transition, which six
+/// live attempts show in five of them. The one thing this end can do about
+/// that is say the transition again -- R, then R-bar-i once more -- which
+/// also covers a far end that reads the other of the two polarities as the
+/// one it watches for. The wait has to outlast what the far end may spend
+/// before its CP: 9.4.2.2 lets it complete the CPt it is sending and then
+/// send SCR for up to 4000 ms, so anything much under 4.5 s yanks the
+/// transmit away from under a far end that is still allowed to be thinking
+/// (and does break the offline calls, which renegotiate through noise). The
+/// one call that did answer took 4.4 s over the first R-bar-i, so the tries
+/// are 4.5 s apart and there are three of them: with TRN1d a second rather
+/// than four (see the FFI's V90_TRN1D) phase 4 has about nine seconds of
+/// 9.4.1's 15 s plus five round trips to spend them in.
 const R_BAR_ANSWERED: f64 = 4.5;
-const R_BAR_TRIES: u32 = 2;
+const R_BAR_TRIES: u32 = 3;
 
 /// How long R is held before each R-bar-i after the first, so that what
 /// reaches the far end is the pair of signals and not a longer run of one.

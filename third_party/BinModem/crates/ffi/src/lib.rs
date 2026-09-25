@@ -501,10 +501,23 @@ impl Answerer {
         /* LIVE_SERVER is the habit for a real analogue modem on the far end
            rather than another engine: 4.05 s of TRN1d, where PROMPT's 0.3 s
            is all datapump's own analogue modem needs. 2040T (9.3.1.4) is a
-           floor, and a real modem's downstream equalizer uses the time. */
+           floor, and a real modem's downstream equalizer uses the time.
+
+           `V90_TRN1D` overrides the length in seconds, because that time
+           comes out of phase 4's budget rather than phase 3's: B1 is due 15 s
+           plus five round trips after INFO1a (9.4.1), and on the call of
+           2026-09-25 11:00 that put phase 4 at 14.1 s of the 21 s, leaving
+           the analogue modem 6.2 s to answer an R-bar-i -- which it did, once,
+           4.4 s after it, and did not in five other attempts. Every second
+           of TRN1d is a second of phase 4, so the default is a second --
+           still four times 2040T, with the Jd a second into the 4000 ms it
+           has to start in. `V90_TRN1D=4.05` puts the four seconds back. */
+        let habits = match std::env::var("V90_TRN1D").ok().and_then(|v| v.parse::<f64>().ok()) {
+            Some(trn1d) if trn1d > 0.0 => v90::digital::Habits { trn1d, ..v90::digital::Habits::LIVE_SERVER },
+            _ => v90::digital::Habits { trn1d: 1.0, ..v90::digital::Habits::LIVE_SERVER },
+        };
         self.stage = Stage::V90(Box::new(
-            v90::startup::Digital::new(v90::server::ours())
-                .with_habits(v90::digital::Habits::LIVE_SERVER),
+            v90::startup::Digital::new(v90::server::ours()).with_habits(habits),
         ));
         self.status = BM_RUNNING;
     }
