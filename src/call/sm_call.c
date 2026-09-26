@@ -1,12 +1,21 @@
 #include "sm_call.h"
 
-/* Bytes each SM_PPP_*_DUMP keeps. Large enough for a whole read-position sweep
-   in data mode (V90_DATA_BIAS holds each position for half a second, and the
-   upstream can be running at 31200 bit/s), not just the negotiation at the
-   start. Off unless the variable is set. */
-#define SM_PPP_DUMP_MAX 65536
 #include "ppp/sm_pppd.h"
 #include "bbs/bbs.h"
+
+#include <stdlib.h>
+
+/* Bytes each SM_PPP_*_DUMP keeps, SM_PPP_DUMP_MAX overriding. A megabyte by
+   default: a call in data mode decodes kilobytes a second, so a cap sized for
+   a sweep fills in seconds and then records nothing for the rest of the call.
+   Off unless the variable is set. */
+static size_t dump_max(void)
+{
+    static size_t max;
+    if (max == 0)
+        max = (size_t)strtoul(getenv("SM_PPP_DUMP_MAX") ? getenv("SM_PPP_DUMP_MAX") : "1048576", NULL, 10);
+    return max;
+}
 
 #ifdef SM_HAVE_BM
 #include "bm_answerer.h"
@@ -442,9 +451,9 @@ static void pump_ppp(sm_call_t *c)
             {
                 if (!dump)
                     dump = fopen(path, "w");
-                if (dump && dumped < SM_PPP_DUMP_MAX)
+                if (dump && dumped < dump_max())
                 {
-                    size_t room = SM_PPP_DUMP_MAX - dumped;
+                    size_t room = dump_max() - dumped;
                     int k, upto = (int)(room < (size_t)n ? room : (size_t)n);
 
                     for (k = 0; k < upto; k++)
@@ -509,9 +518,9 @@ static void pump_ppp(sm_call_t *c)
                 {
                     if (!dump)
                         dump = fopen(path, "w");
-                    if (dump && dumped < SM_PPP_DUMP_MAX)
+                    if (dump && dumped < dump_max())
                     {
-                        size_t room = SM_PPP_DUMP_MAX - dumped;
+                        size_t room = dump_max() - dumped;
                         int k, upto = (int)(room < (size_t)r ? room : (size_t)r);
 
                         for (k = 0; k < upto; k++)

@@ -68,6 +68,26 @@ const BOUNDARY_GAIN: f64 = 0.4;
    modem". A delay-locked NLMS filter over our own transmitted samples
    takes the reflection off before the engine sees it. */
 
+/// Whether V.90's data mode gets a V.42 stack at all, `V90_ERROR_CONTROL` in
+/// the environment.
+///
+/// Off by default, which is the behaviour this path has always had: V.90 data
+/// mode raw, with no error control. Whether the stack is worth having is not
+/// yet settled -- the far modem over V.8 says LAPM=0 and drops the link to
+/// transparent within T401, so it may buy nothing, and this crate's own V.90
+/// loopback has a far end with no V.42 to answer with, so it never leaves
+/// negotiation. Both are measurements to make rather than assumptions to build
+/// in, so the variable decides until they have been made.
+fn v90_error_control() -> bool {
+    use std::sync::Mutex;
+    static ON: Mutex<Option<bool>> = Mutex::new(None);
+    let mut guard = ON.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(std::env::var("V90_ERROR_CONTROL").is_ok_and(|v| v != "0"));
+    }
+    guard.unwrap_or(false)
+}
+
 const ECHO_TAPS: usize = 512; /* 64 ms of echo spread */
 
 /**
@@ -532,7 +552,7 @@ impl Answerer {
         }
     }
 
-    fn start_error_control(&mut self) {
+fn start_error_control(&mut self) {
         if self.ec.is_some() {
             return;
         }
@@ -547,10 +567,27 @@ impl Answerer {
             ..EcParams::default()
         };
         let mut stack = EcStack::new(role, params);
-        if self.lapm_declared {
+        if self.lapm_declared || v90_error_control() {
+            /* Over V.90 the far modem's V.8 says LAPM=0 -- its V.34-mode self
+             * says 1 on the same line -- so taking the hint at its word leaves
+             * the data mode with no error control at all, and the stack falls
+             * to transparent within T401. V.8's bit is a capability hint
+             * anyway; V.42's own XID exchange is the negotiation (7.2 names
+             * V.42 for the DTE-side conversion), so declare it and let the
+             * far modem answer or stay silent. Nothing is lost if it stays
+             * silent: that is where the link is now. */
             stack = stack.declared_lapm();
         }
-        stack.offer_compression(Compression::Both);
+        // V.90's data mode gets V.42's error control but not its compression:
+        // the interleaver and the forward correction are what the upstream
+        // needs at 31200 bit/s over a line this marginal, and compression
+        // within V.90 is the part already found broken. The V.34 path offers
+        // both, which is why it decodes where the raw V.90 path does not.
+        if v90_error_control() {
+            stack.without_v42bis();
+        } else {
+            stack.offer_compression(Compression::Both);
+        }
         /* The physical modems used through the ATA are V.42bis-era devices.
            Some of them repeat their XID forever when a response includes the
            later V.44 private parameter set instead of ignoring the unknown
@@ -713,11 +750,23 @@ impl Answerer {
                     v90::startup::Status::Connected { transmit, receive } => {
                         self.rate_tx = transmit as c_int;
                         self.rate_rx = receive as c_int;
-                        self.physical_connected = true;
-                        // Raw data mode: no V.42 stack is started on this
-                        // path (compression within V.90 is known broken),
-                        // so connected is connected.
-                        BM_CONNECTED
+                        if !self.physical_connected {
+                            self.physical_connected = true;
+                            if v90_error_control() {
+                                self.start_error_control();
+                            }
+                        }
+                        if self.ec.is_some() {
+                            self.ec_samples += 1;
+                            if self.ec_samples >= ENGINE_FS as u32 / 1000 {
+                                self.ec_samples = 0;
+                                if let Some(ec) = self.ec.as_mut() {
+                                    ec.tick(1);
+                                }
+                            }
+                        }
+                        self.update_connected_status();
+                        self.status
                     }
                     v90::startup::Status::Retraining => BM_RETRAINING,
                     v90::startup::Status::ClearedDown => {
@@ -855,12 +904,36 @@ impl Answerer {
         self.want_v34
     }
 
+    /// The stage's own phase phrase, for when V.90's data mode has no stack.
+    fn phase_from_stage(&mut self) {
+        let src: &[u8] = match &self.stage {
+            Stage::V8(m) => m.phase().as_bytes(),
+            Stage::V34(m) => m.phase().as_bytes(),
+            Stage::V90(m) => m.phase().as_bytes(),
+            Stage::Done => b"",
+        };
+        let n = src.len().min(self.phase_buf.len() - 1);
+        self.phase_buf[..n].copy_from_slice(&src[..n]);
+        self.phase_buf[n] = 0;
+    }
+
     /// Copy the current phase phrase into the buffer the C side reads.
     fn copy_phase(&mut self) {
         let src: &[u8] = if self.physical_connected {
             if self.want_v90 {
-                // Raw first cut; V.42 over V.90 arrives with the stack.
-                b"V.90 data"
+                if !v90_error_control() {
+                    return self.phase_from_stage();
+                }
+                match self.ec.as_ref() {
+                    Some(ec) if ec.is_connected() => match ec.compression_name() {
+                        Some("V.42bis") => b"V.90 data / V.42 / V.42bis",
+                        Some("V.44") => b"V.90 data / V.42 / V.44",
+                        _ => b"V.90 data / V.42",
+                    },
+                    Some(ec) if ec.phase() == EcPhase::Transparent => b"V.90 data / transparent",
+                    Some(_) => b"V.42 negotiating",
+                    None => b"V.90 data",
+                }
             } else {
                 match self.ec.as_ref() {
                     Some(ec) if ec.is_connected() => match ec.compression_name() {
