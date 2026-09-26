@@ -26,7 +26,23 @@ use std::ffi::{c_int, c_void};
 use binmodemffi::*;
 
 extern "C" fn get_bit(_user: *mut c_void) -> c_int {
-    1
+    // V90_TX=zeros sends an idle line instead of ones.
+    //
+    // The far modem here is a recording: it did what it did in answer to the
+    // transmit in the recording, and is not listening to this run at all. So
+    // what this run transmits has no say in the transcript, and sending ones --
+    // a wideband pattern at full power that is not the one whose echo is in the
+    // capture -- leaves the canceller adapting to a signal that is not there.
+    // On the 2026-09-26 01:32 capture that put the receiver's timing drift at
+    // 900 ppm by the time phase 4 was sending its MP, and the client's B1 was
+    // never found. Idle costs nothing and asks the canceller only to remove the
+    // echo that is actually in the recording, which ECHO_REFERENCE supplies.
+    static ONES: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+    let mut guard = ONES.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(std::env::var("V90_TX").as_deref() != Ok("zeros"));
+    }
+    i32::from(guard.unwrap_or(true))
 }
 
 extern "C" fn put_bit(_user: *mut c_void, _bit: c_int) {}
