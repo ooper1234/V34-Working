@@ -201,6 +201,10 @@ const ECHO_QUIET_DB: f64 = -30.0; /* input loudness the far end must be under */
 const ECHO_MU: f64 = 0.5;
 /* How far apart the lags of the TX-correlation projection are, in samples. */
 const AB_LAG_STEP: usize = 8;
+/* How long a window the A/B is judged on: a quarter of a second, which at the
+   8 kHz rate is four blocks of the far-end signal and, over 64 lags of
+   projection, enough samples that the floor cannot decide it. */
+const AB_WINDOW: usize = 2048;
 /* The ridge on the normal equations, as a fraction of the reference's own
    energy. Swept, not guessed: over the DIL's whole spectral range anything
    from zero to 1e-4 moves the recovered gain by under a tenth, and 1e-3 by a
@@ -426,6 +430,9 @@ struct Ls {
     /// The correlation the solve was built from, so the test can check the
     /// estimator against a path it knows rather than against itself.
     lags: usize,
+    /// Set once the A/B has been handed the two candidates, so a second window
+    /// of far-end silence does not start a second comparison.
+    ab_armed: bool,
 }
 
 impl Ls {
@@ -463,6 +470,7 @@ impl Ls {
             reported: false,
             kept: Vec::new(),
             lags: 0,
+            ab_armed: false,
         }
     }
 }
@@ -1127,10 +1135,49 @@ impl Echo {
         // correlation over the whole of it, so there is nothing to solve until
         // there is no more. Inside the window it could not be checked either,
         // because every sample after it would be part of the same measurement.
-        if !self.far_silent && echo_ls() {
-            self.ls_solve();
+        // The falling edge of the far end's silence: solve if there is a window
+        // to solve, then judge the two candidates on what comes after.
+        if !self.far_silent {
+            if echo_ls() {
+                self.ls_solve();
+            }
+            self.ab_collect(x, self.reference());
+        }
+        if self.ab.as_ref().is_some_and(|a| a.window.len() >= AB_WINDOW) {
+            self.ab_select();
         }
         left
+    }
+
+    /// Our own transmit as the canceller's reference is defined: the sample
+    /// `push` has just written into the ring, which is the one at delay minus
+    /// one in the filter's frame.
+    fn reference(&self) -> f64 {
+        let n = self.tx.len();
+        self.tx[(self.tx_pos + n - 1) % n]
+    }
+
+    /// Add one sample to the A/B's judging window, and arm the A/B if a solve
+    /// has just put two candidates to choose between.
+    fn ab_collect(&mut self, x: f64, r: f64) {
+        let taps = self.w.len();
+        if let Some(ab) = self.ab.as_mut() {
+            if ab.window.len() < AB_WINDOW {
+                ab.window.push((x, r));
+            }
+            return;
+        }
+        // Armed by a solve that ran and left two candidates: what the gradient
+        // had, and what the correlation found.
+        if let Some(ls) = self.ls.as_ref() {
+            if ls.solved && !ls.kept.is_empty() && ls.kept.len() == taps && !ls.ab_armed {
+                self.ab = Some(Ab { gradient: ls.kept.clone(), ls: self.w.clone(), window: Vec::new() });
+                if let Some(ls) = self.ls.as_mut() {
+                    ls.ab_armed = true;
+                }
+                self.ab_collect(x, r);
+            }
+        }
     }
 
     /// `ECHO_DEPTH` logs one line a window: the cancellation depth, the delay
@@ -2347,6 +2394,117 @@ mod ls_tests {
                 if v.abs() > bm { (i, (v.abs(), v)) } else { (bi, (bm, bv)) }
             });
         (lock as isize - centre as isize + at as isize, mag)
+    }
+
+    /// The selection has to be made on the transmit-correlated energy, on a
+    /// window big enough to decide it, and the winner has to end up in the
+    /// filter. This drives `ab_select` itself rather than the metric under it,
+    /// because the metric is already tested and the wiring is not.
+    #[test]
+    fn the_ab_puts_the_winner_in_the_filter() {
+        let taps = 512usize;
+        let delay = 1320usize;
+        let centre = taps / 2;
+        let n = AB_WINDOW;
+        let (r, _) = reference_with_spread(n + delay, 2.0);
+        // The line: the path, plus a far-end signal neither filter is to blame
+        // for, plus some noise.
+        let mut far = 0x5eed_1234u32;
+        let mut window: Vec<(f64, f64)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut y = 0.0;
+            for (k, (_o, g)) in [(0usize, -0.106f64), (3, 0.04), (7, -0.02)]
+                .iter()
+                .enumerate()
+            {
+                let j = i as isize - delay as isize - k as isize;
+                if j >= 0 {
+                    y += g * r[j as usize];
+                }
+            }
+            far = far.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let f = if (far >> 16) & 1 == 0 { 0.02 } else { -0.02 };
+            window.push((y + f, r[i]));
+        }
+        // The right filter: the path at the lock, so on tap `centre`.
+        let mut good = vec![0.0; taps];
+        for (k, (_o, g)) in [(0usize, -0.106f64), (3, 0.04), (7, -0.02)]
+            .iter()
+            .enumerate()
+        {
+            good[centre + k] = *g;
+        }
+        // The wrong one, and the wrong one the old metric would have chosen: the
+        // same path buried in noise a tenth as large again.
+        let mut noise = 0xfeed_faceu32;
+        let mut noisy = vec![0.0; taps];
+        for v in noisy.iter_mut() {
+            noise = noise.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v = ((noise >> 16) as f64 / 32768.0 - 0.5) * 0.02;
+        }
+        for (k, (_o, g)) in [(0usize, -0.106f64), (3, 0.04), (7, -0.02)]
+            .iter()
+            .enumerate()
+        {
+            noisy[centre + k] = *g;
+        }
+
+        let mut e = Echo::new();
+        e.delay = delay;
+        e.ab = Some(Ab { gradient: noisy.clone(), ls: good.clone(), window });
+        e.ab_select();
+        assert!(e.ab.is_none(), "the A/B was not consumed");
+        for (k, (&a, &b)) in e.w.iter().zip(&good).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "tap {k} is {a:+.6} and the right answer is {b:+.6}"
+            );
+        }
+        // And the same pair the other way round, so the choice is not an
+        // artefact of which candidate happens to be listed first: the good one
+        // wins on merit from either slot.
+        let good_again = good.clone();
+        let mut e = Echo::new();
+        e.delay = delay;
+        e.ab = Some(Ab { gradient: good_again.clone(), ls: noisy, window: rebuild() });
+        e.ab_select();
+        for (k, v) in e.w.iter().enumerate() {
+            assert!(
+                (v - good_again[k]).abs() < 1e-12,
+                "with the order reversed, tap {} is {:+.6} and the right answer is {:+.6}",
+                k,
+                v,
+                good_again[k]
+            );
+        }
+    }
+
+    /// The same window again, for the reversed-order case above. Built twice
+    /// rather than cloned because the A/B takes it by value.
+    fn rebuild() -> Vec<(f64, f64)> {
+        let taps = 512usize;
+        let delay = 1320usize;
+        let centre = taps / 2;
+        let n = AB_WINDOW;
+        let (r, _) = reference_with_spread(n + delay, 2.0);
+        let mut far = 0x5eed_1234u32;
+        let mut window: Vec<(f64, f64)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut y = 0.0;
+            for (k, (_o, g)) in [(0usize, -0.106f64), (3, 0.04), (7, -0.02)]
+                .iter()
+                .enumerate()
+            {
+                let j = i as isize - delay as isize - k as isize;
+                if j >= 0 {
+                    y += g * r[j as usize];
+                }
+            }
+            far = far.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let f = if (far >> 16) & 1 == 0 { 0.02 } else { -0.02 };
+            window.push((y + f, r[i]));
+        }
+        window
     }
 
     /// The identification has to recover a path it was never told, and recover
