@@ -78,6 +78,26 @@ const BOUNDARY_GAIN: f64 = 0.4;
 /// loopback has a far end with no V.42 to answer with, so it never leaves
 /// negotiation. Both are measurements to make rather than assumptions to build
 /// in, so the variable decides until they have been made.
+/// Whether V.90's data mode stops transmitting, `V90_TX_MUTE` in the
+/// environment.
+///
+/// A bench hook, and the first thing to try about a receive path that decodes
+/// noise: our own 48 kbit/s is the loudest thing in the band the upstream
+/// receiver reads, because V.90's downstream carrier is close enough to the
+/// upstream one that a filter wide enough for wideband data passes it. The
+/// receiver would then be reading our own transmission, which against the
+/// coarse slicer grid scores like a locked signal -- a real signal, the wrong
+/// one. Muting in data mode only, so the start-up that gets there still runs.
+fn v90_tx_mute() -> bool {
+    use std::sync::Mutex;
+    static ON: Mutex<Option<bool>> = Mutex::new(None);
+    let mut guard = ON.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(std::env::var("V90_TX_MUTE").is_ok_and(|v| v != "0"));
+    }
+    guard.unwrap_or(false)
+}
+
 fn v90_error_control() -> bool {
     use std::sync::Mutex;
     static ON: Mutex<Option<bool>> = Mutex::new(None);
@@ -434,6 +454,9 @@ pub struct Answerer {
     /// Built by `bm_create_v90`: V.8 offers the digital PCM category and
     /// both stages run at the line's rate through [`Self::linear_step`].
     want_v90: bool,
+    /// V.90's data mode has been reached: past this point the line is ours to
+    /// fill, and `v90_tx_mute` says not to.
+    v90_in_data: bool,
     up: Resampler,
     down: Resampler,
     stage: Stage,
@@ -518,6 +541,7 @@ impl Answerer {
             role,
             want_v34,
             want_v90,
+            v90_in_data: false,
             up: Resampler::new(LINE_FS, ENGINE_FS),
             down: Resampler::new(ENGINE_FS, LINE_FS),
             stage: Stage::V8(Box::new(v8m)),
@@ -752,6 +776,7 @@ fn start_error_control(&mut self) {
                         self.rate_rx = receive as c_int;
                         if !self.physical_connected {
                             self.physical_connected = true;
+                            self.v90_in_data = true;
                             if v90_error_control() {
                                 self.start_error_control();
                             }
@@ -792,6 +817,7 @@ fn start_error_control(&mut self) {
             // and Done is silence by definition.
             Stage::V34(_) | Stage::Done => 0.0,
         };
+        let y = if self.want_v90 && self.v90_in_data && v90_tx_mute() { 0.0 } else { y };
         if y.abs() > self.peak {
             self.peak = y.abs();
         }

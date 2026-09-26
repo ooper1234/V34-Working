@@ -581,6 +581,17 @@ enum Stage {
     Finished,
 }
 
+/// `V90_DATA_AT`: the second data mode starts at, whatever E and B1 did.
+fn data_at() -> Option<f64> {
+    static AT: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        std::env::var("V90_DATA_AT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+    })
+}
+
 /// The read positions, in samples, `V90_DATA_BIAS` asks to be tried in turn
 /// once data mode starts: the far end begins a superframe of its own for B1
 /// (9.4.2.5), so the sampling instant this receiver locked in phase 4 need not
@@ -978,6 +989,21 @@ impl Modem {
         }
         self.far_peak = self.far_peak.max(input.abs());
         self.rx.feed(input);
+        // V90_DATA_AT, in seconds from the start of the capture or call, starts
+        // data mode on the clock whether or not E and B1 were read. The
+        // counterpart of V34_DATA_AT, for the same reason: a replay of a
+        // recording gets to phase 4 and then gives up waiting for a B1 the
+        // recording does carry, and what is wanted is the data mode after it.
+        // Only from phase 4, and only with a CP in hand -- the framing, the
+        // trellis and the scrambler all come from the CP and the MP.
+        if matches!(self.stage, Stage::Phase4Cpt | Stage::Phase4Cp)
+            && self.cp.is_some()
+            && self.source.mp.is_some()
+            && let Some(at) = data_at()
+            && self.now >= self.samples(at)
+        {
+            self.heard_e();
+        }
         // Phase 4's own account of the far end, every half second: what the
         // receiver thinks of the signal, so a live call's transcript says
         // whether sequences that do not parse arrived on a locked receiver
