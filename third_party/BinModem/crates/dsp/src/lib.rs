@@ -10,6 +10,7 @@
 //! forced every loop to re-acquire on each block.
 
 pub mod complex;
+pub mod linalg;
 pub mod echo;
 pub mod equalizer;
 pub mod fft;

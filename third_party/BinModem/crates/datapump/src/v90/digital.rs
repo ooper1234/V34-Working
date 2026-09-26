@@ -647,6 +647,184 @@ fn data_points() -> Option<std::fs::File> {
     guard.as_mut()?.1.as_mut()?.try_clone().ok()
 }
 
+/// Where the replay cases' equalised points go, when `V90_ABC_POINTS` names a
+/// file. Appended, and every row is tagged `A` or `C` so two calls can share it.
+fn abc_points() -> Option<std::fs::File> {
+    use std::sync::Mutex;
+    static PATH: Mutex<Option<(std::path::PathBuf, Option<std::fs::File>)>> = Mutex::new(None);
+    let want = std::env::var_os("V90_ABC_POINTS")?;
+    let mut guard = PATH.lock().ok()?;
+    if guard.is_none() {
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&want).ok();
+        *guard = Some((std::path::PathBuf::from(&want), file));
+    }
+    guard.as_mut()?.1.as_mut()?.try_clone().ok()
+}
+
+/// Two more receivers, and the echo path the third is shown instead of ours.
+///
+/// This is the decisive test of whether the echo canceller is what is keeping
+/// the constellation away, and it is run on the live call rather than offline
+/// because the receiver's state is the thing that cannot be reconstructed: it
+/// has been adapting its equaliser and its timing loop for the whole call, and a
+/// fresh receiver on the same samples is answering a different question.
+///
+/// The receiver that produces the V.90 data-mode constellation is
+/// `v34::receiver::Receiver` -- V.90's upstream is V.34-shaped and reuses it --
+/// so that is what is cloned, from the state it had reached at data-mode entry,
+/// and all three are fed the same samples from then on. The only difference
+/// between them is the echo:
+///
+///   the live one  what the engine was given: the line less the canceller's echo
+///   `a`           the line, uncancelled
+///   `c`           the line less a path estimated independently of the engine
+///
+/// The independent path arrives as taps, from `V90_ABC_PATH`, rather than being
+/// estimated here. Estimating it with the code under test could only show that
+/// the code agrees with itself.
+#[derive(Debug, Clone)]
+struct Abc {
+    /// The line, uncancelled.
+    a: Receiver,
+    /// The line less the independent path.
+    c: Receiver,
+    /// The path, in the echo filter's own frame: tap `k` is the reference sample
+    /// `delay - taps / 2 + k` ago.
+    path: Vec<f64>,
+    delay: usize,
+    /// The transmit reference, so the path can be predicted from the same signal
+    /// the live filter predicts it from. The echo is a reflection of *our* send,
+    /// not of the line, and predicting it from the line would be a different
+    /// filter altogether.
+    seen: VecDeque<f64>,
+    /// The same two series, kept for the estimate, and the estimate's own
+    /// verdict. `path` is empty until the window is long enough to fit one.
+    fit_x: VecDeque<f64>,
+    fit_r: VecDeque<f64>,
+    /// Whether the path has been estimated.
+    ///
+    /// Not tested by whether `path` is empty: the placeholder is a zero-filled
+    /// vector of the right length, so it is not empty, and with `is_empty` as
+    /// the test the estimate never ran, both replay receivers were fed, and
+    /// cases A and C were the same signal.
+    fitted: bool,
+    /// What the correlation scan found, and what the fit achieved on it.
+    scanned: usize,
+    scan_corr: f64,
+    erle: f64,
+}
+
+/// How many data-mode samples the replay's own estimate is taken over. Sixteen
+/// per tap, which is what the DIL's own solve is held to.
+const ABC_FIT: usize = 8_192;
+/// The delay range the scan looks in, in samples, the same 80 ms to 384 ms the
+/// canceller's own lock searches.
+const ABC_LO: usize = 640;
+const ABC_HI: usize = 3_072;
+
+impl Abc {
+    /// Find the path, by correlation for the delay and then by least squares.
+    fn estimate(&mut self) {
+        let x: Vec<f64> = self.fit_x.iter().copied().collect();
+        let r: Vec<f64> = self.fit_r.iter().copied().collect();
+        let n = x.len();
+        let sx = (x.iter().map(|v| v * v).sum::<f64>() / n as f64).sqrt();
+        let sr = (r.iter().map(|v| v * v).sum::<f64>() / n as f64).sqrt();
+        if sx <= 0.0 || sr <= 0.0 {
+            return;
+        }
+        // The strongest lag our own transmit explains. The far end is talking
+        // throughout, so this is the only part of the line that is a reflection
+        // of what we sent -- which is exactly the part case C is about.
+        let mut best = (0.0f64, ABC_LO);
+        let mut lag = ABC_LO;
+        while lag < ABC_HI {
+            if lag + 64 < n {
+                let mut c = 0.0;
+                for i in lag..n {
+                    c += x[i] * r[i - lag];
+                }
+                c /= ((n - lag) as f64 * sx * sr);
+                if c.abs() > best.0 {
+                    best = (c.abs(), lag);
+                }
+            }
+            lag += 8;
+        }
+        self.scanned = best.1;
+        self.scan_corr = best.0;
+        let taps = self.path.len();
+        let d0 = best.1 as isize - (taps / 2) as isize;
+        let Some(w) = dsp::linalg::echo_path(&r, &x, d0, taps, 1.0e-6) else {
+            return;
+        };
+        // What the fit achieved, on the window it was taken over, against no
+        // cancellation at all. In sample this is the least flattering place to
+        // be measured, and it is the number the log should carry.
+        let mut e0 = 0.0f64;
+        let mut e1 = 0.0f64;
+        for i in 0..n {
+            let mut y = 0.0;
+            for (k, &wk) in w.iter().enumerate() {
+                if wk == 0.0 {
+                    continue;
+                }
+                let j = i as isize - d0 - k as isize;
+                if j >= 0 && (j as usize) < n {
+                    y += wk * r[j as usize];
+                }
+            }
+            let d = x[i] - y;
+            e0 += x[i] * x[i];
+            e1 += d * d;
+        }
+        self.erle = 10.0 * (e0 / e1.max(1e-30)).log10();
+        self.path = w;
+        self.fitted = true;
+        self.delay = best.1;
+        self.seen.clear();
+        eprintln!(
+            "  v90: A/B/C path estimated over {ABC_FIT} data-mode samples: delay {}, \
+             correlation {:.3}, in-window ERLE_tx {:.1} dB, norm {:.4}",
+            self.delay,
+            self.scan_corr,
+            self.erle,
+            self.path.iter().map(|v| v * v).sum::<f64>().sqrt()
+        );
+    }
+
+    /// The line less this path's echo.
+    fn predicted(&self, line: f64) -> f64 {
+        let n = self.seen.len();
+        if n == 0 {
+            return line;
+        }
+        // Every tap has to be able to reach its own reference sample, so the
+        // ring has to be at least `delay + taps` long. Sized by the tap count
+        // alone it was 1024 samples for a 1880-sample delay, every read fell off
+        // the end, the prediction was exactly zero, and cases A and C came out
+        // byte-identical -- 321 957 points each, E[z^8] of 8.4 for both. The
+        // decisive experiment was a no-op and read as "the echo is not the
+        // problem", which is the one thing it must never read.
+        if n < self.delay + self.path.len() {
+            return line;
+        }
+        let last = n - 1;
+        let d0 = self.delay as isize - (self.path.len() / 2) as isize;
+        let mut y = 0.0;
+        for (k, &w) in self.path.iter().enumerate() {
+            if w == 0.0 {
+                continue;
+            }
+            let j = last as isize - d0 - k as isize;
+            if j >= 0 && (j as usize) < n {
+                y += w * self.seen[j as usize];
+            }
+        }
+        line - y
+    }
+}
+
 /// The digital modem, phase 3 on.
 #[derive(Debug, Clone)]
 pub struct Modem {
@@ -657,6 +835,8 @@ pub struct Modem {
     deadline: Option<(u64, &'static str)>,
     source: Source,
     rx: Receiver,
+    /// Two more copies of `rx` for the A/B/C replay. See [`Self::abc_arm`].
+    abc: Option<Abc>,
     reader: Reader,
     in_trn: bool,
     trn_symbols: usize,
@@ -748,6 +928,7 @@ impl Modem {
             deadline: None,
             source: Source::new(settings.law, settings.uinfo, settings.jd, settings.habits.trn1d),
             rx,
+            abc: None,
             reader: Reader::new(Mode::Answer),
             in_trn: true,
             trn_symbols: 0,
@@ -995,6 +1176,72 @@ impl Modem {
         self.stage = Stage::Finished;
         self.source.start(Out::Silence);
         self.source.pending = None;
+    }
+
+    /// Arm the A/B/C replay: two more copies of the receiver, from the state it
+    /// has reached. The path the third is to be shown is estimated from this
+    /// call's own data mode once there are samples enough; an empty `path` means
+    /// it is not estimated yet, and until it is neither replay receiver is fed,
+    /// so the two never see a window the estimate did not cover.
+    ///
+    /// Called once, when data mode begins. `path` may carry an externally
+    /// estimated path, and `delay` is where the lock is.
+    /// `path_len` is the *echo* filter's length, not the receiver's: the two
+    /// are unrelated and taking the receiver's gave a 31-tap path, which spans
+    /// 31 delays and cannot reach a reflection 1319 samples back.
+    pub fn abc_arm(&mut self, path: Vec<f64>, delay: usize, path_len: usize) {
+        if path_len < 2 || (!path.is_empty() && path.len() != path_len) {
+            return;
+        }
+        let path = if path.is_empty() { vec![0.0; path_len] } else { path };
+        self.abc = Some(Abc {
+            a: self.rx.clone(),
+            c: self.rx.clone(),
+            path: path.clone(),
+            delay,
+            seen: VecDeque::with_capacity(delay + path.len() + 16),
+            fitted: !path.iter().all(|v| *v == 0.0),
+            fit_x: VecDeque::with_capacity(ABC_FIT + 16),
+            fit_r: VecDeque::with_capacity(ABC_FIT + 16),
+            scanned: 0,
+            scan_corr: 0.0,
+            erle: 0.0,
+        });
+        eprintln!(
+            "  v90: A/B/C armed from the receiver state at data mode: {} taps, \
+             path norm {:.4}, lock {delay}",
+            self.rx.taps().len(),
+            path.iter().map(|v| v * v).sum::<f64>().sqrt()
+        );
+    }
+
+    /// One data-mode sample for the two replay receivers. `line` is what the
+    /// engine's own canceller was given as its input and `reference` is our own
+    /// transmit at that moment.
+    ///
+    /// The path for the third case is estimated here, from this call's own data
+    /// mode, once there are enough samples: a delay found by correlating the
+    /// line against our own transmit, and then a least-squares fit around it.
+    /// The delay cannot be assumed, because the DIL's lock and the data mode's
+    /// path have been seen 200-odd samples apart on this line, which is more
+    /// than half the tap window reaches.
+    pub fn abc_feed(&mut self, line: f64, reference: f64) {
+        let Some(abc) = self.abc.as_mut() else { return };
+        abc.seen.push_back(reference);
+        if abc.seen.len() > abc.delay + abc.path.len() {
+            abc.seen.pop_front();
+        }
+        if !abc.fitted {
+            abc.fit_x.push_back(line);
+            abc.fit_r.push_back(reference);
+            if abc.fit_x.len() >= ABC_FIT {
+                abc.estimate();
+            }
+            return;
+        }
+        let c = abc.predicted(line);
+        abc.a.feed(line);
+        abc.c.feed(c);
     }
 
     /// One network sample in, one out.
@@ -1551,6 +1798,33 @@ impl Modem {
                             let p = symbol.point;
                             let _ = writeln!(f, "{} {:.6} {:.6}", self.now, p.re, p.im);
                             self.points_written += 1;
+                        }
+                    }
+                    // The two replay cases, from the same receiver state on the
+                    // same samples, so three E[z^8] figures describe one window
+                    // and differ only in the echo.
+                    if self.abc.is_some() {
+                        let mut syms = Vec::new();
+                        if let Some(abc) = self.abc.as_mut() {
+                            while let Some(h) = abc.a.heard() {
+                                if let Heard::Symbol(s) = h {
+                                    syms.push(("A", s));
+                                }
+                            }
+                            while let Some(h) = abc.c.heard() {
+                                if let Heard::Symbol(s) = h {
+                                    syms.push(("C", s));
+                                }
+                            }
+                        }
+                        if let Some(mut f) = abc_points() {
+                            for (case, s) in syms {
+                                let _ = writeln!(
+                                    f,
+                                    "{case} {} {:.6} {:.6}",
+                                    self.now, s.point.re, s.point.im
+                                );
+                            }
                         }
                     }
                     decoder.feed(symbol.point);

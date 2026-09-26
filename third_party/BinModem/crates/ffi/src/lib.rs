@@ -201,9 +201,53 @@ const ECHO_QUIET_DB: f64 = -30.0; /* input loudness the far end must be under */
 const ECHO_MU: f64 = 0.5;
 /* How far apart the lags of the TX-correlation projection are, in samples. */
 const AB_LAG_STEP: usize = 8;
+/* The data-mode tracker.
+ *
+ * The DIL filter is fitted over the DIL, which is narrowband start-up
+ * signalling, and data mode is wideband in both directions. The reflection is
+ * at the same delay the whole time -- measured across 2.56 s of data mode in
+ * eight overlapping windows, the peak lag was 1319, 1319, 1321, 1319, 1319,
+ * 1321, 1321, 1321 -- and a fit to the data mode's own samples reaches 23.6 dB
+ * of ERLE_tx where the DIL fit reaches 13.1. So the path is not moving and does
+ * not need chasing: it needs fitting once more, in the right window.
+ *
+ * 12288 samples is 1.5 s, a 24-sample-per-tap fit and one and a half times the
+ * whole 512-tap reach of the filter's delay window. The first version used three
+ * and a half seconds, which left the logged data-mode window -- 2.56 s of it,
+ * opening at data-mode entry -- almost entirely filled by the filter the tracker
+ * exists to replace, and the measurement could not see the tracker at all.
+ */
+const TRACK_RING: usize = 12_288;
+/* How much of it a fit uses, and how much is held back from the fit to judge it
+ * on. The held-back part is the *older* half, so that a fit over the newest
+ * samples needs no shift to be expressed in the filter's own frame, and is still
+ * out of sample: nothing that fitted the filter has seen it. */
+const TRACK_FIT: usize = 8_192;
+const TRACK_HOLD: usize = 4_096;
+/* How often to try. A second, which is a whole call's worth of rate symbols
+ * between attempts and a sixteenth of the ring between refits. */
+const TRACK_PERIOD: usize = 4_096;
+/* How much better a candidate has to be, on the held-back samples, before it
+ * replaces what is in the filter. Half a decibel is noise on a window this
+ * size; a whole one is a change nobody could argue with. */
+const TRACK_MARGIN_DB: f64 = 1.0;
+/* How far the fitted path's peak may sit from the middle of the window before
+ * the lock is moved to bring it back. 48 taps either side of the edge. */
+const TRACK_EDGE: usize = 48;
+
 /* How many line samples of one call's data-mode window are logged: the same
    2.56 s the constellation dump covers, so the two describe one interval. */
 const DATA_LOG_SAMPLES: u64 = 20_480;
+/* How far into data mode the logged window starts.
+ *
+ * The tracker needs a ring's worth of samples before its first attempt, so a
+ * window that opens at data-mode entry is nothing but the filter the tracker
+ * exists to replace. It did exactly that: 16384 logged samples, the tracker's
+ * entire warm-up, and an ERLE_tx of 12.6 dB that was the DIL filter's number all
+ * over again. Starting two seconds in measures the regime the call spends
+ * almost all of its time in.
+ */
+const DATA_LOG_SKIP: u64 = 16_384;
 /* How long a window the A/B is judged on.
  *
    It has to be longer than the longest delay the search can report plus half
@@ -274,6 +318,25 @@ fn cholesky_solve(a: &[f64], b: &[f64], n: usize) -> Option<(Vec<f64>, Vec<f64>)
         y[i] = s / m[i * n + i];
     }
     Some((y, pivots))
+}
+
+/// The echo path for the data-mode A/B/C replay, given as taps.
+///
+/// Read from `V90_ABC_PATH` because it has to be estimated outside the engine:
+/// the question is whether a *different model of the path* restores the
+/// constellation, and estimating it here with the code under test could only
+/// show that the code agrees with itself. `scripts/bench/abc-window.py` writes
+/// the taps and they are passed in like this.
+fn abc_path() -> Option<Vec<f64>> {
+    let raw = std::env::var("V90_ABC_PATH").ok()?;
+    let v: Vec<f64> = raw
+        .split_whitespace()
+        .map(|t| t.parse().ok())
+        .collect::<Option<_>>()?;
+    if v.len() < 2 {
+        return None;
+    }
+    Some(v)
 }
 
 /// Whether the DIL solves the path in one block, which `ECHO_LS` turns off to
@@ -367,6 +430,34 @@ struct Echo {
     /// The last sample's line, reference and prediction, so that whoever calls
     /// [`Echo::sample`] can log all three without this knowing about the log.
     last: Last,
+    /// The data-mode tracker. See `TRACK_RING`.
+    track: Track,
+    /// The filter at each commit, newest last, for the data-mode log to write
+    /// out: the filter is not the one that was in place when the window opened.
+    track_writes: Vec<(u64, usize, Vec<f64>)>,
+}
+
+/// The data-mode tracker's window and its bookkeeping.
+///
+/// The samples are the line and our own transmit, oldest first, capped at
+/// [`TRACK_RING`]. Nothing here is ever adapted towards: a candidate is fitted,
+/// judged on samples the fit did not see, and either replaces the filter or is
+/// thrown away. There is no gradient step and no `far_end_silent`, because in
+/// data mode the far end is transmitting and a step small enough not to chase it
+/// is too small to converge.
+#[derive(Default)]
+struct Track {
+    rx: std::collections::VecDeque<f64>,
+    reference: std::collections::VecDeque<f64>,
+    /// Samples since the last attempt.
+    since: usize,
+    /// Attempts made, and how many were taken.
+    tries: usize,
+    taken: usize,
+    /// The last figure each candidate reached on the held-back samples, so the
+    /// log says what was rejected and not only what was accepted.
+    held_best: f64,
+    held_now: f64,
 }
 
 /// One sample's three series, kept for the data-mode log.
@@ -513,6 +604,8 @@ impl Echo {
             data: false,
             far_silent: false,
             last: Last::default(),
+            track: Track::default(),
+            track_writes: Vec::new(),
             echo_energy: 0.0,
             residual_energy: 0.0,
             gate_samples: 0,
@@ -669,6 +762,55 @@ impl Echo {
         ls.buf_r.push(r);
     }
 
+    /// The echo path over one window of the line and our own transmit.
+    ///
+    /// Linear correlations, one row of the Toeplitz normal matrix per lag, a
+    /// ridge at [`LS_RIDGE`] of the reference's own energy, and a direct
+    /// Cholesky. `d0` is the lowest delay the window of taps covers, so the
+    /// answer is already the filter and needs no rescaling and no peak search.
+    ///
+    /// The same function for the DIL and for data mode, on purpose: the two were
+    /// answering the same question and the only thing that differs is the window
+    /// they are given, and a tracker with its own arithmetic could disagree with
+    /// the thing it is supposed to be tracking.
+    fn solve_path(reference: &[f64], line: &[f64], d0: isize, taps: usize) -> Option<Vec<f64>> {
+        let n = reference.len().min(line.len());
+        if d0 < 0 || n < d0 as usize + taps {
+            return None;
+        }
+        let mut q = vec![0.0; taps];
+        let mut b = vec![0.0; taps];
+        for t in 0..taps {
+            let mut acc = 0.0;
+            for i in t..n {
+                acc += reference[i] * reference[i - t];
+            }
+            q[t] = acc;
+        }
+        for j in 0..taps {
+            let lag = d0 as usize + j;
+            let mut acc = 0.0;
+            for i in lag..n {
+                acc += line[i] * reference[i - lag];
+            }
+            b[j] = acc;
+        }
+        let energy = q[0].max(1e-30);
+        let mut a = vec![0.0; taps * taps];
+        for i in 0..taps {
+            for j in 0..taps {
+                a[i * taps + j] = q[i.abs_diff(j)];
+            }
+            a[i * taps + i] += LS_RIDGE * energy;
+        }
+        let (w, pivots) = cholesky_solve(&a, &b, taps)?;
+        // The pivots come back so the log can say how close the system was to
+        // singular, which is the only honest way to say whether the ridge was
+        // needed at all.
+        let _ = pivots;
+        Some(w)
+    }
+
     /// The tap `k` of a filter with `taps` taps is the reference sample
     /// `delay - taps / 2 + k` ago, so the whole 512-tap window spans delays
     /// `delay - 256 ..= delay + 255`. Every lag the estimate needs is in that
@@ -812,6 +954,179 @@ impl Echo {
              reference's energy, pivot spread {:.1} dB, {}",
             ls.cond_db, ls.note
         );
+    }
+
+    /// One data-mode sample into the tracker's window, and an attempt when
+    /// [`TRACK_PERIOD`] have gone by.
+    ///
+    /// Fed from `sample` on every sample of a call that has reached data mode,
+    /// so that the window is the window the receiver is being given, not a
+    /// window reconstructed afterwards.
+    fn track_feed(&mut self, x: f64, r: f64) {
+        self.track.rx.push_back(x);
+        self.track.reference.push_back(r);
+        if self.track.rx.len() > TRACK_RING {
+            self.track.rx.pop_front();
+            self.track.reference.pop_front();
+        }
+        self.track.since += 1;
+        if self.track.since >= TRACK_PERIOD {
+            self.track.since = 0;
+            self.track_step();
+        }
+    }
+
+    /// Fit the path to the newest [`TRACK_FIT`] samples, judge it on the
+    /// [`TRACK_HOLD`] before them, and take it only if it is better.
+    ///
+    /// The margin is what stops this being the gradient again. The previous
+    /// gradient made the echo *worse* -- -1.9 dB of ERLE_tx on the calls that
+    /// measured it -- because it was fitted to the far modem's signal as well as
+    /// to ours, and nothing ever asked whether the result was an improvement.
+    /// Here both candidates are scored on the same held-back samples, on the
+    /// energy correlated with our own transmit, and the incumbent has to lose by
+    /// a whole decibel.
+    fn track_step(&mut self) {
+        let taps = self.w.len();
+        if self.delay == 0 || self.track.rx.len() < TRACK_FIT + TRACK_HOLD {
+            return;
+        }
+        self.track.tries += 1;
+        let n = self.track.rx.len();
+        // `as_slices` on a `VecDeque` splits at the ring's own wrap point and
+        // the first half can come back empty, which it did: "range end index
+        // 4096 out of range for slice of length 0". One slice each, contiguous.
+        let rx = self.track.rx.make_contiguous();
+        let rf = self.track.reference.make_contiguous();
+        let hold = &rx[..TRACK_HOLD];
+        let ref_hold = &rf[..TRACK_HOLD];
+        let fit = &rx[n - TRACK_FIT..];
+        let ref_fit = &rf[n - TRACK_FIT..];
+        let d0 = self.delay as isize - (taps / 2) as isize;
+
+        // What the incumbent achieves on the held-back samples, as the thing to
+        // beat. Its own prediction is not in the window, so it is formed from
+        // the same reference with the same frame the fit uses.
+        let now = Self::residual_measured(self.w.as_slice(), d0, self.delay, hold, ref_hold);
+        let Some(cand) = Self::solve_path(ref_fit, fit, d0, taps) else {
+            eprintln!("  echo: track: the normal equations would not factor; the filter is left alone");
+            return;
+        };
+        // Where the fit's own peak sits, and whether the window would be better
+        // held somewhere else.
+        //
+        // Moving the lock on the strength of the peak alone was a mistake, and a
+        // measured one: on the 2026-09-26 23:10 call a fit whose peak was 160
+        // samples right of centre moved the lock there, and the live filter's
+        // ERLE_tx in the windows that followed went from 5.5 dB to 0.2 and then
+        // 0.0. The dominant path had not moved -- an independent fit over the
+        // same windows still put its own energy at 1319 and its ERLE *fell* to
+        // 9.1 dB at 1479 from 11.1 at 1319 -- so the peak of a noisy fit is not
+        // evidence of where the path is. The lock is therefore moved only if a
+        // fit taken at the new lock beats a fit taken at the old one, on the
+        // same held-back samples, by the same margin as everything else.
+        let peak = cand
+            .iter()
+            .enumerate()
+            .fold((0usize, 0.0f64), |(bi, bm), (i, &v)| {
+                if v.abs() > bm { (i, v.abs()) } else { (bi, bm) }
+            })
+            .0;
+        let mut cand = cand;
+        let mut d0 = d0;
+        let mut moved = 0isize;
+        if peak.abs_diff(taps / 2) >= TRACK_EDGE
+            && let Some(alt) = Self::solve_path(ref_fit, fit, d0 + (peak as isize - (taps / 2) as isize), taps)
+        {
+            let shift = peak as isize - (taps / 2) as isize;
+            let here = Self::residual_measured(cand.as_slice(), d0, self.delay, hold, ref_hold);
+            let there = Self::residual_measured(alt.as_slice(), d0 + shift, (self.delay as isize + shift) as usize, hold, ref_hold);
+            if 10.0 * (here / there.max(1e-30)).log10() >= TRACK_MARGIN_DB {
+                cand = alt;
+                d0 += peak as isize - (taps / 2) as isize;
+                moved = peak as isize - (taps / 2) as isize;
+            }
+        }
+        let got = Self::residual_measured(cand.as_slice(), d0, self.delay, hold, ref_hold);
+        self.track.held_best = got;
+        self.track.held_now = now;
+        let better = 10.0 * (now / got.max(1e-30)).log10();
+        if better < TRACK_MARGIN_DB {
+            eprintln!(
+                "  echo: track: candidate {better:+.1} dB against the filter on \
+                 {TRACK_HOLD} held-back samples, peak at tap {peak}, not taken"
+            );
+            return;
+        }
+        // The FIR window follows the path. The fit is expressed in the frame
+        // whose tap `j` is the line's response at delay `lock - centre + j`, so
+        // a peak away from the middle means the lock is holding the window in
+        // the wrong place, and the window is a finite one: a path at its edge
+        // has half its arrival outside the filter.
+        let shift = peak as isize - (taps / 2) as isize;
+        let mut w = vec![0.0; taps];
+        for (j, v) in cand.iter().enumerate() {
+            let k = j as isize - shift;
+            if k >= 0 && (k as usize) < taps {
+                w[k as usize] = *v;
+            }
+        }
+        if moved != 0 {
+            self.delay = (d0 + (taps / 2) as isize).clamp(ECHO_LAG_LO as isize, ECHO_LAG_HI as isize)
+                as usize;
+        }
+        let norm: f64 = w.iter().map(|v| v * v).sum::<f64>().sqrt();
+        self.w = w.clone();
+        self.track.taken += 1;
+        // The window's own report quotes the taps and the delay in force when it
+        // was written, which is before the tracker has run at all. The filter
+        // changes under it, so each commit is logged too and the report can say
+        // which set was in force over which part of the window.
+        self.track_writes.push((self.track.rx.len() as u64, self.delay, w));
+        eprintln!(
+            "  echo: track: taken, {better:+.1} dB against the filter on \
+             {TRACK_HOLD} held-back samples, peak at a delay of {}, norm {norm:.4}, \
+             {}/{} attempts",
+            d0 + peak as isize,
+            self.track.taken,
+            self.track.tries
+        );
+    }
+
+    /// The energy in `line - predict(taps)` that is correlated with `reference`.
+    ///
+    /// `d0` is where the tap window starts, which is what the prediction needs,
+    /// and `delay` is the lock, which is what the projection has to be *centred*
+    /// on. They differ by half the tap count, and passing the first where the
+    /// second was wanted put the search over `[delay - 512, delay)`: the path,
+    /// which is at `delay`, sat on the top edge of the range and most of what
+    /// the search found was the edge itself. The tracker then compared two
+    /// filters on that and committed on it, and a call that ran 232 attempts
+    /// finished with an ERLE_tx of -3.5 dB: a filter that made the echo worse,
+    /// which is precisely what the held-out check existed to prevent.
+    fn residual_measured(
+        taps_w: &[f64],
+        d0: isize,
+        delay: usize,
+        line: &[f64],
+        reference: &[f64],
+    ) -> f64 {
+        let n = line.len().min(reference.len());
+        let mut res = vec![0.0; n];
+        for i in 0..n {
+            let mut y = 0.0;
+            for (k, &w) in taps_w.iter().enumerate() {
+                if w == 0.0 {
+                    continue;
+                }
+                let j = i as isize - d0 - k as isize;
+                if j >= 0 && (j as usize) < n {
+                    y += w * reference[j as usize];
+                }
+            }
+            res[i] = line[i] - y;
+        }
+        Self::tx_correlated(&res, reference, delay, taps_w.len())
     }
 
     /// The energy in `residual` that is linearly correlated with our own
@@ -1195,7 +1510,13 @@ impl Echo {
         // of our own transmit samples it is an echo of, and what the filter
         // predicted. `sample` has no other way to hand them up, and the log
         // wants them for the same sample the receiver is being given.
-        self.last = Last { x, r: self.reference(), yhat };
+        let reference = self.reference();
+        self.last = Last { x, r: reference, yhat };
+        // Data mode, where the far end is transmitting and the DIL's silence is
+        // not coming back: the path is refitted here or not at all.
+        if self.data {
+            self.track_feed(x, reference);
+        }
         left
     }
 
@@ -1318,6 +1639,8 @@ pub struct Answerer {
     /// numbering, so that a sample count it reports can be tied to a line
     /// sample of the capture. `V90_DATA_ECHO` writes it.
     v90_origin: u64,
+    /// Whether the replay has been given a path and armed.
+    abc_armed: bool,
     /// The V.90 modem's own sample count, read inside the stage match and used
     /// outside it, where `self` is free to borrow.
     v90_now: u64,
@@ -1413,6 +1736,7 @@ impl Answerer {
             capture: std::env::var_os("BM_CAPTURE").map(|d| Capture::new(std::path::Path::new(&d))),
         v90_origin: 0,
         v90_now: 0,
+        abc_armed: false,
         echo_state_done: false,
         data_log: None,
         data_log_from: u64::MAX,
@@ -1555,7 +1879,14 @@ fn start_error_control(&mut self) {
         // Data mode is where the echo path has to keep adapting with the far
         // end talking: both directions are wideband there, so the reflection
         // learned on the narrowband start-up sequences does not describe it.
-        self.echo.data = self.status == BM_CONNECTED;
+        // Data mode, for the V.90 path, is `v90_in_data` and not the connected
+        // status: `update_connected_status` holds BM_RUNNING for as long as the
+        // error-control layer is still negotiating, which is the whole of the
+        // data-mode window the constellation is measured in. Gating on the
+        // status meant the tracker never ran -- 4096 samples of ring collected
+        // per second and not one attempt logged in a call that spent four
+        // minutes in data mode.
+        self.echo.data = self.v90_in_data || self.status == BM_CONNECTED;
         let x = self.echo.sample(input as f64 / 32768.0);
         let y = match &mut self.stage {
             Stage::V8(m) => {
@@ -1640,6 +1971,12 @@ fn start_error_control(&mut self) {
                             self.physical_connected = true;
                             self.v90_in_data = true;
                             self.v90_now = m.samples();
+                            // Armed unconditionally: the path is estimated from
+                            // this call's own data mode once there are samples
+                            // enough, and gating the arming on a path supplied
+                            // from outside left the replay never running.
+                            m.abc_arm(abc_path().unwrap_or_default(), self.echo.delay, self.echo.w.len());
+                            self.abc_armed = true;
                             if v90_error_control() {
                                 self.start_error_control();
                             }
@@ -1681,6 +2018,24 @@ fn start_error_control(&mut self) {
             Stage::V34(_) | Stage::Done => 0.0,
         };
 
+        // The filter the tracker has committed since the last sample, in the
+        // same file, so the window's report can say which taps were in force
+        // over which part of it.
+        if self.data_log.is_some() && !self.echo.track_writes.is_empty() {
+            use std::io::Write;
+            let now = self.samples.saturating_sub(self.v90_origin);
+            let writes = std::mem::take(&mut self.echo.track_writes);
+            if let Some(f) = self.data_log.as_mut() {
+                for (age, delay, w) in writes {
+                    let taps: Vec<String> = w.iter().map(|v| format!("{v:.9}")).collect();
+                    let _ = writeln!(f, "=== track");
+                    let _ = writeln!(f, "data_now {}", now.saturating_sub(age as u64));
+                    let _ = writeln!(f, "delay {delay}");
+                    let _ = writeln!(f, "taps_count {}", w.len());
+                    let _ = writeln!(f, "taps {}", taps.join(" "));
+                }
+            }
+        }
         if self.v90_in_data && !self.echo_state_done {
             self.echo_state_done = true;
             self.write_echo_state(self.v90_now);
@@ -1692,6 +2047,16 @@ fn start_error_control(&mut self) {
             let now = self.samples.saturating_sub(self.v90_origin);
             let l = self.echo.last;
             self.data_log_sample(now, l.x, l.r, l.yhat);
+        }
+        // The replay receivers, shown the line and the line with the
+        // independent path off it. Fed from here, where `x` is the line as it
+        // arrived and `reference` is our own transmit: the echo is a reflection
+        // of what we sent, and a path predicted from the line would be a
+        // different filter altogether.
+        if self.abc_armed {
+            if let Stage::V90(m) = &mut self.stage {
+                m.abc_feed(self.echo.last.x, self.echo.last.r);
+            }
         }
         let y = if self.want_v90 && self.v90_in_data && v90_tx_mute() { 0.0 } else { y };
         if y.abs() > self.peak {
@@ -1982,7 +2347,10 @@ impl Answerer {
         // more than once, and which of those a constellation point belongs to is
         // settled by its count against the header nearest below it; latching on
         // the first left that unanswerable.
-        self.data_log_from = self.samples.saturating_sub(self.v90_origin);
+        self.data_log_from = self
+            .samples
+            .saturating_sub(self.v90_origin)
+            .saturating_add(DATA_LOG_SKIP);
         self.data_log_header();
     }
 
@@ -2957,6 +3325,104 @@ mod ls_tests {
     #[test]
     fn the_dil_identification_finds_the_latest_lockable_path() {
         identification_at(ECHO_LAG_HI - 64, 0.05, ECHO_LAG_HI - 64);
+    }
+
+    /// The tracker has to take a better filter and refuse a worse one, and it
+    /// has to judge both on samples the fit did not see.
+    ///
+    /// The gradient this replaces made the echo worse -- -1.9 dB of ERLE_tx on
+    /// the calls that measured it -- and nothing ever asked whether its result
+    /// was an improvement. Here the incumbent has to lose by a decibel on
+    /// held-back samples or the candidate is thrown away, so the tracker can
+    /// only ever go forwards. That is the whole of its safety.
+    #[test]
+    fn the_tracker_takes_a_better_path_and_refuses_a_worse_one() {
+        let taps = 512usize;
+        let delay = 1319usize;
+        let n = TRACK_FIT + TRACK_HOLD + TRACK_PERIOD * 2;
+        let (r, _) = reference_with_spread(n + delay, 2.0);
+        // The line: the path, plus a far-end signal neither filter is to blame
+        // for. The far end is talking throughout, because that is the whole
+        // difficulty and `far_end_silent` is not available for it.
+        let mut far = 0x0f1e_2d3cu32;
+        let mut line = vec![0.0; n];
+        for i in 0..n {
+            let mut y = 0.0;
+            for (k, (_o, g)) in [(0usize, -0.072f64), (2, 0.069), (4, 0.046)]
+                .iter()
+                .enumerate()
+            {
+                let j = i as isize - delay as isize - k as isize;
+                if j >= 0 {
+                    y += g * r[j as usize];
+                }
+            }
+            far = far.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let f = if (far >> 16) & 1 == 0 { 0.03 } else { -0.03 };
+            line[i] = y + f;
+        }
+
+        // The incumbent: the right delay, and a broadband wrong shape -- what
+        // fitting over the wrong window gives.
+        let mut weak = Echo::new();
+        weak.delay = delay;
+        weak.w = vec![0.0; taps];
+        for (k, (_o, g)) in [(0usize, -0.0375f64), (2, 0.061), (3, 0.035), (8, 0.030)]
+            .iter()
+            .enumerate()
+        {
+            weak.w[taps / 2 + k] = *g;
+        }
+        let mut noise = 0x51ce_0001u32;
+        for v in weak.w.iter_mut() {
+            noise = noise.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v += ((noise >> 16) as f64 / 32768.0 - 0.5) * 0.012;
+        }
+        for (i, &x) in line.iter().enumerate() {
+            weak.track_feed(x, r[i]);
+        }
+        let taken = weak.track.taken;
+        assert!(
+            taken > 0,
+            "the tracker took nothing from a filter that was {} dB worse",
+            TRACK_MARGIN_DB
+        );
+        assert_eq!(weak.track.rx.len(), TRACK_RING);
+        eprintln!(
+            "    tracker: took {}/{} attempts, norm {:.4}, peak {:.4} at a delay of {}",
+            taken,
+            weak.track.tries,
+            weak.w.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            weak.w[taps / 2],
+            weak.delay
+        );
+        // The fitted path has to be better than what it replaced, on the
+        // held-back samples, by the margin the test exists to enforce.
+        // And an incumbent that is already right must not be displaced by noise.
+        let mut good = Echo::new();
+        good.delay = delay;
+        good.w = vec![0.0; taps];
+        for (k, (_o, g)) in [(0usize, -0.072f64), (2, 0.069), (4, 0.046)]
+            .iter()
+            .enumerate()
+        {
+            good.w[taps / 2 + k] = *g;
+        }
+        let before = good.w.clone();
+        for (i, &x) in line.iter().enumerate() {
+            good.track_feed(x, r[i]);
+        }
+        assert_eq!(
+            good.track.taken, 0,
+            "a filter that already was the path was replaced {} times",
+            good.track.taken
+        );
+        for (k, (a, b)) in good.w.iter().zip(&before).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "tap {k} moved from {b:+.6} to {a:+.6} on a line it already fitted"
+            );
+        }
     }
 
     /// The A/B has to prefer the right filter for the right reason, so this

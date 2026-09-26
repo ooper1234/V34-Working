@@ -44,15 +44,31 @@ def read_state(path):
 
 
 def read_series(path):
-    """`now x r yhat residual`, one row per line."""
-    rows = []
+    """Every segment's `now x r yhat residual`, in file order.
+
+    Segmented, because the file is appended across calls and across retrainings
+    and the count restarts at zero in each new V.90 modem: a segment's rows are
+    the ones after its header and before the next, and taking the whole file put
+    two calls' rows in one series with two calls' worth of `now` colliding.
+    """
+    segs, cur = [], None
     for line in open(path):
         f = line.split()
-        if f and f[0] == "s" and len(f) >= 6:
-            rows.append([float(v) for v in f[1:6]])
-    a = np.array(rows)
-    return {"now": a[:, 0].astype(np.int64), "x": a[:, 1], "r": a[:, 2],
-            "yhat": a[:, 3], "left": a[:, 4]}
+        if not f:
+            continue
+        if f[0] == "===":
+            cur = {"rows": []}
+            segs.append(cur)
+        elif f[0] == "s" and len(f) >= 6 and cur is not None:
+            cur["rows"].append([float(v) for v in f[1:6]])
+    out = []
+    for g in segs:
+        if not g["rows"]:
+            continue
+        a = np.array(g["rows"])
+        out.append({"now": a[:, 0].astype(np.int64), "x": a[:, 1], "r": a[:, 2],
+                    "yhat": a[:, 3], "left": a[:, 4], "header": g})
+    return out
 
 
 def read_points(path):
@@ -96,20 +112,32 @@ def moment8(z):
 if __name__ == "__main__":
     state = read_state(sys.argv[1])
     points = read_points(sys.argv[2])
-    series = read_series(sys.argv[1])
+    segs = read_series(sys.argv[1])
     if not state["blocks"]:
         raise SystemExit("no data-mode header in the state file")
-    # The last header: the most recent entry into data mode in this file.
-    hdr = state["blocks"][-1]
-    delay = int(hdr["delay"])
-    taps = hdr["taps"] if hdr.get("taps") is not None else np.zeros(TAPS)
-    entry = int(hdr["data_now"])
+    # The segment to report on: the one whose rows overlap the constellation
+    # points the most. The points file is per call and per Modem, and so is each
+    # segment, so overlap is the only thing that pairs them.
+    def overlap(g):
+        lo, hi = g["now"].min(), g["now"].max()
+        return int(((points["now"] >= lo) & (points["now"] <= hi)).sum())
+    series = max(segs, key=overlap)
+    entry = int(series["header"].get("data_now", series["now"][0]))
 
     # The constellation's own window, and the series rows inside it. Both files
     # carry the same count, so this is an exact intersection rather than an
     # assumption about where in the call either of them started.
     lo = max(points["now"].min(), series["now"].min())
     hi = min(points["now"].max(), series["now"].max())
+    # The filter in force over the *end* of the window, which is not the one
+    # that was in place when the window opened: the data-mode tracker replaces it
+    # as the call goes on, and each replacement is logged with the count it
+    # happened at. The last one at or before `hi` is the one that was doing the
+    # cancelling for most of the window.
+    live = [b for b in state["blocks"] if int(b.get("data_now", "0")) <= hi]
+    hdr = live[-1] if live else state["blocks"][0]
+    delay = int(hdr["delay"])
+    taps = hdr["taps"] if hdr.get("taps") is not None else np.zeros(TAPS)
     ps = (points["now"] >= lo) & (points["now"] <= hi)
     ss = (series["now"] >= lo) & (series["now"] <= hi)
     x = series["x"][ss]
@@ -118,8 +146,11 @@ if __name__ == "__main__":
     z = points["re"][ps] + 1j * points["im"][ps]
 
     print("V.90 data mode: the echo and the constellation, on one interval of samples\n")
-    print(f"  entry into data mode at count {entry}, delay {delay}, {len(taps)} taps, "
-          f"norm {np.sqrt((taps**2).sum()):.4f}")
+    commits = [b for b in state["blocks"] if b.get("data_now") is not None][1:]
+    print(f"  entry into data mode at count {entry}")
+    print(f"  the filter in force at the end of the window: delay {delay}, {len(taps)} taps, "
+          f"norm {np.sqrt((taps**2).sum()):.4f} (set at count {hdr['data_now']}; "
+          f"{len(commits)} tracker commits logged)")
     print(f"  window: counts {lo}..{hi}, {ss.sum()} line samples, {ps.sum()} constellation points")
     print(f"  every figure below is over exactly that interval\n")
 

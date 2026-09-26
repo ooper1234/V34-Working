@@ -346,6 +346,21 @@ pub struct Digital {
 }
 
 impl Digital {
+    /// Arm the data-mode A/B/C replay. See `digital::Modem::abc_arm`.
+    pub fn abc_arm(&mut self, path: Vec<f64>, delay: usize, path_len: usize) {
+        if let Some(m) = self.v90.as_mut() {
+            m.abc_arm(path, delay, path_len);
+        }
+    }
+
+    /// One data-mode sample for the replay receivers: `line` as it arrived and
+    /// `reference` is our own transmit at that moment.
+    pub fn abc_feed(&mut self, line: f64, reference: f64) {
+        if let Some(m) = self.v90.as_mut() {
+            m.abc_feed(line, reference);
+        }
+    }
+
     /// How many line samples the V.90 modem inside has been given.
     ///
     /// Read by the FFI so that it can put this modem's sample count and the
