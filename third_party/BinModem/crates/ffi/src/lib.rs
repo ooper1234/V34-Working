@@ -201,10 +201,18 @@ const ECHO_QUIET_DB: f64 = -30.0; /* input loudness the far end must be under */
 const ECHO_MU: f64 = 0.5;
 /* How far apart the lags of the TX-correlation projection are, in samples. */
 const AB_LAG_STEP: usize = 8;
-/* How long a window the A/B is judged on: a quarter of a second, which at the
-   8 kHz rate is four blocks of the far-end signal and, over 64 lags of
-   projection, enough samples that the floor cannot decide it. */
-const AB_WINDOW: usize = 2048;
+/* How long a window the A/B is judged on.
+ *
+   It has to be longer than the longest delay the search can report plus half
+   the tap window plus the projection's own tail, because a lag whose reference
+ * runs off the end of the window is not searched at all. That is 3072 + 256 +
+ * 256 = 3584 for the longest lockable delay, so 4096. At 2048 the search was
+ * silently truncated to lags below 1792, and a call locking at 1879 had its
+ * path's peak outside the range being measured -- which is a large part of why
+ * the measured ERLE_tx swung from 15.7 dB to -4.6 dB between calls that had the
+ * same estimator and the same path. Half a second at 8 kHz.
+ */
+const AB_WINDOW: usize = 4096;
 /* The ridge on the normal equations, as a fraction of the reference's own
    energy. Swept, not guessed: over the DIL's whole spectral range anything
    from zero to 1e-4 moves the recovered gain by under a tenth, and 1e-3 by a
@@ -831,6 +839,8 @@ impl Echo {
         let lo = delay.saturating_sub(centre);
         let mut lag = lo;
         while lag < delay + centre {
+            // A lag whose reference would run past the end of the window is
+            // skipped, not wrapped. Callers must leave room: see `AB_WINDOW`.
             if lag + 256 <= n {
                 // A reflection of the reference sample `lag` ago lands at
                 // index i having come from index i - lag, so the projection
@@ -1103,19 +1113,20 @@ impl Echo {
                      against {:.1} dB before it, over {} samples",
                     ls.depth_before, ls.post_n
                 );
-                // If the solve made it worse, the gradient was getting it more
-                // nearly right than the block solve did and the taps go back.
-                if after < ls.depth_before {
-                    let kept = std::mem::take(&mut ls.kept);
-                    if kept.len() == self.w.len() {
-                        self.w = kept;
-                    }
-                    eprintln!(
-                        "  echo: DIL solve: {after:.1} dB is worse than the gradient's \
-                         {:.1} dB, so its taps are kept",
-                        ls.depth_before
-                    );
-                }
+                // Logged, and nothing more. This figure is prediction against
+                // residual, which is not a measure of cancellation: it rises
+                // when the filter's output is simply larger, so it preferred a
+                // big noisy filter to a small correct one and on the 2026-09-26
+                // calls it preferred the gradient at -2.5 dB of transmit-correlated
+                // residual -- a filter that made the echo worse -- over the
+                // correlation's at 8.3 dB. It used to put the gradient's taps
+                // back here. It no longer decides anything: the A/B does, on
+                // the energy actually correlated with our own transmission, and
+                // it runs over a window this measurement is not taken from.
+                eprintln!(
+                    "  echo: DIL solve: this figure is prediction against residual and \
+                     is not a measure of cancellation; the A/B below decides"
+                );
             }
         }
 
@@ -1139,6 +1150,22 @@ impl Echo {
         // to solve, then judge the two candidates on what comes after.
         if !self.far_silent {
             if echo_ls() {
+                // How long the far end's silence actually lasted, and whether
+                // that was enough. A 1.96 s DIL is 15 655 samples, thirty a tap
+                // and well clear of the sixteen the solve wants, so a window
+                // that fell short was not the DIL being 1.96 s long.
+                let (held, needed) = self
+                    .ls
+                    .as_ref()
+                    .map(|l| (l.samples, 16 * self.w.len()))
+                    .unwrap_or((0, 0));
+                if held > 0 && !self.ls.as_ref().is_some_and(|l| l.solved) {
+                    eprintln!(
+                        "  echo: far end resumed after {held} silent samples, {} \
+                         short of the {needed} the solve wants",
+                        needed.saturating_sub(held)
+                    );
+                }
                 self.ls_solve();
             }
             self.ab_collect(x, self.reference());
@@ -2482,9 +2509,7 @@ mod ls_tests {
     /// The same window again, for the reversed-order case above. Built twice
     /// rather than cloned because the A/B takes it by value.
     fn rebuild() -> Vec<(f64, f64)> {
-        let taps = 512usize;
         let delay = 1320usize;
-        let centre = taps / 2;
         let n = AB_WINDOW;
         let (r, _) = reference_with_spread(n + delay, 2.0);
         let mut far = 0x5eed_1234u32;
@@ -2505,6 +2530,32 @@ mod ls_tests {
             window.push((y + f, r[i]));
         }
         window
+    }
+
+    /// The judging window has to cover every lag the filter can reach, or the
+    /// measurement silently excludes the path's peak and the answer is noise.
+    ///
+    /// This is a bug that was in the A/B from the first version: the window was
+    /// a quarter of a second, the projection skips any lag whose reference
+    /// would run past the end, and a call locking at 1879 samples therefore had
+    /// its path measured at lags the path was not at. It showed up as the live
+    /// ERLE_tx swinging from 15.7 dB to -4.6 dB between calls with the same
+    /// estimator and the same path.
+    #[test]
+    fn the_judging_window_covers_every_lag_the_filter_reaches() {
+        let taps = 512usize;
+        // The longest delay the search will ever report, from the lock's range.
+        let worst = ECHO_LAG_HI;
+        let needed = worst + taps / 2 + 256;
+        assert!(
+            AB_WINDOW >= needed,
+            "a {AB_WINDOW}-sample window cannot search the {}-sample lag the \\
+             filter reaches at the longest lockable delay; it needs {needed}",
+            worst + taps / 2
+        );
+        // And the check is not vacuous: at a quarter of a second it did not
+        // hold, which is how this was found.
+        assert!(AB_WINDOW >= 3584, "the window came back to {AB_WINDOW}");
     }
 
     /// The identification has to recover a path it was never told, and recover
@@ -2799,7 +2850,6 @@ mod ls_tests {
             let f = if (far >> 16) & 1 == 0 { 0.03 } else { -0.03 };
             window.push((y + f + 0.002 * ((i * 37 % 11) as f64 - 5.0), r[i]));
         }
-        let e = Echo::new();
         // Tap k models a path component at delay `delay - centre + k`, so a
         // path at the lock itself lands on tap `centre`, and the components at
         // 0, 3 and 7 samples behind it on centre, centre + 3, centre + 7.
