@@ -430,6 +430,9 @@ struct Echo {
     /// The last sample's line, reference and prediction, so that whoever calls
     /// [`Echo::sample`] can log all three without this knowing about the log.
     last: Last,
+    /// Whether the data-mode tracker runs. Set for V.90's data mode and not for
+    /// V.34's, whose canceller keeps the behaviour it has always had.
+    tracking: bool,
     /// The data-mode tracker. See `TRACK_RING`.
     track: Track,
     /// The filter at each commit, newest last, for the data-mode log to write
@@ -603,6 +606,7 @@ impl Echo {
             frozen: false,
             data: false,
             far_silent: false,
+            tracking: false,
             last: Last::default(),
             track: Track::default(),
             track_writes: Vec::new(),
@@ -1513,8 +1517,8 @@ impl Echo {
         let reference = self.reference();
         self.last = Last { x, r: reference, yhat };
         // Data mode, where the far end is transmitting and the DIL's silence is
-        // not coming back: the path is refitted here or not at all.
-        if self.data {
+        // not coming back: the path is refitted here or not at all. V.90 only.
+        if self.tracking {
             self.track_feed(x, reference);
         }
         left
@@ -1886,7 +1890,16 @@ fn start_error_control(&mut self) {
         // status meant the tracker never ran -- 4096 samples of ring collected
         // per second and not one attempt logged in a call that spent four
         // minutes in data mode.
-        self.echo.data = self.v90_in_data || self.status == BM_CONNECTED;
+        self.echo.data = self.status == BM_CONNECTED;
+        // The tracker, though, is V.90's alone. It exists because V.90's DIL is
+        // narrowband start-up signalling and its data mode is wideband in both
+        // directions, and it refits the filter under a call that is up; V.34's
+        // canceller has its own long-established behaviour in data mode and
+        // replacing its taps every half second from a data-mode window is not
+        // a change to make to a path that works. The two flags were the same
+        // line for a while and every V.34 call was running the tracker, which
+        // is the one thing not to do to it.
+        self.echo.tracking = self.v90_in_data;
         let x = self.echo.sample(input as f64 / 32768.0);
         let y = match &mut self.stage {
             Stage::V8(m) => {
