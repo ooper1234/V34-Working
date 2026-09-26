@@ -1766,11 +1766,18 @@ impl Modem {
                     if self.bias_left == 0 {
                         if self.bias_at < bias.len() {
                             self.rx.shift_read(bias[self.bias_at]);
+                            // The sample count goes in the note because the
+                            // equalised points it applies to are tagged with
+                            // that count and nothing else ties the two together:
+                            // without it a sweep is a list of positions and a
+                            // file of points, and no way to say which points
+                            // came from which position.
                             self.say(format!(
-                                "data mode: read position {} of {}: {:+.1} samples",
+                                "data mode: read position {} of {}: {:+.2} samples at {}",
                                 self.bias_at + 1,
                                 bias.len(),
-                                bias[self.bias_at]
+                                bias[self.bias_at],
+                                self.now
                             ));
                             self.bias_at += 1;
                             self.bias_left = data_bias_hold();
@@ -1997,6 +2004,25 @@ impl Modem {
         };
         let params = Params { framing, code, nonlinear, precoding: [(0, 0); 3], mode };
         let decoder = UpstreamDecoder::new(params);
+        // What the slicer's grid is, in the numbers that decide it. Every
+        // measurement so far has said the receiver is decoding noise, and a
+        // grid of the wrong size produces exactly that while reporting itself
+        // locked: the phase-4 note reads "receiver at 3200 bit/s" and 3200 is
+        // this modem's symbol rate, so a grid built for one bit per symbol
+        // would slice a 1280-point constellation into nothing and score well
+        // against it, because any point is near *some* point of a small grid.
+        self.say(format!(
+            "data mode: upstream {} bit/s, framing b={} n={} p={} j={} expanded={}, trellis {code:?}, \
+             nonlinear {nonlinear}, grid scale {:.5} over extent {}",
+            self.upstream_rate,
+            framing.b,
+            framing.n,
+            framing.p,
+            framing.j,
+            framing.expanded,
+            decoder.grid_scale(),
+            decoder.extent()
+        ));
         self.rx.set_grid(decoder.grid_scale(), decoder.extent());
         self.b1_left = framing.n;
         self.decoder = Some(decoder);

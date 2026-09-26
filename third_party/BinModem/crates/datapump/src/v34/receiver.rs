@@ -57,6 +57,41 @@ use crate::v32::Mode;
 const FILTER_TAPS: usize = 64;
 const FILTER_PHASES: usize = 256;
 
+/// One symbol's value at three stages of the receive chain, when
+/// `V34_STAGE_POINTS` names a file: `count row y z`.
+///
+/// `row[REACH]` is the equaliser's input at the symbol's own instant, before the
+/// equaliser and before the carrier is taken out; `y` is the equaliser's output
+/// before the carrier; `z` is what the slicer is handed. Three numbers per symbol
+/// is what it takes to say which of those three stages the constellation stops
+/// being visible at, and the answer may well be that it is not there at any of
+/// them, which the output alone cannot distinguish from a constellation that
+/// never arrived.
+///
+/// `count` is `self.taken`, the receiver's own line-sample count, so the rows line
+/// up with the sample counts the rest of the data-mode dumps use.
+fn stage_points(count: u64, input: &Complex, equalised: &Complex, decided: &Complex) {
+    use std::sync::Mutex;
+    use std::{fs::File, io::Write, path::PathBuf};
+    static PATH: Mutex<Option<(PathBuf, Option<File>)>> = Mutex::new(None);
+    let Some(want) = std::env::var_os("V34_STAGE_POINTS") else { return };
+    let Ok(mut guard) = PATH.lock() else { return };
+    if guard.is_none() {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::path::Path::new(&want))
+            .ok();
+        *guard = Some((PathBuf::from(&want), file));
+    }
+    let Some(f) = guard.as_mut().and_then(|g| g.1.as_mut()) else { return };
+    let _ = writeln!(
+        f,
+        "{count} {:.9} {:.9} {:.9} {:.9} {:.9} {:.9}",
+        input.re, input.im, equalised.re, equalised.im, decided.re, decided.im
+    );
+}
+
 /// Equaliser taps either side of the centre, in half symbols: 31 taps,
 /// fifteen and a half symbols of the line's memory.
 const REACH: usize = 15;
@@ -1113,6 +1148,7 @@ impl Receiver {
         self.rotation = self.rotation.rem_euclid(std::f64::consts::TAU);
         self.error += 0.01 * (squared - self.error);
         self.last = z;
+        stage_points(self.taken, &row[REACH], &y, &z);
         Symbol { point: z, decided, error: squared }
     }
 
