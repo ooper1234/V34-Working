@@ -45,7 +45,47 @@ extern "C" fn get_bit(_user: *mut c_void) -> c_int {
     i32::from(guard.unwrap_or(true))
 }
 
-extern "C" fn put_bit(_user: *mut c_void, _bit: c_int) {}
+/// Every bit the receiver recovers from the line, when `V90_BITS` names a file
+/// to write them to as hex.
+///
+/// This is the only way to see what a replay actually decoded. The moments of
+/// the equalised points say whether a constellation is there; they cannot say
+/// whether the demapper turned it into the right bits, and a receiver can hold
+/// a lock on a signal and still hand up nonsense. On a V.90 call the path
+/// carries raw bits, so what lands here is the PPP bit stream with its 0x7e
+/// flags and nothing to undo but the flags themselves.
+/// The bits put_bit has been handed. One static, shared with `write_bits`:
+/// two of them, and the writer reads an empty one and writes nothing.
+static BITS: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+extern "C" fn put_bit(_user: *mut c_void, bit: c_int) {
+    use std::sync::Mutex;
+    let want = std::env::var_os("V90_BITS").is_some();
+    if !want {
+        return;
+    }
+    let mut guard = BITS.lock().unwrap_or_else(|e| e.into_inner());
+    let v = guard.get_or_insert_with(Vec::new);
+    if v.len() % 8 == 0 {
+        v.push(0);
+    }
+    let last = v.len() - 1;
+    v[last] = (v[last] << 1) | u8::from(bit != 0);
+}
+
+fn write_bits() {
+    let Ok(path) = std::env::var("V90_BITS") else { return };
+    let guard = BITS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(v) = guard.as_ref() else { return };
+    let mut out = String::new();
+    for (i, b) in v.iter().enumerate() {
+        if i % 32 == 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("{b:02x} "));
+    }
+    let _ = std::fs::write(&path, out);
+}
 
 /// A 16-bit PCM WAV: its sample rate, and every sample, interleaved.
 fn read_wav(path: &str) -> (u32, Vec<i16>) {
@@ -94,6 +134,14 @@ fn the_v90_path_replayed_over_a_capture() {
     let mut last = String::new();
     for frame in from..samples.len() / 2 {
         // Channel 0 is the first of each pair: the line as it arrived.
+        //
+        // bm_service first, as process_audio does in sm_call.c: it is what
+        // hands the receiver's recovered bits to put_bit, so a replay that
+        // only steps the engine never sees a single decoded bit and cannot
+        // tell a working data path from a locked receiver decoding noise. The
+        // C calls it once per audio chunk; calling it per sample drains the
+        // same queues more often and changes nothing else.
+        bm_service(end);
         bm_step(end, samples[frame * 2] as c_int);
         let now = text(bm_phase(end));
         if now != last {
@@ -108,5 +156,6 @@ fn the_v90_path_replayed_over_a_capture() {
         text(bm_phase(end)),
         text(bm_failure(end))
     );
+    write_bits();
     bm_destroy(end);
 }
