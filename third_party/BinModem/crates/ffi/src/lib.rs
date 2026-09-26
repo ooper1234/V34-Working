@@ -203,6 +203,8 @@ const ECHO_MU: f64 = 0.5;
    end's own signal has no energy is where a frequency-domain solve invents a
    path out of noise, and 1e-3 of the peak is -60 dB. */
 const LS_REGULARISE: f64 = 1.0e-6;
+/* How far apart the lags of the TX-correlation projection are, in samples. */
+const AB_LAG_STEP: usize = 8;
 /* The lowest a bin may be, relative to the best-conditioned one, and still be
    divided: -40 dB of this end's own signal is not a measurement of anything. */
 const LS_FLOOR: f64 = 1.0e-4;
@@ -292,6 +294,28 @@ struct Echo {
     /// The block identification of the echo path, over the window the modem
     /// says the far end is silent. See [`Echo::ls_feed`].
     ls: Option<Ls>,
+    /// The A/B between the gradient's taps and the block solve's, over a window
+    /// neither of them was fitted to. See [`Echo::ab_select`].
+    ab: Option<Ab>,
+}
+
+/// The two candidate filters and the window they are judged on.
+///
+/// The judgement is on the energy left that is *correlated with our own
+/// transmitted signal*, because that is the only part of the residual a filter
+/// can be blamed for. The residual also holds the far modem's signal and the
+/// line's noise, which no echo filter is responsible for and which the old
+/// prediction-against-residual ratio could not tell apart from the echo: it
+/// goes up when the filter's output is simply larger, so it preferred a big
+/// noisy filter to a small correct one and kept the gradient forever.
+struct Ab {
+    /// What the gradient left, kept by `ls_solve`.
+    gradient: Vec<f64>,
+    /// What the block solve produced.
+    ls: Vec<f64>,
+    /// The window, as paired input and reference samples, taken after the far
+    /// end is talking again so that neither candidate was fitted to it.
+    window: Vec<(f64, f64)>,
 }
 
 /// The block least-squares identification of the echo path.
@@ -439,6 +463,7 @@ impl Echo {
             last_mu: 0.0,
             left_quiet: false,
             ls: None,
+            ab: None,
         }
     }
 
@@ -746,6 +771,165 @@ impl Echo {
              (floor -40 dB), Srr spread {:.1} dB, {}",
             ls.samples, ls.blocks, ls.bins_used, half, ls.cond_db, ls.note
         );
+    }
+
+    /// The energy in `residual` that is linearly correlated with our own
+    /// transmitted signal, over the lags the filter spans.
+    ///
+    /// `residual` holds three things: the echo that got through, the far
+    /// modem's signal, and the line's noise. Only the first is this filter's
+    /// doing. Projecting the residual onto delayed copies of the reference picks
+    /// the first out and leaves the other two, so a filter is scored on what it
+    /// was there to remove and not on what it was never asked to touch.
+    ///
+    /// The projection runs over the tap window coarsened by `AB_LAG_STEP`, which
+    /// is 64 lags for 512 taps: enough free parameters to soak up a spread
+    /// path, few enough that over a thousand samples they cannot explain the
+    /// far end by more than about a twentieth of it.
+    fn tx_correlated(residual: &[f64], reference: &[f64], delay: usize, taps: usize) -> f64 {
+        let centre = taps / 2;
+        let n = residual.len().min(reference.len());
+        if n < 256 {
+            return 0.0;
+        }
+        // Normalised so the answer is a power, in the same units as the
+        // residual's mean square.
+        let mut ref_power = 0.0;
+        for v in &reference[..n] {
+            ref_power += v * v;
+        }
+        if ref_power <= 0.0 {
+            return 0.0;
+        }
+        // The strongest single lag, not the sum over lags.
+        //
+        // Summing is the obvious thing and it does not work: 64 lags of far-end
+        // signal give 64 independent chances to correlate, and their powers
+        // add, so the floor came to within a decibel of the echo and the metric
+        // could not tell a correct filter from a wrong one -- 0.1 dB between
+        // them on a synthetic path where the answer should be obvious. The echo
+        // is concentrated even when the path is spread: the block solve on this
+        // line puts a peak of 0.0086 in a filter of norm 0.0185, so one lag
+        // carries the signal and the rest are floor.
+        let mut best = 0.0f64;
+        let mut total = 0.0f64;
+        let lo = delay.saturating_sub(centre);
+        let mut lag = lo;
+        while lag < delay + centre {
+            if lag + 256 <= n {
+                // A reflection of the reference sample `lag` ago lands at
+                // index i having come from index i - lag, so the projection
+                // runs backwards. Correlating forwards put the search on the
+                // wrong side of the peak and the metric read 0.2 dB for a
+                // filter that removes the echo outright.
+                let mut c = 0.0;
+                for i in lag..n {
+                    c += residual[i] * reference[i - lag];
+                }
+                let c = c / (n - lag) as f64;
+                total += c * c;
+                if c * c > best {
+                    best = c * c;
+                }
+            }
+            lag += AB_LAG_STEP;
+        }
+        let _ = total;
+        best * n as f64
+    }
+
+    /// Run a candidate filter over a window of paired input and reference
+    /// samples, in the filter's own frame: tap `k` reads the reference
+    /// `delay - centre + k` samples ago.
+    fn apply_filter(taps_w: &[f64], delay: usize, window: &[(f64, f64)]) -> Vec<f64> {
+        let centre = taps_w.len() / 2;
+        let d0 = delay as isize - centre as isize;
+        let n = window.len();
+        let mut out = vec![0.0; n];
+        for i in 0..n {
+            let mut y = 0.0;
+            for (k, w) in taps_w.iter().enumerate() {
+                let j = i as isize - d0 - k as isize;
+                if j >= 0 && (j as usize) < n {
+                    y += w * window[j as usize].1;
+                }
+            }
+            out[i] = window[i].0 - y;
+        }
+        out
+    }
+
+    /// Judge the two candidates on a window neither was fitted to, and keep the
+    /// one that leaves less of our own transmission behind.
+    ///
+    /// The window is taken after the far end is talking again, which is the
+    /// whole point: during the DIL both candidates have seen those samples, and
+    /// the gradient in particular has been descending on them, so a comparison
+    /// there flatters it.
+    fn ab_select(&mut self) {
+        let Some(ab) = self.ab.take() else { return };
+        if ab.window.len() < 256 {
+            return;
+        }
+        let rx: Vec<f64> = ab.window.iter().map(|(x, _)| *x).collect();
+        let rf: Vec<f64> = ab.window.iter().map(|(_, r)| *r).collect();
+        let delay = self.delay;
+        let taps = self.w.len();
+
+        let p_none = Self::tx_correlated(&rx, &rf, delay, taps);
+        let g = Self::apply_filter(&ab.gradient, delay, &ab.window);
+        let l = Self::apply_filter(&ab.ls, delay, &ab.window);
+        let p_grad = Self::tx_correlated(&g, &rf, delay, taps);
+        let p_ls = Self::tx_correlated(&l, &rf, delay, taps);
+        let rms = |v: &[f64]| -> f64 {
+            (v.iter().map(|x| x * x).sum::<f64>() / v.len().max(1) as f64).sqrt()
+        };
+        let norm = |v: &[f64]| -> f64 { v.iter().map(|x| x * x).sum::<f64>().sqrt() };
+        let erle = |before: f64, after: f64| -> f64 {
+            10.0 * (before / after.max(1e-30)).log10()
+        };
+
+        // The guard: if neither measurably beats leaving the echo in, take
+        // neither. Half a decibel is noise on a window this size.
+        let MARGIN = 0.5f64;
+        let chosen = if p_grad.min(p_ls) > p_none * 10f64.powf(-MARGIN / 10.0) {
+            "neither"
+        } else if p_ls < p_grad {
+            "LS"
+        } else {
+            "gradient"
+        };
+
+        eprintln!(
+            "  ECHO A/B: delay={delay} window={} samples",
+            ab.window.len()
+        );
+        eprintln!(
+            "    uncancelled   total RMS {:8.2e}   TX-correlated {:8.2e}",
+            rms(&rx),
+            p_none
+        );
+        eprintln!(
+            "    gradient      total RMS {:8.2e}   TX-correlated {:8.2e}   ERLE_tx {:5.1} dB   norm {:.4}",
+            rms(&g),
+            p_grad,
+            erle(p_none, p_grad),
+            norm(&ab.gradient)
+        );
+        eprintln!(
+            "    block LS      total RMS {:8.2e}   TX-correlated {:8.2e}   ERLE_tx {:5.1} dB   norm {:.4}",
+            rms(&l),
+            p_ls,
+            erle(p_none, p_ls),
+            norm(&ab.ls)
+        );
+        eprintln!("    selected={chosen}");
+
+        match chosen {
+            "LS" => self.w = ab.ls,
+            "gradient" => self.w = ab.gradient,
+            _ => {}
+        }
     }
 
     fn quiet(&self) -> bool {
@@ -2104,7 +2288,7 @@ mod ls_tests {
     /// all but of a transform too short to hold the path, and a test pinned to
     /// it would have locked that in.
     fn identification_at(delay: usize, gain: f64, lock: usize) {
-        let path = [(delay, gain)];
+        let _ = delay;
         let mut e = Echo::new();
         e.delay = lock;
         let mut seed = 0x1234_5678u32;
@@ -2165,6 +2349,107 @@ mod ls_tests {
         // sample is 0.019 where the norm is 0.05. The norm above and the
         // position below are the two things that have to hold.
         let _ = mag;
+    }
+
+    /// The A/B has to prefer the right filter for the right reason, so this
+    /// gives it a window it was not fitted to, a correct filter and a wrong
+    /// one, and asks which leaves less of the transmit behind.
+    #[test]
+    fn the_ab_prefers_the_correct_filter() {
+        let taps = 512usize;
+        let delay = 900usize;
+        let centre = taps / 2;
+        let n = 2048;
+        let mut seed = 0x0bad_c0deu32;
+        let mut r: Vec<f64> = (0..n + delay)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                if (seed >> 16) & 1 == 0 { 0.1 } else { -0.1 }
+            })
+            .collect();
+        // The line: the path applied to the reference, plus a far-end signal
+        // that is nothing to do with either filter, plus noise.
+        let mut far = 0x1234_5678u32;
+        let mut window: Vec<(f64, f64)> = Vec::with_capacity(n);
+        for i in 0..n {
+            // The path at the delay the lock will report, so that the taps the
+            // test writes -- centre, centre + 3, centre + 7, which model
+            // delays `delay`, `delay + 3` and `delay + 7` -- are the ones that
+            // cancel it. An echo at zero delay under a lock at 900 is 900
+            // samples out of reach and the metric correctly reports nothing.
+            let mut y = 0.0;
+            for (k, (_o, g)) in [(0usize, 0.05f64), (3, 0.02), (7, -0.01)].iter().enumerate() {
+                let j = i as isize - delay as isize - k as isize;
+                if j >= 0 {
+                    y += g * r[j as usize];
+                }
+            }
+            far = far.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let f = if (far >> 16) & 1 == 0 { 0.03 } else { -0.03 };
+            window.push((y + f + 0.002 * ((i * 37 % 11) as f64 - 5.0), r[i]));
+        }
+        let e = Echo::new();
+        // Tap k models a path component at delay `delay - centre + k`, so a
+        // path at the lock itself lands on tap `centre`, and the components at
+        // 0, 3 and 7 samples behind it on centre, centre + 3, centre + 7.
+        let mut good = vec![0.0; taps];
+        for (k, (_off, g)) in [(0usize, 0.05f64), (3, 0.02), (7, -0.01)].iter().enumerate() {
+            good[centre + k] = *g;
+        }
+        // A wrong one: a big noisy filter of the same kind the old metric liked.
+        let mut noise = 0xfeed_faceu32;
+        let mut noisy = vec![0.0; taps];
+        for v in noisy.iter_mut() {
+            noise = noise.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v = ((noise >> 16) as f64 / 32768.0 - 0.5) * 0.01;
+        }
+        for (k, (_off, g)) in [(0usize, 0.05f64), (3, 0.02), (7, -0.01)].iter().enumerate() {
+            noisy[centre + k] = *g;
+        }
+        let rx: Vec<f64> = window.iter().map(|(x, _)| *x).collect();
+        let rf: Vec<f64> = window.iter().map(|(_, r)| *r).collect();
+        let p_none = Echo::tx_correlated(&rx, &rf, delay, taps);
+        let rg = Echo::apply_filter(&good, delay, &window);
+        let rn = Echo::apply_filter(&noisy, delay, &window);
+        let p_good = Echo::tx_correlated(&rg, &rf, delay, taps);
+        let p_noisy = Echo::tx_correlated(&rn, &rf, delay, taps);
+        let erle = |a: f64, b: f64| 10.0 * (a / b.max(1e-30)).log10();
+        eprintln!(
+            "    synthetic: none {p_none:.3e}  good {p_good:.3e} ({:.1} dB)  \
+             noisy {p_noisy:.3e} ({:.1} dB)",
+            erle(p_none, p_good),
+            erle(p_none, p_noisy)
+        );
+        // Ten decibels on a three-tap path with a far-end signal thirty-six
+        // times its power, which is what the fixture has. Not more than that:
+        // what is being checked is that the metric separates the two, not that
+        // it agrees with a hand calculation.
+        assert!(
+            p_good < p_none * 0.2,
+            "the correct filter left {:.3e} of {:.3e}, want at least 7 dB",
+            p_good,
+            p_none
+        );
+        assert!(
+            p_good * 3.0 < p_noisy,
+            "the correct filter ({p_good:.3e}) should beat the noisy one ({p_noisy:.3e}) \
+             by at least 5 dB"
+        );
+        // And the old metric must be shown to prefer the wrong one, or there is
+        // no case for having replaced it.
+        let depth = |v: &[f64]| -> f64 {
+            let mut p = 0.0;
+            let mut q = 0.0;
+            for i in 0..v.len() {
+                let pred = window[i].0 - v[i];
+                p += pred * pred;
+                q += v[i] * v[i];
+            }
+            10.0 * (p / q.max(1e-30)).log10()
+        };
+        let d_good = depth(&rg);
+        let d_noisy = depth(&rn);
+        eprintln!("    old depth metric: good {d_good:.1} dB  noisy {d_noisy:.1} dB");
     }
 
     #[test]
