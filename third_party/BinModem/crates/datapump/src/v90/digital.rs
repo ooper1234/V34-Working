@@ -581,6 +581,16 @@ enum Stage {
     Finished,
 }
 
+/// `V90_DATA_AT` in samples: the point in this modem's own run where data mode
+/// starts, whatever E and B1 did.
+///
+/// An absolute count, not `samples()`, which is a deadline measured from
+/// wherever the caller happens to be standing and so can never be compared
+/// against `now`. Seconds, not samples: the hook is read by people.
+fn data_sample(seconds: f64) -> u64 {
+    (seconds * FS).round() as u64
+}
+
 /// `V90_DATA_AT`: the second data mode starts at, whatever E and B1 did.
 fn data_at() -> Option<f64> {
     static AT: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
@@ -658,6 +668,11 @@ pub struct Modem {
     descriptor: Option<Descriptor>,
     cpt: Option<Cp>,
     cp: Option<Cp>,
+    /// The last CP that was accepted, kept past the renegotiation that takes
+    /// `cp` away. `V90_DATA_AT` needs one to build data mode from, and on a
+    /// recording the renegotiation at 23.5 s has usually taken it by the time
+    /// the recorded data mode arrives.
+    cp_kept: Option<Cp>,
     far_e: bool,
     decoder: Option<UpstreamDecoder>,
     b1_left: usize,
@@ -747,6 +762,7 @@ impl Modem {
             far_e: false,
             decoder: None,
             b1_left: 0,
+        cp_kept: None,
             points_written: 0,
             bias_at: 0,
             bias_left: 0,
@@ -989,19 +1005,27 @@ impl Modem {
         }
         self.far_peak = self.far_peak.max(input.abs());
         self.rx.feed(input);
-        // V90_DATA_AT, in seconds from the start of the capture or call, starts
-        // data mode on the clock whether or not E and B1 were read. The
-        // counterpart of V34_DATA_AT, for the same reason: a replay of a
-        // recording gets to phase 4 and then gives up waiting for a B1 the
-        // recording does carry, and what is wanted is the data mode after it.
-        // Only from phase 4, and only with a CP in hand -- the framing, the
-        // trellis and the scrambler all come from the CP and the MP.
+        // V90_DATA_AT, in seconds after this modem's V.90 started, starts data
+        // mode on the clock whether or not E and B1 were read. The counterpart
+        // of V34_DATA_AT, for the same reason: a replay of a recording gets to
+        // phase 4 and then gives up waiting for a B1 the recording does carry,
+        // and what is wanted is the data mode after it. Only from phase 4, and
+        // only with a CP in hand -- the framing, the trellis and the scrambler
+        // all come from the CP and the MP.
         if matches!(self.stage, Stage::Phase4Cpt | Stage::Phase4Cp)
-            && self.cp.is_some()
             && self.source.mp.is_some()
             && let Some(at) = data_at()
-            && self.now >= self.samples(at)
+            && self.now >= data_sample(at)
         {
+            // A data-mode CP is what heard_e wants, and a recording of a call
+            // that reached data mode has one in it -- but a recording whose
+            // phase 4 timed out before the analogue modem's CP arrived has
+            // only the CPt, and the CPt names the same shaping and the same
+            // carrier. The one thing heard_e takes from a CP is the rate, and
+            // V90_UP_RATE overrides that outright, so the CPt serves.
+            if self.cp.is_none() {
+                self.cp = self.cp_kept.clone().or_else(|| self.cpt.clone());
+            }
             self.heard_e();
         }
         // Phase 4's own account of the far end, every half second: what the
@@ -1059,6 +1083,19 @@ impl Modem {
         // whether the receiver is following the far end's signal.
         if self.stage == Stage::Data && self.now - self.phase4_note >= FS as u64 {
             self.phase4_note = self.now;
+            // The same block phase 4 writes, and for the same reason: what the
+            // equaliser is being fed is the only way to tell a filter that
+            // cannot invert the path from a signal that is not there. The `h`
+            // lines are the half-symbol samples after the receive filter and
+            // before the equaliser, so a constellation among them is one the
+            // filter is throwing away.
+            if let Some(mut f) = tap_dump() {
+                use std::fmt::Write as _;
+                let mut text = String::new();
+                let _ = writeln!(text, "@ {}", self.now);
+                self.rx.tap_dump(&mut text);
+                let _ = f.write_all(text.as_bytes());
+            }
             let (error, level) = self.rx.gate();
             self.say(format!(
                 "data mode: snr {:.1} dB, taps {:.2}, drift {:+.0} ppm, turn {:+.4}, {} slips{}, error {:.4} against a gate of {:.4} ({}), {}",
@@ -1594,6 +1631,7 @@ impl Modem {
                 self.rbar_at = Some(self.now);
                 self.rbar_tries += 1;
                 self.retry_at = None;
+                self.cp_kept = Some(cp.clone());
                 self.cpt = Some(cp);
                 self.stage = Stage::Phase4Cp;
             }
@@ -1622,6 +1660,7 @@ impl Modem {
         // The transition was answered, so there is nothing left to offer.
         self.rbar_at = None;
         self.retry_at = None;
+        self.cp_kept = Some(cp.clone());
         self.cp = Some(cp);
     }
 

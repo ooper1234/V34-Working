@@ -128,6 +128,13 @@ fn echo_taps() -> usize {
     }
     guard.unwrap_or(ECHO_TAPS)
 }
+/// Whether `Echo::report` logs the cancellation depth once a window.
+fn echo_depth() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ECHO_DEPTH").is_ok_and(|v| v != "0"))
+}
+
 /// ECHO_REFERENCE, when it names a capture, supplies the echo filter's
 /// reference from channel 1 of that recording -- the transmit channel -- instead
 /// of from what this run generated.
@@ -192,6 +199,12 @@ const ECHO_WINDOW: usize = 1024; /* lock/adapt gate on 128 ms of input */
 const ECHO_PEAK_MIN: f64 = 0.3; /* correlation needed to lock a delay */
 const ECHO_QUIET_DB: f64 = -30.0; /* input loudness the far end must be under */
 const ECHO_MU: f64 = 0.5;
+/* How far either side of the lock a re-lock may wander and still count as the
+   same path, and the fraction of the locked correlation it must keep for the
+   filter to stay where it is. 64 samples is 8 ms, an order of magnitude either
+   side of the drift a call's path shows. */
+const ECHO_HOLD: usize = 64;
+const ECHO_HOLD_KEEP: f64 = 0.7;
 
 /// The step the echo filter takes while the far end is talking, where its
 /// error is the far end's signal as much as its own. `ECHO_SLOW_MU` in the
@@ -244,6 +257,17 @@ struct Echo {
     echo_energy: f64,
     residual_energy: f64,
     gate_samples: usize,
+    /// What the filter predicted and what was left over, summed over the
+    /// window, for ECHO_DEPTH: the cancellation depth in decibels, the only
+    /// number that says whether the filter is tracking the path or not.
+    pred_energy: f64,
+    left_energy: f64,
+    left_samples: usize,
+    last_mu: f64,
+    /// Whether the window just measured was one the filter was allowed to
+    /// adapt in. Taken in the sample loop, because `report` runs once
+    /// `seen` has been cleared and asking then always says no.
+    left_quiet: bool,
 }
 
 impl Echo {
@@ -260,6 +284,11 @@ impl Echo {
             echo_energy: 0.0,
             residual_energy: 0.0,
             gate_samples: 0,
+            pred_energy: 0.0,
+            left_energy: 0.0,
+            left_samples: 0,
+            last_mu: 0.0,
+            left_quiet: false,
         }
     }
 
@@ -300,6 +329,39 @@ impl Echo {
         if !self.quiet() {
             return;
         }
+        // Once the path is locked, look around the lock first and only go
+        // searching the whole range if there is nothing there.
+        //
+        // This is not a small thing. The taps straddle the lock
+        // (`d0 = delay - w.len()/2`) over 512 taps, so a lock that moves moves
+        // every tap, and NLMS has to relearn the window from nothing. A real
+        // call measured on 2026-09-26 12:36 flip-flopped between 1168 and 1688
+        // -- 520 samples, the whole tap window -- on successive quiet windows,
+        // with the correlation at 0.98 or better on both, and the cancellation
+        // depth never got past 20 to 32 dB for want of a stable geometry to
+        // converge in. The far end of a call does not move 62 ms of path in
+        // 128 ms; a second reflection taking the correlation peak is enough,
+        // and a filter cannot tell the two apart while it re-locks every time.
+        if self.delay != 0 {
+            let mut best = self.delay;
+            let mut bestc = -1.0f64;
+            let lo = self.delay.saturating_sub(ECHO_HOLD);
+            let hi = (self.delay + ECHO_HOLD).min(ECHO_LAG_HI - 1);
+            let mut lag = lo;
+            while lag <= hi {
+                let c = self.corr_at(lag).abs();
+                if c > bestc {
+                    bestc = c;
+                    best = lag;
+                }
+                lag += 2;
+            }
+            if bestc >= self.peak * ECHO_HOLD_KEEP {
+                self.peak = self.peak.max(bestc);
+                self.shift_to(best);
+                return;
+            }
+        }
         let mut best = 0usize;
         let mut bestc = -1.0f64;
         let mut lag = ECHO_LAG_LO;
@@ -323,9 +385,34 @@ impl Echo {
             }
         }
         if bestc >= ECHO_PEAK_MIN {
-            self.delay = best;
+            self.shift_to(best);
             self.peak = bestc;
         }
+    }
+
+    /// Move the lock to `lag`, carrying the filter's weights across so the
+    /// taps still describe the same reflection.
+    ///
+    /// Tap `k` reads the transmit sample `delay - w.len()/2 + k` ago, so a lock
+    /// that moves by `delta` samples means tap `k` must take what tap `k +
+    /// delta` held, and the taps that run off either end of the window have had
+    /// no data to learn from and start at zero. Without this a re-lock throws
+    /// away a converged filter; with it a path that really has moved costs one
+    /// window of adaptation rather than all of it.
+    fn shift_to(&mut self, lag: usize) {
+        if lag == self.delay {
+            return;
+        }
+        let delta = lag as isize - self.delay as isize;
+        let n = self.w.len();
+        let old = std::mem::replace(&mut self.w, vec![0.0; n]);
+        for (k, slot) in self.w.iter_mut().enumerate() {
+            let from = k as isize + delta;
+            if from >= 0 && (from as usize) < n {
+                *slot = old[from as usize];
+            }
+        }
+        self.delay = lag;
     }
 
     fn quiet(&self) -> bool {
@@ -406,6 +493,7 @@ impl Echo {
                 } else {
                     0.0
                 };
+                self.last_mu = mu;
                 if mu > 0.0 {
                     let g = mu * (x - yhat) / norm;
                     for (k, &v) in r.iter().enumerate() {
@@ -414,12 +502,44 @@ impl Echo {
                 }
             }
         }
+        self.pred_energy += yhat * yhat;
+        let left = x - yhat;
+        self.left_energy += left * left;
+        self.left_samples += 1;
+        self.left_quiet = self.quiet();
         self.seen.push(x);
         if self.seen.len() >= ECHO_WINDOW {
             self.scan();
             self.seen.clear();
+            self.report();
         }
-        x - yhat
+        left
+    }
+
+    /// `ECHO_DEPTH` logs one line a window: the cancellation depth, the delay
+    /// the path was locked at, and the step the filter took. The depth is the
+    /// filter's own prediction against what was left over, so where the far
+    /// end is quiet it is the echo return loss, and where the far end is
+    /// talking it reads low by however loud the far end is -- which is the safe
+    /// direction, and is why the `quiet` flag is on the line.
+    fn report(&mut self) {
+        if !echo_depth() || self.left_samples == 0 {
+            return;
+        }
+        let (p, l) = (self.pred_energy, self.left_energy);
+        let depth = 10.0 * (p / l.max(1e-12)).log10();
+        eprintln!(
+            "  echo: depth {depth:6.1} dB  delay {:5}  peak {:.3}  mu {:.4}  quiet {}  data {}  taps {:.3}",
+            self.delay,
+            self.peak,
+            self.last_mu,
+            if self.left_quiet { "y" } else { "n" },
+            if self.data { "y" } else { "n" },
+            self.energy().sqrt()
+        );
+        self.pred_energy = 0.0;
+        self.left_energy = 0.0;
+        self.left_samples = 0;
     }
 
     /// What we put on the line (post-gain), newest last.

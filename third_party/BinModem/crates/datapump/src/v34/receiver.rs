@@ -691,6 +691,17 @@ impl Receiver {
         self.recent.clear();
     }
 
+    /// Whether the equaliser keeps stepping in data mode, which
+    /// `V34_TAPS_IN_DATA` asks for. Off by default, as the note at the step
+    /// says: there the slicer is a coarse quantiser and a step taken from it
+    /// walks the filter off the path. It is a bench hook because holding the
+    /// taps is only right if the taps trained in phase 4 still describe the
+    /// path in data mode, and that is worth being able to test.
+    fn taps_in_data() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("V34_TAPS_IN_DATA").is_ok_and(|v| v != "0"))
+    }
+
     /// Signal to noise of the decisions, in decibels.
     pub fn snr_db(&self) -> f64 {
         -10.0 * self.error.max(1e-9).log10()
@@ -1061,7 +1072,7 @@ impl Receiver {
         // the 581 slips the 2026-09-25 call showed.
         if self.lost.is_none() && (squared < doubtful || self.data_mode) {
             let energy: f64 = row.iter().map(|x| x.norm_sqr()).sum::<f64>() + 1e-9;
-            if !self.data_mode {
+            if !self.data_mode || Self::taps_in_data() {
                 let back = e * spin.conj() * (STEP / energy);
                 for (tap, x) in self.taps.iter_mut().zip(row) {
                     *tap -= back * x.conj();
