@@ -199,6 +199,21 @@ const ECHO_WINDOW: usize = 1024; /* lock/adapt gate on 128 ms of input */
 const ECHO_PEAK_MIN: f64 = 0.3; /* correlation needed to lock a delay */
 const ECHO_QUIET_DB: f64 = -30.0; /* input loudness the far end must be under */
 const ECHO_MU: f64 = 0.5;
+/* How far above the best-conditioned bin a divide may reach: a bin where this
+   end's own signal has no energy is where a frequency-domain solve invents a
+   path out of noise, and 1e-3 of the peak is -60 dB. */
+const LS_REGULARISE: f64 = 1.0e-6;
+/* The lowest a bin may be, relative to the best-conditioned one, and still be
+   divided: -40 dB of this end's own signal is not a measurement of anything. */
+const LS_FLOOR: f64 = 1.0e-4;
+
+/// Whether the DIL solves the path in one block, which `ECHO_LS` turns off to
+/// leave the gradient descent to do it.
+fn echo_ls() -> bool {
+    use std::sync::OnceLock;
+    static ON: std::sync::OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ECHO_LS").as_deref() != Ok("0"))
+}
 /* How far either side of the lock a re-lock may wander and still count as the
    same path, and the fraction of the locked correlation it must keep for the
    filter to stay where it is. 64 samples is 8 ms, an order of magnitude either
@@ -274,6 +289,115 @@ struct Echo {
     /// adapt in. Taken in the sample loop, because `report` runs once
     /// `seen` has been cleared and asking then always says no.
     left_quiet: bool,
+    /// The block identification of the echo path, over the window the modem
+    /// says the far end is silent. See [`Echo::ls_feed`].
+    ls: Option<Ls>,
+}
+
+/// The block least-squares identification of the echo path.
+///
+/// The path is static and this end's own transmitted samples are known exactly,
+/// so over a window where the far modem is silent the filter is not something
+/// to descend towards: it is a least-squares solution, and it is better solved
+/// than descended to. NLMS needs on the order of `taps` samples per tap to
+/// settle, and the DIL is 1.96 s -- 15 655 samples, about thirty per tap for
+/// 512 taps -- which converges to about 30 dB. The data-mode constellation
+/// wants 45.
+///
+/// In the frequency domain the same solution is one divide per bin, because a
+/// stationary path's transfer function is the ratio of the cross-spectrum to
+/// the auto-spectrum. So the window is accumulated as Welch spectra, `H` is
+/// formed once, regularised where this end's own signal has little energy, and
+/// the impulse response comes back by inverse transform. That is the same
+/// least-squares answer at a cost that fits inside a call.
+struct Ls {
+    fft: dsp::Fft,
+    n: usize,
+    /// Hann, so the blocks that overlap add up to a constant.
+    win: Vec<f64>,
+    /// The received samples, and our own transmitted ones alongside: the
+    /// canceller's reference is exactly what `push` was given.
+    buf_x: Vec<f64>,
+    buf_r: Vec<f64>,
+    /// The reference's auto-spectrum, and the line's. The estimate divides the
+    /// cross-spectrum by the *reference's*, not the line's: for a line that is
+    /// the path applied to the reference, Sxy is H times Srr while the line's own
+    /// |X| squared is H times H times Srr, so dividing by it returns one over H
+    /// rather than H. That is not a scale error but an inversion, and it put a
+    /// filter of norm 2.9 in the path where it amplified instead of cancelling:
+    /// the first attempt read 20.0 at the tap the path had 0.05 at.
+    srr: Vec<f64>,
+    sxx: Vec<f64>,
+    sxy_re: Vec<f64>,
+    sxy_im: Vec<f64>,
+    blocks: usize,
+    samples: usize,
+    solved: bool,
+    /// Cancellation measured over the far-silent window before the solve and
+    /// after it, so the log can show what the solve bought rather than what the
+    /// window happened to read.
+    depth_before: f64,
+    depth_after: f64,
+    /// 10log10 of the ratio of the largest to the smallest `Sxx` bin used,
+    /// which is the conditioning the regularisation is answering.
+    cond_db: f64,
+    /// What the solve was told, and what it did.
+    note: String,
+    /// The filter's prediction and the residual over the window, so the log can
+    /// show what the solve bought rather than what the window happened to read.
+    pred: f64,
+    res: f64,
+    /// Set once the solve is in the filter, so the after-figure is measured on
+    /// samples taken after it and not before.
+    solved_at: u64,
+    /// The same measurement taken after the solve, and whether it has been
+    /// printed yet.
+    post_pred: f64,
+    post_res: f64,
+    post_n: u32,
+    reported: bool,
+    /// The taps as the gradient left them, so a solve that measures worse than
+    /// the gradient can be refused rather than merely complained about.
+    kept: Vec<f64>,
+    /// Bins the divide was actually done in, out of `n / 2`.
+    bins_used: usize,
+}
+
+impl Ls {
+    /// An identification window that has collected nothing yet.
+    fn blank(taps: usize) -> Self {
+        let n = (2 * taps).next_power_of_two();
+        let win = (0..n)
+            .map(|i| 0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / n as f64).cos())
+            .collect();
+        Ls {
+            fft: dsp::Fft::new(n),
+            n,
+            win,
+            buf_x: Vec::with_capacity(n),
+            buf_r: Vec::with_capacity(n),
+            srr: vec![0.0; n / 2 + 1],
+            sxx: vec![0.0; n / 2 + 1],
+            sxy_re: vec![0.0; n / 2 + 1],
+            sxy_im: vec![0.0; n / 2 + 1],
+            blocks: 0,
+            samples: 0,
+            solved: false,
+            depth_before: 0.0,
+            depth_after: 0.0,
+            cond_db: 0.0,
+            note: String::new(),
+            pred: 0.0,
+            res: 0.0,
+            solved_at: 0,
+            post_pred: 0.0,
+            post_res: 0.0,
+            post_n: 0,
+            reported: false,
+            bins_used: 0,
+            kept: Vec::new(),
+        }
+    }
 }
 
 impl Echo {
@@ -296,6 +420,7 @@ impl Echo {
             left_samples: 0,
             last_mu: 0.0,
             left_quiet: false,
+            ls: None,
         }
     }
 
@@ -422,6 +547,180 @@ impl Echo {
         self.delay = lag;
     }
 
+    /// Take one sample into the identification window: `x` is what arrived,
+    /// `r` is what this end transmitted at the same moment.
+    ///
+    /// Only called while the modem says the far end is silent, which is what
+    /// makes the window a measurement of the path rather than of the far end.
+    fn ls_feed(&mut self, x: f64, r: f64) {
+        let taps = self.w.len();
+        // Long enough to resolve a 512-tap path: the impulse response is read
+        // out of a circular transform of this size, so a path longer than it
+        // would wrap, and 1024 leaves room for the filter plus its own
+        // pre-echo.
+        let _ = taps;
+        let ls = self.ls.get_or_insert_with(|| Ls::blank(self.w.len()));
+        if ls.solved {
+            return;
+        }
+        ls.samples += 1;
+        ls.buf_x.push(x);
+        ls.buf_r.push(r);
+        if ls.buf_x.len() < ls.n {
+            return;
+        }
+        // One Welch block: window, transform, accumulate.
+        let mut re: Vec<f64> = ls.buf_x.iter().zip(&ls.win).map(|(v, w)| v * w).collect();
+        let mut im = vec![0.0; ls.n];
+        let mut rr: Vec<f64> = ls.buf_r.iter().zip(&ls.win).map(|(v, w)| v * w).collect();
+        let mut ri = vec![0.0; ls.n];
+        ls.fft.process(&mut re, &mut im);
+        ls.fft.process(&mut rr, &mut ri);
+        for k in 0..=ls.n / 2 {
+            ls.srr[k] += rr[k] * rr[k] + ri[k] * ri[k];
+            ls.sxx[k] += re[k] * re[k] + im[k] * im[k];
+            ls.sxy_re[k] += re[k] * rr[k] + im[k] * ri[k];
+            ls.sxy_im[k] += im[k] * rr[k] - re[k] * ri[k];
+        }
+        ls.blocks += 1;
+        // Keep a quarter of the window as overlap between blocks.
+        let keep = ls.n * 3 / 4;
+        ls.buf_x.drain(..ls.n - keep);
+        ls.buf_r.drain(..ls.n - keep);
+    }
+
+    /// Form `H`, read the impulse response back out of it, align it to the
+    /// lock, and put it in the filter. Once per call.
+    fn ls_solve(&mut self) {
+        let Some(ls) = self.ls.as_mut() else { return };
+        if ls.solved || ls.blocks < 4 {
+            return;
+        }
+        ls.solved = true;
+        ls.kept = self.w.clone();
+        // What the filter was managing over the window the solve came from, so
+        // the log can say what the solve bought.
+        ls.depth_before = 10.0 * (ls.pred / ls.res.max(1e-30)).log10();
+        ls.pred = 0.0;
+        ls.res = 0.0;
+        ls.solved_at = ls.samples as u64;
+        let n = ls.n;
+        let half = n / 2;
+        // Regularise against the best-conditioned bin: a divide by a bin where
+        // this end's own signal has no energy is how a frequency-domain solve
+        // invents a path out of noise.
+        let peak = ls.srr[..=half].iter().copied().fold(0.0f64, f64::max).max(1e-30);
+        let mut h_re = vec![0.0; n];
+        let mut h_im = vec![0.0; n];
+        let mut used_min = f64::INFINITY;
+        let mut used_max = 0.0f64;
+        // A bin where this end's own signal is down 40 dB carries no
+        // information about the path: dividing there is how a frequency-domain
+        // solve invents one, and it is what put a norm of 3.4 in the filter on
+        // the first attempt. Those bins are left at zero instead, which costs
+        // at most -40 dB of prediction in them -- nothing, against a path that
+        // is 14 dB down to begin with -- and keeps the impulse response short.
+        let floor_bin = peak * LS_FLOOR;
+        let mut used = 0usize;
+        for k in 0..=half {
+            let hr = if ls.srr[k] >= floor_bin {
+                used += 1;
+                ls.sxy_re[k] / (ls.srr[k] + peak * LS_REGULARISE)
+            } else {
+                0.0
+            };
+            let hi = if ls.srr[k] >= floor_bin {
+                ls.sxy_im[k] / (ls.srr[k] + peak * LS_REGULARISE)
+            } else {
+                0.0
+            };
+            // Conjugated, because the inverse transform is conj(FFT(conj(.)).
+            h_re[k] = hr;
+            h_im[k] = -hi;
+            if k > 0 && k < half {
+                used_min = used_min.min(ls.srr[k]);
+                used_max = used_max.max(ls.srr[k]);
+                h_re[n - k] = hr;
+                h_im[n - k] = hi;
+            }
+        }
+        ls.bins_used = used;
+        ls.cond_db = if used_min > 0.0 {
+            10.0 * (used_max / used_min).log10()
+        } else {
+            f64::INFINITY
+        };
+        // The inverse transform, which is not the forward one: IFFT(H) is
+        // conj(FFT(conj(H)))/n. Using a plain forward transform here put the
+        // impulse response at the wrong place entirely -- the peak came back
+        // at 945 with the correlation's lock at 1319 -- and gave the filter a
+        // norm of 2.9, so it amplified where it should have cancelled, and the
+        // cancellation went to -0.2 dB. The conjunctions are already in place
+        // from the bin loop: the spectrum was conjugated as it was mirrored.
+        ls.fft.process(&mut h_re, &mut h_im);
+        let scale = 1.0 / n as f64;
+
+        // Only the real part survives, and conjugating does not change the
+        // real part, so the impulse response is read straight out of the
+        // transform.
+        let imp: Vec<f64> = h_re.iter().map(|v| v * scale).collect();
+
+        // Where the path actually is, and where the filter's window has to put
+        // it.
+        //
+        // The impulse response's index *is* the delay: it comes out of a
+        // circular transform against the transmit sample of the same moment, so
+        // index m is the echo of the transmit sample m ago. And tap k of the
+        // filter multiplies the transmit sample `delay - w.len()/2 + k` ago.
+        // Putting the response's peak at the centre of the window instead --
+        // which is what this did first -- assumes the correlation's lock and
+        // the path agree, and on a real call they do not: the lock was at 1159
+        // and the response's peak at 55, so every tap was 1104 samples out,
+        // further than the whole 512-tap window reaches, and the cancellation
+        // came out at -9.5 dB against the gradient's 9.4.
+        let (peak_at, peak_mag) = imp
+            .iter()
+            .enumerate()
+            .fold((0usize, f64::NEG_INFINITY), |(bi, bm), (i, &v)| {
+                if v.abs() > bm { (i, v.abs()) } else { (bi, bm) }
+            });
+        let centre = self.w.len() / 2;
+        // tap `k` is the sample `delay - centre + k` ago, so the tap that must
+        // carry the path at `peak_at` is `peak_at - delay + centre`.
+        let want = peak_at as isize - self.delay as isize + centre as isize;
+        let mut w = vec![0.0; self.w.len()];
+        let mut placed = 0usize;
+        for (i, &v) in imp.iter().enumerate() {
+            let k = i as isize + want - peak_at as isize;
+            if k >= 0 && (k as usize) < w.len() {
+                w[k as usize] = v;
+                placed += 1;
+            }
+        }
+        let norm: f64 = w.iter().map(|v| v * v).sum::<f64>().sqrt();
+        self.w = w;
+        // With no lock there is no window to put the path in, so keep the
+        // solution and wait: a lock on the next quiet window aligns it.
+        if self.delay == 0 {
+            ls.note = format!(
+                "solved, {placed} of {} samples placed, peak {peak_mag:.4} at {peak_at}, norm {norm:.4},                  but no delay is locked so the taps are not in use",
+                self.w.len()
+            );
+            return;
+        }
+        ls.note = format!(
+            "{placed} of {} samples placed, peak {peak_mag:.4} at a delay of {peak_at} \
+             samples against a lock at {}, norm {norm:.4}",
+            self.w.len(),
+            self.delay
+        );
+        eprintln!(
+            "  echo: DIL solve: {} samples in {} blocks of {n}, {} of {} bins used \
+             (floor -40 dB), Srr spread {:.1} dB, {}",
+            ls.samples, ls.blocks, ls.bins_used, half, ls.cond_db, ls.note
+        );
+    }
+
     fn quiet(&self) -> bool {
         if self.seen.is_empty() {
             return false;
@@ -513,7 +812,7 @@ impl Echo {
                 // inferred: a line loud with this end's own transmission is
                 // loud in every window, so `quiet()` alone leaves the DIL --
                 // the only wideband chance to learn the path -- shut.
-                let mu = if self.quiet() || self.far_silent || self.double_talk(x, yhat) {
+                let mu = if self.quiet() || (!echo_ls() && self.far_silent) || self.double_talk(x, yhat) {
                     ECHO_MU
                 } else if self.data {
                     slow_mu()
@@ -529,6 +828,71 @@ impl Echo {
                 }
             }
         }
+        // The DIL, and the block identification of the path from it.
+        //
+        // This is the one window in the call where the far modem is silent and
+        // this end is transmitting, so it is the one window where the input is
+        // a measurement of the path rather than of the far end, and it is far
+        // too short to descend 512 taps through. `x` is what arrived and `r[0]`
+        // is what this end transmitted at the same moment, which is the
+        // canceller's own reference -- no separate tap or delay to get wrong.
+        if self.far_silent && echo_ls() {
+            let first = self.ls.is_none();
+            if first {
+                eprintln!(
+                    "  echo: DIL identification starting, {} taps, delay {}",
+                    self.w.len(),
+                    self.delay
+                );
+            }
+            // The canceller's own reference: the transmit sample this moment,
+            // which is what `r[0]` held when the delay lock put it in reach, and
+            // which `push` has just written into the ring.
+            let n = self.tx.len();
+            let reference = self.tx[(self.tx_pos + n - 1) % n];
+            self.ls_feed(x, reference);
+            if let Some(ls) = self.ls.as_mut() {
+                ls.pred += yhat * yhat;
+                ls.res += (x - yhat) * (x - yhat);
+            }
+        }
+
+        // The after-figure: the same measurement as the one taken over the
+        // window the solve came from, on samples taken after it. Printed once,
+        // when the first full window after the far end starts talking again
+        // completes, which is the first window that is the filter's alone.
+        if !self.far_silent
+            && let Some(ls) = self.ls.as_mut()
+            && ls.solved
+            && !ls.reported
+        {
+            ls.post_pred += yhat * yhat;
+            ls.post_res += (x - yhat) * (x - yhat);
+            ls.post_n += 1;
+            if ls.post_n >= ECHO_WINDOW as u32 {
+                ls.reported = true;
+                let after = 10.0 * (ls.post_pred / ls.post_res.max(1e-30)).log10();
+                eprintln!(
+                    "  echo: DIL solve: cancellation after the solve {after:.1} dB, \
+                     against {:.1} dB before it, over {} samples",
+                    ls.depth_before, ls.post_n
+                );
+                // If the solve made it worse, the gradient was getting it more
+                // nearly right than the block solve did and the taps go back.
+                if after < ls.depth_before {
+                    let kept = std::mem::take(&mut ls.kept);
+                    if kept.len() == self.w.len() {
+                        self.w = kept;
+                    }
+                    eprintln!(
+                        "  echo: DIL solve: {after:.1} dB is worse than the gradient's \
+                         {:.1} dB, so its taps are kept",
+                        ls.depth_before
+                    );
+                }
+            }
+        }
+
         self.pred_energy += yhat * yhat;
         let left = x - yhat;
         self.left_energy += left * left;
@@ -539,6 +903,19 @@ impl Echo {
             self.scan();
             self.seen.clear();
             self.report();
+        }
+        // Solve on the falling edge of the window, not inside it. The DIL is
+        // 1.96 s and every sample of it is worth having: solved after four
+        // blocks -- 1792 samples, 0.22 s -- the estimate came out at a norm of
+        // 3.4 where a 14 dB echo path is about 0.2, and the cancellation went
+        // from 10.6 dB to -5.4 dB. Inside the window the solve also cannot be
+        // checked, because every sample after it would be part of the same
+        // measurement.
+        if !self.far_silent && echo_ls() {
+            let ready = self.ls.as_ref().is_some_and(|l| !l.solved && l.blocks >= 4);
+            if ready {
+                self.ls_solve();
+            }
         }
         left
     }
@@ -1677,5 +2054,87 @@ pub extern "C" fn bm_failure(a: *mut Answerer) -> *const c_char {
 pub extern "C" fn bm_destroy(a: *mut Answerer) {
     if !a.is_null() {
         drop(unsafe { Box::from_raw(a) });
+    }
+}
+
+#[cfg(test)]
+mod ls_tests {
+    use super::*;
+
+    /// The block identification has to recover a path it was never told, so
+    /// this drives it with a known one: a reference and a line that differ by
+    /// a short reflection, which is what the DIL actually is.
+    ///
+    /// The gains are what a 14 dB echo looks like -- the far hybrid on this line
+    /// was measured returning the reflection about 14 dB down -- so the filter
+    /// that comes out has a norm of about 0.1, and a result an order of
+    /// magnitude larger is inventing a path rather than finding one.
+    #[test]
+    fn the_dil_identification_recovers_a_known_path() {
+        let path: [(usize, f64); 3] = [(0, 0.10), (5, -0.05), (11, 0.02)];
+        let mut e = Echo::new();
+        // The lock is a separate matter from the path and the two do not agree
+        // on a real call -- the correlation has been locking at 1159 while the
+        // identification puts the path at 55 -- so this test sets the lock
+        // where the path is, and the disagreement is the thing to look at on
+        // the line rather than something to fold in here.
+        e.delay = 11;
+        // Broadband, like four points of 22 666 bit/s: a fixed pseudorandom
+        // sequence so the test is the same every run.
+        let mut seed = 0x1234_5678u32;
+        let mut r = vec![0.0f64; 40_000];
+        for v in r.iter_mut() {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v = if (seed >> 16) & 1 == 0 { 0.1 } else { -0.1 };
+        }
+        // A history long enough that every read is of a sample already sent: a
+        // ring read before it has been written is a zero, and eleven of those
+        // at the head of the run is a tenth of the window.
+        let mut history = vec![0.0f64; r.len()];
+        for (n, &tx) in r.iter().enumerate() {
+            let mut y = 0.0;
+            for (d, g) in path {
+                if n >= d {
+                    y += g * history[n - d];
+                }
+            }
+            e.ls_feed(y, tx);
+            history[n] = tx;
+        }
+        assert!(e.ls.is_some(), "no identification window was opened");
+        e.ls_solve();
+        let ls = e.ls.as_ref().expect("window");
+        assert!(ls.solved, "the solve did not run");
+        assert!(ls.samples > 15_000, "only {} samples", ls.samples);
+        let norm = e.w.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            (0.05..0.25).contains(&norm),
+            "filter norm {norm:.4}, want about 0.1 for a 14 dB path"
+        );
+        // The strongest tap has to sit at the path's first arrival, in the
+        // window's own frame: tap 256 is the lock, and the path is 11 samples
+        // long, so the peak belongs near 256.
+        let (at, mag) = e
+            .w
+            .iter()
+            .enumerate()
+            .fold((0usize, f64::NEG_INFINITY), |(bi, bm), (i, &v)| {
+                if v.abs() > bm {
+                    (i, v.abs())
+                } else {
+                    (bi, bm)
+                }
+            });
+        // Tap 256 is the lock, and the path is 11 samples long, so its first
+        // arrival belongs at 256.
+        assert!(
+            (240..=270).contains(&at),
+            "peak at tap {at}, want the path's arrival inside the window at the lock"
+        );
+        // The exact per-tap shape is not what this test is for; what matters
+        // is that the estimate is a path and not its inverse, which the norm
+        // above already settles: 0.05 for this path against 20.0 for the
+        // inverted one.
+        assert!((0.02..0.2).contains(&mag), "peak magnitude {mag:.4}");
     }
 }
