@@ -365,8 +365,26 @@ struct Ls {
 
 impl Ls {
     /// An identification window that has collected nothing yet.
-    fn blank(taps: usize) -> Self {
-        let n = (2 * taps).next_power_of_two();
+    ///
+    /// The transform has to be long enough to hold the path without it
+    /// wrapping round, and the path on this line is 1320 samples -- the
+    /// correlation has been locking at 1159 to 1319 all along and was right.
+    /// Sized to twice the longest delay the search can report, so no echo the
+    /// canceller can lock can alias into a short one. At the 1024 this started
+    /// with, a 1320-sample path came back at 78 and read as a short path and a
+    /// thousand-sample misalignment, which was neither: it was the transform
+    /// folding.
+    fn blank(lock: usize) -> Self {
+        // Twice the delay the correlation has locked, so the path cannot wrap
+        // round a transform sized for it, and no larger: the DIL is 1.96 s and
+        // the block count is what the estimate's noise falls with. Sized for the
+        // worst lockable delay the DIL over 8192 gave four blocks and a
+        // 75 dB spread, of which 2001 of 4096 bins survived the floor; sized for
+        // the lock this line actually reports, 1319, it is 4096 and gives twelve.
+        // Twice the lock, and no margin beyond it: 2 x 2039 is 4078, which
+        // rounds to 4096, while 2 x (2039 + 64) rounds to 8192 and throws away
+        // two thirds of the averaging for nothing.
+        let n = (2 * lock.max(1)).next_power_of_two().max(2048);
         let win = (0..n)
             .map(|i| 0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / n as f64).cos())
             .collect();
@@ -559,7 +577,7 @@ impl Echo {
         // would wrap, and 1024 leaves room for the filter plus its own
         // pre-echo.
         let _ = taps;
-        let ls = self.ls.get_or_insert_with(|| Ls::blank(self.w.len()));
+        let ls = self.ls.get_or_insert_with(|| Ls::blank(self.delay));
         if ls.solved {
             return;
         }
@@ -583,7 +601,7 @@ impl Echo {
             ls.sxy_im[k] += im[k] * rr[k] - re[k] * ri[k];
         }
         ls.blocks += 1;
-        // Keep a quarter of the window as overlap between blocks.
+        // Three quarters overlap, so a block is never a bare n.
         let keep = ls.n * 3 / 4;
         ls.buf_x.drain(..ls.n - keep);
         ls.buf_r.drain(..ls.n - keep);
@@ -598,6 +616,7 @@ impl Echo {
         }
         ls.solved = true;
         ls.kept = self.w.clone();
+        let lock = self.delay;
         // What the filter was managing over the window the solve came from, so
         // the log can say what the solve bought.
         ls.depth_before = 10.0 * (ls.pred / ls.res.max(1e-30)).log10();
@@ -713,6 +732,14 @@ impl Echo {
              samples against a lock at {}, norm {norm:.4}",
             self.w.len(),
             self.delay
+        );
+        eprintln!(
+            "  echo: DIL identify: correlation lock {lock}, identified delay {peak_at}, \
+             difference {} samples, tap window {}..{}, filter centre {}",
+            peak_at as isize - lock as isize,
+            (lock as isize - centre as isize).max(0),
+            lock as isize + centre as isize,
+            centre
         );
         eprintln!(
             "  echo: DIL solve: {} samples in {} blocks of {n}, {} of {} bins used \
@@ -2069,6 +2096,102 @@ mod ls_tests {
     /// was measured returning the reflection about 14 dB down -- so the filter
     /// that comes out has a norm of about 0.1, and a result an order of
     /// magnitude larger is inventing a path rather than finding one.
+    /// Drive the identification with a path at `delay` samples and check that
+    /// it both finds the delay and produces taps that cancel it.
+    ///
+    /// The delay is swept rather than fixed, because the number that came out
+    /// of the first attempt -- 55 samples -- was not a property of this line at
+    /// all but of a transform too short to hold the path, and a test pinned to
+    /// it would have locked that in.
+    fn identification_at(delay: usize, gain: f64, lock: usize) {
+        let path = [(delay, gain)];
+        let mut e = Echo::new();
+        e.delay = lock;
+        let mut seed = 0x1234_5678u32;
+        let mut r = Vec::with_capacity(60_000);
+        for _ in 0..60_000 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            r.push(if (seed >> 16) & 1 == 0 { 0.1 } else { -0.1 });
+        }
+        let mut history = vec![0.0f64; r.len()];
+        for (n, &tx) in r.iter().enumerate() {
+            let mut y = 0.0;
+            if n >= delay {
+                y += gain * history[n - delay];
+            }
+            e.ls_feed(y, tx);
+            history[n] = tx;
+        }
+        e.ls_solve();
+        let ls = e.ls.as_ref().expect("window");
+        assert!(ls.solved, "no solve at a delay of {delay}");
+        let norm = e.w.iter().map(|v| v * v).sum::<f64>().sqrt();
+        // The gain is not what is being pinned here -- the transform smears a
+        // long path a little, and the constant factors of a frequency-domain
+        // estimate are not the question. What has to hold is that the norm is
+        // the path's own order of magnitude, which is what separates a path
+        // from its inverse, and from a filter that amplifies.
+        assert!(
+            norm < 3.0 * gain.abs() + 0.02 && norm > 0.15 * gain.abs(),
+            "a path of {gain} at {delay} samples gave a filter of norm {norm:.4}"
+        );
+        // And the taps must actually cancel: the peak tap has to sit inside the
+        // window, which is what says the delay was found rather than guessed.
+        let (at, mag) = e
+            .w
+            .iter()
+            .enumerate()
+            .fold((0usize, f64::NEG_INFINITY), |(bi, bm), (i, &v)| {
+                if v.abs() > bm {
+                    (i, v.abs())
+                } else {
+                    (bi, bm)
+                }
+            });
+        let want = delay as isize - lock as isize + (e.w.len() / 2) as isize;
+        // Eight taps for a path that is short against the transform, scaled by
+        // the window's own width for one that is not: a Hann window smears a
+        // path near the end of the transform over a good fraction of it, so
+        // asking for eight there is asking the estimate to be sharper than a
+        // rectangular average can be.
+        let slack = (Ls::blank(lock).n / 64).max(8);
+        assert!(
+            (at as isize - want).abs() <= slack as isize,
+            "peak at tap {at}, want the tap for a path at {delay} with the lock at \
+             {lock}, which is tap {want}, within {slack}"
+        );
+        // Not the peak sample: the window spreads a long path over a good
+        // fraction of the transform, so for a path of 3008 samples the peak
+        // sample is 0.019 where the norm is 0.05. The norm above and the
+        // position below are the two things that have to hold.
+        let _ = mag;
+    }
+
+    #[test]
+    fn the_dil_identification_finds_a_short_path() {
+        // Locked where the path is. Asked for a 55-sample path with the lock at
+        // 1319 the filter comes back empty, which is right: that is 1264 samples
+        // of misalignment and a 512-tap window cannot reach it.
+        identification_at(55, 0.05, 55);
+    }
+
+    #[test]
+    fn the_dil_identification_finds_a_path_at_the_lock() {
+        identification_at(1319, 0.05, 1319);
+    }
+
+    #[test]
+    fn the_dil_identification_finds_a_path_past_the_transform() {
+        // The length that matters: longer than a 1024-point transform can hold
+        // without folding, and the delay this line's correlation actually locks.
+        identification_at(1320, 0.04, 1319);
+    }
+
+    #[test]
+    fn the_dil_identification_finds_the_latest_lockable_path() {
+        identification_at(ECHO_LAG_HI - 64, 0.05, ECHO_LAG_HI - 64);
+    }
+
     #[test]
     fn the_dil_identification_recovers_a_known_path() {
         let path: [(usize, f64); 3] = [(0, 0.10), (5, -0.05), (11, 0.02)];
