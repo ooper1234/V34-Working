@@ -199,15 +199,67 @@ const ECHO_WINDOW: usize = 1024; /* lock/adapt gate on 128 ms of input */
 const ECHO_PEAK_MIN: f64 = 0.3; /* correlation needed to lock a delay */
 const ECHO_QUIET_DB: f64 = -30.0; /* input loudness the far end must be under */
 const ECHO_MU: f64 = 0.5;
-/* How far above the best-conditioned bin a divide may reach: a bin where this
-   end's own signal has no energy is where a frequency-domain solve invents a
-   path out of noise, and 1e-3 of the peak is -60 dB. */
-const LS_REGULARISE: f64 = 1.0e-6;
 /* How far apart the lags of the TX-correlation projection are, in samples. */
 const AB_LAG_STEP: usize = 8;
-/* The lowest a bin may be, relative to the best-conditioned one, and still be
-   divided: -40 dB of this end's own signal is not a measurement of anything. */
-const LS_FLOOR: f64 = 1.0e-4;
+/* The ridge on the normal equations, as a fraction of the reference's own
+   energy. Swept, not guessed: over the DIL's whole spectral range anything
+   from zero to 1e-4 moves the recovered gain by under a tenth, and 1e-3 by a
+   quarter. It is here to keep the factorisation well-posed and not to shape
+   the answer, so it is the smallest thing that does that. */
+const LS_RIDGE: f64 = 1.0e-6;
+
+/// Solve a symmetric positive-definite system by Cholesky, and report the pivots.
+///
+/// Returns the pivots as well as the solution because their spread is how close
+/// the system came to singular, which is the number the ridge is there to
+/// answer and the only honest way to say whether it was needed at all.
+///
+/// `a` is row-major `n` by `n` and is overwritten. `None` if a pivot comes out
+/// non-positive, which for a normal-equation matrix means the correlation has
+/// not identified the path and the right answer is to leave the filter alone
+/// rather than to divide by it.
+fn cholesky_solve(a: &[f64], b: &[f64], n: usize) -> Option<(Vec<f64>, Vec<f64>)> {
+    let mut m = a.to_vec();
+    let mut y = b.to_vec();
+    let mut pivots = Vec::with_capacity(n);
+    for k in 0..n {
+        let mut d = m[k * n + k];
+        for j in 0..k {
+            let l = m[k * n + j];
+            d -= l * l;
+        }
+        if !(d > 0.0) {
+            return None;
+        }
+        pivots.push(d);
+        let dk = d.sqrt();
+        m[k * n + k] = dk;
+        for i in k + 1..n {
+            let mut s = m[i * n + k];
+            for j in 0..k {
+                s -= m[i * n + j] * m[k * n + j];
+            }
+            m[i * n + k] = s / dk;
+        }
+    }
+    // Forward substitution, L y = b.
+    for i in 0..n {
+        let mut s = y[i];
+        for j in 0..i {
+            s -= m[i * n + j] * y[j];
+        }
+        y[i] = s / m[i * n + i];
+    }
+    // Back substitution, L' x = y.
+    for i in (0..n).rev() {
+        let mut s = y[i];
+        for j in i + 1..n {
+            s -= m[j * n + i] * y[j];
+        }
+        y[i] = s / m[i * n + i];
+    }
+    Some((y, pivots))
+}
 
 /// Whether the DIL solves the path in one block, which `ECHO_LS` turns off to
 /// leave the gradient descent to do it.
@@ -335,26 +387,13 @@ struct Ab {
 /// the impulse response comes back by inverse transform. That is the same
 /// least-squares answer at a cost that fits inside a call.
 struct Ls {
-    fft: dsp::Fft,
-    n: usize,
-    /// Hann, so the blocks that overlap add up to a constant.
-    win: Vec<f64>,
     /// The received samples, and our own transmitted ones alongside: the
-    /// canceller's reference is exactly what `push` was given.
+    /// canceller's reference is exactly what `push` was given. The whole
+    /// far-silent window is kept, because the estimate is a correlation over
+    /// all of it and a correlation that only sees part of it is the one thing
+    /// that cannot be arranged afterwards.
     buf_x: Vec<f64>,
     buf_r: Vec<f64>,
-    /// The reference's auto-spectrum, and the line's. The estimate divides the
-    /// cross-spectrum by the *reference's*, not the line's: for a line that is
-    /// the path applied to the reference, Sxy is H times Srr while the line's own
-    /// |X| squared is H times H times Srr, so dividing by it returns one over H
-    /// rather than H. That is not a scale error but an inversion, and it put a
-    /// filter of norm 2.9 in the path where it amplified instead of cancelling:
-    /// the first attempt read 20.0 at the tap the path had 0.05 at.
-    srr: Vec<f64>,
-    sxx: Vec<f64>,
-    sxy_re: Vec<f64>,
-    sxy_im: Vec<f64>,
-    blocks: usize,
     samples: usize,
     solved: bool,
     /// Cancellation measured over the far-silent window before the solve and
@@ -362,8 +401,9 @@ struct Ls {
     /// window happened to read.
     depth_before: f64,
     depth_after: f64,
-    /// 10log10 of the ratio of the largest to the smallest `Sxx` bin used,
-    /// which is the conditioning the regularisation is answering.
+    /// 10log10 of the ratio of the largest to the smallest pivot the
+    /// factorisation produced, which is how close the normal equations came to
+    /// singular and is what the ridge is there to answer.
     cond_db: f64,
     /// What the solve was told, and what it did.
     note: String,
@@ -383,46 +423,31 @@ struct Ls {
     /// The taps as the gradient left them, so a solve that measures worse than
     /// the gradient can be refused rather than merely complained about.
     kept: Vec<f64>,
-    /// Bins the divide was actually done in, out of `n / 2`.
-    bins_used: usize,
+    /// The correlation the solve was built from, so the test can check the
+    /// estimator against a path it knows rather than against itself.
+    lags: usize,
 }
 
 impl Ls {
     /// An identification window that has collected nothing yet.
     ///
-    /// The transform has to be long enough to hold the path without it
-    /// wrapping round, and the path on this line is 1320 samples -- the
-    /// correlation has been locking at 1159 to 1319 all along and was right.
-    /// Sized to twice the longest delay the search can report, so no echo the
-    /// canceller can lock can alias into a short one. At the 1024 this started
-    /// with, a 1320-sample path came back at 78 and read as a short path and a
-    /// thousand-sample misalignment, which was neither: it was the transform
-    /// folding.
+    /// The lock is not used to size anything. It used to be: the transform was
+    /// twice the lock, on the reasoning that an impulse response has to fit in
+    /// the transform without wrapping round it. That is a real constraint, and
+    /// it is the wrong one to satisfy minimally, because the transform's length
+    /// is also what decides how much of each block's reference the correlation
+    /// can see. A correlation over blocks of `n` for a path at delay `D` sees
+    /// `(n - D) / n` of the reference the numerator needs, while the denominator
+    /// still counts all of it, so the estimate comes out at `g * (1 - D / n)` --
+    /// and `n = 2 D` is exactly where that is one half. The two constraints are
+    /// independent, and the smallest transform that fits the path is the one
+    /// worst placed to measure it. Nothing here is sized against the delay.
     fn blank(lock: usize) -> Self {
-        // Twice the delay the correlation has locked, so the path cannot wrap
-        // round a transform sized for it, and no larger: the DIL is 1.96 s and
-        // the block count is what the estimate's noise falls with. Sized for the
-        // worst lockable delay the DIL over 8192 gave four blocks and a
-        // 75 dB spread, of which 2001 of 4096 bins survived the floor; sized for
-        // the lock this line actually reports, 1319, it is 4096 and gives twelve.
-        // Twice the lock, and no margin beyond it: 2 x 2039 is 4078, which
-        // rounds to 4096, while 2 x (2039 + 64) rounds to 8192 and throws away
-        // two thirds of the averaging for nothing.
-        let n = (2 * lock.max(1)).next_power_of_two().max(2048);
-        let win = (0..n)
-            .map(|i| 0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / n as f64).cos())
-            .collect();
+        let _ = lock;
         Ls {
-            fft: dsp::Fft::new(n),
-            n,
-            win,
-            buf_x: Vec::with_capacity(n),
-            buf_r: Vec::with_capacity(n),
-            srr: vec![0.0; n / 2 + 1],
-            sxx: vec![0.0; n / 2 + 1],
-            sxy_re: vec![0.0; n / 2 + 1],
-            sxy_im: vec![0.0; n / 2 + 1],
-            blocks: 0,
+            // The DIL is 1.96 s, 15 655 samples, and a little slack.
+            buf_x: Vec::with_capacity(20_000),
+            buf_r: Vec::with_capacity(20_000),
             samples: 0,
             solved: false,
             depth_before: 0.0,
@@ -436,8 +461,8 @@ impl Ls {
             post_res: 0.0,
             post_n: 0,
             reported: false,
-            bins_used: 0,
             kept: Vec::new(),
+            lags: 0,
         }
     }
 }
@@ -595,13 +620,12 @@ impl Echo {
     ///
     /// Only called while the modem says the far end is silent, which is what
     /// makes the window a measurement of the path rather than of the far end.
+    ///
+    /// Nothing is computed here. The estimate is a correlation over the whole
+    /// window, so it cannot start until the window has stopped, and doing it
+    /// incrementally over blocks is what put the factor of two into the
+    /// amplitude in the first place.
     fn ls_feed(&mut self, x: f64, r: f64) {
-        let taps = self.w.len();
-        // Long enough to resolve a 512-tap path: the impulse response is read
-        // out of a circular transform of this size, so a path longer than it
-        // would wrap, and 1024 leaves room for the filter plus its own
-        // pre-echo.
-        let _ = taps;
         let ls = self.ls.get_or_insert_with(|| Ls::blank(self.delay));
         if ls.solved {
             return;
@@ -609,34 +633,26 @@ impl Echo {
         ls.samples += 1;
         ls.buf_x.push(x);
         ls.buf_r.push(r);
-        if ls.buf_x.len() < ls.n {
-            return;
-        }
-        // One Welch block: window, transform, accumulate.
-        let mut re: Vec<f64> = ls.buf_x.iter().zip(&ls.win).map(|(v, w)| v * w).collect();
-        let mut im = vec![0.0; ls.n];
-        let mut rr: Vec<f64> = ls.buf_r.iter().zip(&ls.win).map(|(v, w)| v * w).collect();
-        let mut ri = vec![0.0; ls.n];
-        ls.fft.process(&mut re, &mut im);
-        ls.fft.process(&mut rr, &mut ri);
-        for k in 0..=ls.n / 2 {
-            ls.srr[k] += rr[k] * rr[k] + ri[k] * ri[k];
-            ls.sxx[k] += re[k] * re[k] + im[k] * im[k];
-            ls.sxy_re[k] += re[k] * rr[k] + im[k] * ri[k];
-            ls.sxy_im[k] += im[k] * rr[k] - re[k] * ri[k];
-        }
-        ls.blocks += 1;
-        // Three quarters overlap, so a block is never a bare n.
-        let keep = ls.n * 3 / 4;
-        ls.buf_x.drain(..ls.n - keep);
-        ls.buf_r.drain(..ls.n - keep);
     }
 
-    /// Form `H`, read the impulse response back out of it, align it to the
-    /// lock, and put it in the filter. Once per call.
+    /// The tap `k` of a filter with `taps` taps is the reference sample
+    /// `delay - taps / 2 + k` ago, so the whole 512-tap window spans delays
+    /// `delay - 256 ..= delay + 255`. Every lag the estimate needs is in that
+    /// range, and nothing is needed outside it.
     fn ls_solve(&mut self) {
+        let taps = self.w.len();
         let Some(ls) = self.ls.as_mut() else { return };
-        if ls.solved || ls.blocks < 4 {
+        // Sixteen samples a tap, which is where the estimate is good to a fifth
+        // and no further out is worth acting on: measured on a known path, four
+        // samples a tap gives -65% of the gain, eight gives -32%, sixteen -16%,
+        // thirty-two -8% and a hundred and twenty-eight -2%. The shortfall at
+        // the short end is not the correlation's block bias -- there is no
+        // block any more -- but the ridge shrinking a system that 512 taps and
+        // four samples do not determine, and it is a different failure wanting
+        // a different guard. The DIL is 1.96 s, 15 655 samples, thirty a tap,
+        // so on the line this never bites; it is here so that a truncated window
+        // cannot install a filter that is a fraction of the path.
+        if ls.solved || ls.samples < 16 * taps {
             return;
         }
         ls.solved = true;
@@ -648,128 +664,119 @@ impl Echo {
         ls.pred = 0.0;
         ls.res = 0.0;
         ls.solved_at = ls.samples as u64;
-        let n = ls.n;
-        let half = n / 2;
-        // Regularise against the best-conditioned bin: a divide by a bin where
-        // this end's own signal has no energy is how a frequency-domain solve
-        // invents a path out of noise.
-        let peak = ls.srr[..=half].iter().copied().fold(0.0f64, f64::max).max(1e-30);
-        let mut h_re = vec![0.0; n];
-        let mut h_im = vec![0.0; n];
-        let mut used_min = f64::INFINITY;
-        let mut used_max = 0.0f64;
-        // A bin where this end's own signal is down 40 dB carries no
-        // information about the path: dividing there is how a frequency-domain
-        // solve invents one, and it is what put a norm of 3.4 in the filter on
-        // the first attempt. Those bins are left at zero instead, which costs
-        // at most -40 dB of prediction in them -- nothing, against a path that
-        // is 14 dB down to begin with -- and keeps the impulse response short.
-        let floor_bin = peak * LS_FLOOR;
-        let mut used = 0usize;
-        for k in 0..=half {
-            let hr = if ls.srr[k] >= floor_bin {
-                used += 1;
-                ls.sxy_re[k] / (ls.srr[k] + peak * LS_REGULARISE)
-            } else {
-                0.0
-            };
-            let hi = if ls.srr[k] >= floor_bin {
-                ls.sxy_im[k] / (ls.srr[k] + peak * LS_REGULARISE)
-            } else {
-                0.0
-            };
-            // Conjugated, because the inverse transform is conj(FFT(conj(.)).
-            h_re[k] = hr;
-            h_im[k] = -hi;
-            if k > 0 && k < half {
-                used_min = used_min.min(ls.srr[k]);
-                used_max = used_max.max(ls.srr[k]);
-                h_re[n - k] = hr;
-                h_im[n - k] = hi;
-            }
-        }
-        ls.bins_used = used;
-        ls.cond_db = if used_min > 0.0 {
-            10.0 * (used_max / used_min).log10()
-        } else {
-            f64::INFINITY
-        };
-        // The inverse transform, which is not the forward one: IFFT(H) is
-        // conj(FFT(conj(H)))/n. Using a plain forward transform here put the
-        // impulse response at the wrong place entirely -- the peak came back
-        // at 945 with the correlation's lock at 1319 -- and gave the filter a
-        // norm of 2.9, so it amplified where it should have cancelled, and the
-        // cancellation went to -0.2 dB. The conjunctions are already in place
-        // from the bin loop: the spectrum was conjugated as it was mirrored.
-        ls.fft.process(&mut h_re, &mut h_im);
-        let scale = 1.0 / n as f64;
+        ls.lags = taps;
 
-        // Only the real part survives, and conjugating does not change the
-        // real part, so the impulse response is read straight out of the
-        // transform.
-        let imp: Vec<f64> = h_re.iter().map(|v| v * scale).collect();
-
-        // Where the path actually is, and where the filter's window has to put
-        // it.
-        //
-        // The impulse response's index *is* the delay: it comes out of a
-        // circular transform against the transmit sample of the same moment, so
-        // index m is the echo of the transmit sample m ago. And tap k of the
-        // filter multiplies the transmit sample `delay - w.len()/2 + k` ago.
-        // Putting the response's peak at the centre of the window instead --
-        // which is what this did first -- assumes the correlation's lock and
-        // the path agree, and on a real call they do not: the lock was at 1159
-        // and the response's peak at 55, so every tap was 1104 samples out,
-        // further than the whole 512-tap window reaches, and the cancellation
-        // came out at -9.5 dB against the gradient's 9.4.
-        let (peak_at, peak_mag) = imp
-            .iter()
-            .enumerate()
-            .fold((0usize, f64::NEG_INFINITY), |(bi, bm), (i, &v)| {
-                if v.abs() > bm { (i, v.abs()) } else { (bi, bm) }
-            });
-        let centre = self.w.len() / 2;
-        // tap `k` is the sample `delay - centre + k` ago, so the tap that must
-        // carry the path at `peak_at` is `peak_at - delay + centre`.
-        let want = peak_at as isize - self.delay as isize + centre as isize;
-        let mut w = vec![0.0; self.w.len()];
-        let mut placed = 0usize;
-        for (i, &v) in imp.iter().enumerate() {
-            let k = i as isize + want - peak_at as isize;
-            if k >= 0 && (k as usize) < w.len() {
-                w[k as usize] = v;
-                placed += 1;
-            }
-        }
-        let norm: f64 = w.iter().map(|v| v * v).sum::<f64>().sqrt();
-        self.w = w;
-        // With no lock there is no window to put the path in, so keep the
-        // solution and wait: a lock on the next quiet window aligns it.
-        if self.delay == 0 {
+        let centre = taps / 2;
+        let d0 = lock as isize - centre as isize;
+        let n = ls.buf_x.len().min(ls.buf_r.len());
+        if lock == 0 || d0 < 0 || n < d0 as usize + taps {
             ls.note = format!(
-                "solved, {placed} of {} samples placed, peak {peak_mag:.4} at {peak_at}, norm {norm:.4},                  but no delay is locked so the taps are not in use",
-                self.w.len()
+                "not solved: {} samples, lock {lock}, the window spans delays \
+                 {d0}..{}",
+                n,
+                d0 + taps as isize
             );
             return;
         }
+
+        // The two correlations, over the whole window and linearly.
+        //
+        // `q[t]` is the reference's own energy at lag `t`: what a filter with a
+        // tap there can be fitted against. `b[j]` is what the line has at lag
+        // `d0 + j`, which is the tap the answer wants. Both are sums of products
+        // and both skip the lags a sample cannot reach, so the numerator and the
+        // denominator for any one tap are taken over the same samples and the
+        // estimate is unbiased for any delay and any block size. That is the
+        // whole difference from dividing Welch spectra, where the numerator is
+        // `(n - D) / n` of what it should be and the denominator is all of it.
+        let mut q = vec![0.0; taps];
+        let mut b = vec![0.0; taps];
+        for t in 0..taps {
+            let mut acc = 0.0;
+            for i in t..n {
+                acc += ls.buf_r[i] * ls.buf_r[i - t];
+            }
+            q[t] = acc;
+        }
+        for j in 0..taps {
+            let lag = d0 as usize + j;
+            let mut acc = 0.0;
+            for i in lag..n {
+                acc += ls.buf_x[i] * ls.buf_r[i - lag];
+            }
+            b[j] = acc;
+        }
+        let energy = q[0].max(1e-30);
+
+        // The normal equations: a symmetric positive-definite `taps` square,
+        // Toeplitz because the reference is the same signal at every lag. 512
+        // of them is 262 144 entries and the factorisation is a fifth of that
+        // again, which is under a millisecond -- the thing that ruled out
+        // solving these in the time domain was the 650 gigaflops of forming
+        // them over 15 655 samples, not this.
+        //
+        // The circulant embedding, the usual way to do it with a transform, is
+        // not available here: at 54 dB of spectral spread it diverges, and it
+        // did, giving a filter of norm 166 for a path of 0.106.
+        let mut a = vec![0.0; taps * taps];
+        for i in 0..taps {
+            for j in 0..taps {
+                a[i * taps + j] = q[i.abs_diff(j)];
+            }
+            a[i * taps + i] += LS_RIDGE * energy;
+        }
+        let (w, pivots) = match cholesky_solve(&a, &b, taps) {
+            Some(v) => v,
+            None => {
+                ls.note = format!("not solved: the normal equations are not positive definite");
+                return;
+            }
+        };
+        ls.cond_db = {
+            let lo = pivots.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = pivots.iter().copied().fold(0.0f64, f64::max);
+            if lo > 0.0 {
+                10.0 * (hi / lo).log10()
+            } else {
+                f64::INFINITY
+            }
+        };
+
+        // The answer is already the filter.
+        //
+        // There is no alignment step, because there is nothing to align: tap `j`
+        // of the answer is the line's response at delay `d0 + j`, and tap `j` of
+        // the filter is the reference sample `d0 + j` ago. The previous version
+        // read the impulse response out of a circular transform, found its
+        // largest sample, and slid the whole thing so that sample landed on the
+        // tap the correlation's lock implied -- an assumption about two
+        // measurements agreeing which is why the taps were once 1104 samples
+        // out. Here the estimator's index *is* the filter's index.
+        self.w = w.clone();
+
+        let norm: f64 = w.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let (peak_tap, (peak_abs, peak_mag)) = w
+            .iter()
+            .enumerate()
+            .fold((0usize, (0.0f64, 0.0f64)), |(bi, (bm, bv)), (i, &v)| {
+                if v.abs() > bm { (i, (v.abs(), v)) } else { (bi, (bm, bv)) }
+            });
+        let _ = peak_abs;
+        let peak_at = d0 as usize + peak_tap;
+        let placed = w.iter().filter(|v| **v != 0.0).count();
         ls.note = format!(
-            "{placed} of {} samples placed, peak {peak_mag:.4} at a delay of {peak_at} \
-             samples against a lock at {}, norm {norm:.4}",
-            self.w.len(),
-            self.delay
+            "{placed} of {taps} taps set, largest {peak_mag:+.4} at a delay of {peak_at}, \
+             norm {norm:.4}"
         );
         eprintln!(
-            "  echo: DIL identify: correlation lock {lock}, identified delay {peak_at}, \
-             difference {} samples, tap window {}..{}, filter centre {}",
-            peak_at as isize - lock as isize,
-            (lock as isize - centre as isize).max(0),
-            lock as isize + centre as isize,
-            centre
+            "  echo: DIL identify: correlation lock {lock}, the estimate's taps are \
+             indexed by delay directly, window {d0}..{}",
+            d0 + taps as isize
         );
         eprintln!(
-            "  echo: DIL solve: {} samples in {} blocks of {n}, {} of {} bins used \
-             (floor -40 dB), Srr spread {:.1} dB, {}",
-            ls.samples, ls.blocks, ls.bins_used, half, ls.cond_db, ls.note
+            "  echo: DIL solve: {n} samples, {taps} lags, ridge {LS_RIDGE:e} of the \
+             reference's energy, pivot spread {:.1} dB, {}",
+            ls.cond_db, ls.note
         );
     }
 
@@ -1116,17 +1123,12 @@ impl Echo {
             self.report();
         }
         // Solve on the falling edge of the window, not inside it. The DIL is
-        // 1.96 s and every sample of it is worth having: solved after four
-        // blocks -- 1792 samples, 0.22 s -- the estimate came out at a norm of
-        // 3.4 where a 14 dB echo path is about 0.2, and the cancellation went
-        // from 10.6 dB to -5.4 dB. Inside the window the solve also cannot be
-        // checked, because every sample after it would be part of the same
-        // measurement.
+        // 1.96 s and every sample of it is worth having, and the estimate is a
+        // correlation over the whole of it, so there is nothing to solve until
+        // there is no more. Inside the window it could not be checked either,
+        // because every sample after it would be part of the same measurement.
         if !self.far_silent && echo_ls() {
-            let ready = self.ls.as_ref().is_some_and(|l| !l.solved && l.blocks >= 4);
-            if ready {
-                self.ls_solve();
-            }
+            self.ls_solve();
         }
         left
     }
@@ -2272,83 +2274,334 @@ pub extern "C" fn bm_destroy(a: *mut Answerer) {
 mod ls_tests {
     use super::*;
 
-    /// The block identification has to recover a path it was never told, so
-    /// this drives it with a known one: a reference and a line that differ by
-    /// a short reflection, which is what the DIL actually is.
+    /// A reference whose spectrum spans `spread_db` from DC to Nyquist.
     ///
-    /// The gains are what a 14 dB echo looks like -- the far hybrid on this line
-    /// was measured returning the reflection about 14 dB down -- so the filter
-    /// that comes out has a norm of about 0.1, and a result an order of
-    /// magnitude larger is inventing a path rather than finding one.
-    /// Drive the identification with a path at `delay` samples and check that
-    /// it both finds the delay and produces taps that cancel it.
+    /// A one-pole lowpass of coefficient `c` has a response of one over one
+    /// minus `c` times `e` to the minus `jw`, so its magnitude runs from one at
+    /// Nyquist to one over one minus `c` at DC: a spread of 20log10 of one over
+    /// one minus `c`, and `c` set from that is the whole control.
     ///
-    /// The delay is swept rather than fixed, because the number that came out
-    /// of the first attempt -- 55 samples -- was not a property of this line at
-    /// all but of a transform too short to hold the path, and a test pinned to
-    /// it would have locked that in.
-    fn identification_at(delay: usize, gain: f64, lock: usize) {
-        let _ = delay;
+    /// This matters because the excitation is what decides how well the path can
+    /// be identified, and the DIL's is nothing like white: the reference
+    /// spectrum on the 2026-09-26 capture spans 78.8 dB peak to floor. A test
+    /// that excites with white noise says nothing about that, and the estimator
+    /// that passes it lost a factor of four on the line.
+    fn spread_coefficient(spread_db: f64) -> f64 {
+        let tilt = 10f64.powf(spread_db / 20.0);
+        (tilt - 1.0) / (tilt + 1.0)
+    }
+
+    /// `count` samples of reference with the given spectral spread, and a
+    /// history long enough that every read is of a sample already sent.
+    fn reference_with_spread(count: usize, spread_db: f64) -> (Vec<f64>, Vec<f64>) {
+        let c = spread_coefficient(spread_db);
+        let mut seed = 0x2468_1357u32;
+        let mut r = vec![0.0f64; count];
+        let mut z = 0.0f64;
+        for v in r.iter_mut() {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let white = if (seed >> 16) & 1 == 0 { 0.1 } else { -0.1 };
+            z = c * z + white;
+            *v = z;
+        }
+        // Normalised, so the path's gain is the same number whatever the tilt.
+        let rms = (r.iter().map(|v| v * v).sum::<f64>() / count as f64).sqrt();
+        for v in r.iter_mut() {
+            *v /= rms * 3.162_277_660_168_379; /* 0.1 rms */
+        }
+        let history = vec![0.0f64; count];
+        (r, history)
+    }
+
+    /// Run the identification over a known path and return what it recovered.
+    ///
+    /// `path` is `(delay, gain)` pairs relative to the start of the run, and
+    /// the lock is set separately because on a real call the two do not agree
+    /// and that disagreement is a thing to look at on the line rather than to
+    /// fold in here.
+    fn recover(path: &[(usize, f64)], lock: usize, spread_db: f64, count: usize) -> Echo {
+        let (r, mut history) = reference_with_spread(count, spread_db);
         let mut e = Echo::new();
         e.delay = lock;
-        let mut seed = 0x1234_5678u32;
-        let mut r = Vec::with_capacity(60_000);
-        for _ in 0..60_000 {
-            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            r.push(if (seed >> 16) & 1 == 0 { 0.1 } else { -0.1 });
-        }
-        let mut history = vec![0.0f64; r.len()];
         for (n, &tx) in r.iter().enumerate() {
             let mut y = 0.0;
-            if n >= delay {
-                y += gain * history[n - delay];
+            for (d, g) in path {
+                if n >= *d {
+                    y += g * history[n - *d];
+                }
             }
             e.ls_feed(y, tx);
             history[n] = tx;
         }
         e.ls_solve();
-        let ls = e.ls.as_ref().expect("window");
-        assert!(ls.solved, "no solve at a delay of {delay}");
-        let norm = e.w.iter().map(|v| v * v).sum::<f64>().sqrt();
-        // The gain is not what is being pinned here -- the transform smears a
-        // long path a little, and the constant factors of a frequency-domain
-        // estimate are not the question. What has to hold is that the norm is
-        // the path's own order of magnitude, which is what separates a path
-        // from its inverse, and from a filter that amplifies.
-        assert!(
-            norm < 3.0 * gain.abs() + 0.02 && norm > 0.15 * gain.abs(),
-            "a path of {gain} at {delay} samples gave a filter of norm {norm:.4}"
-        );
-        // And the taps must actually cancel: the peak tap has to sit inside the
-        // window, which is what says the delay was found rather than guessed.
-        let (at, mag) = e
-            .w
+        e
+    }
+
+    /// Where the filter's largest tap is, as a delay, and how large it is.
+    fn peak_as_delay(w: &[f64], lock: usize) -> (isize, f64) {
+        let centre = w.len() / 2;
+        let (at, (_, mag)) = w
             .iter()
             .enumerate()
-            .fold((0usize, f64::NEG_INFINITY), |(bi, bm), (i, &v)| {
-                if v.abs() > bm {
-                    (i, v.abs())
-                } else {
-                    (bi, bm)
-                }
+            .fold((0usize, (0.0f64, 0.0f64)), |(bi, (bm, bv)), (i, &v)| {
+                if v.abs() > bm { (i, (v.abs(), v)) } else { (bi, (bm, bv)) }
             });
-        let want = delay as isize - lock as isize + (e.w.len() / 2) as isize;
-        // Eight taps for a path that is short against the transform, scaled by
-        // the window's own width for one that is not: a Hann window smears a
-        // path near the end of the transform over a good fraction of it, so
-        // asking for eight there is asking the estimate to be sharper than a
-        // rectangular average can be.
-        let slack = (Ls::blank(lock).n / 64).max(8);
+        (lock as isize - centre as isize + at as isize, mag)
+    }
+
+    /// The identification has to recover a path it was never told, and recover
+    /// it *quantitatively*: the delay, the sign, the amplitude and a filter that
+    /// actually cancels. Finding the delay is not enough and was not enough --
+    /// the version of this that only checked the delay passed while the
+    /// estimate came back at a quarter of the true gain, and on the real line
+    /// that filter left 0.1 dB of the echo where no cancellation at all would
+    /// have been better.
+    fn identification_at(delay: usize, gain: f64, lock: usize) {
+        // The path this line actually has: a reflection about 20 dB down, a few
+        // samples wide, at the delay the correlation locks.
+        let path = [
+            (delay, gain),
+            (delay + 3, -0.4 * gain),
+            (delay + 7, 0.2 * gain),
+        ];
+        let e = recover(&path, lock, 2.0, 20_000);
+        let ls = e.ls.as_ref().expect("window");
+        assert!(ls.solved, "no solve at a delay of {delay}");
+
+        let (peak_delay, peak_mag) = peak_as_delay(&e.w, lock);
+        // The delay. The largest tap has to be the path's first arrival, and
+        // the estimate's taps are indexed by delay directly, so there is no
+        // alignment step to be wrong about.
         assert!(
-            (at as isize - want).abs() <= slack as isize,
-            "peak at tap {at}, want the tap for a path at {delay} with the lock at \
-             {lock}, which is tap {want}, within {slack}"
+            (peak_delay - delay as isize).abs() <= 4,
+            "the largest tap is at a delay of {peak_delay}, the path is at {delay}"
         );
-        // Not the peak sample: the window spreads a long path over a good
-        // fraction of the transform, so for a path of 3008 samples the peak
-        // sample is 0.019 where the norm is 0.05. The norm above and the
-        // position below are the two things that have to hold.
-        let _ = mag;
+        // The sign. A path that comes back inverted amplifies where it should
+        // have cancelled, which is the failure the very first attempt had.
+        assert!(
+            peak_mag.signum() == gain.signum(),
+            "a path of {gain} came back with its largest tap at {peak_mag:+.4}"
+        );
+        // The amplitude, to a fifth. This is the assertion the estimator did not
+        // have. A Hann-windowed block correlation loses `(n - D) / n` of the
+        // numerator while the denominator still counts the whole block, so at
+        // the n = 2D this was sized to it returns half, and it did.
+        assert!(
+            (peak_mag / gain - 1.0).abs() <= 0.2,
+            "a path of {gain} at {delay} came back at {peak_mag:+.4}, \
+             {}% out",
+            ((peak_mag / gain - 1.0) * 100.0).round()
+        );
+        // The norm, against the impulse response that was injected: a filter
+        // that is much larger is inventing a path, and one that is much smaller
+        // has not found it. The three taps sum in quadrature to 1.09 * |gain|.
+        let norm = e.w.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let true_norm = path
+            .iter()
+            .map(|(_, g)| g * g)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            (norm / true_norm - 1.0).abs() <= 0.35,
+            "a path of norm {true_norm:.4} came back with a filter of norm {norm:.4}"
+        );
+        // And it has to cancel, measured the way the filter will be judged:
+        // on the energy left that is correlated with our own transmit.
+        let (r, mut history) = reference_with_spread(20_000, 2.0);
+        let mut window: Vec<(f64, f64)> = Vec::new();
+        for n in 0..20_000 {
+            let mut y = 0.0;
+            for (d, g) in path {
+                if n >= d {
+                    y += g * history[n - d];
+                }
+            }
+            window.push((y, r[n]));
+            history[n] = r[n];
+        }
+        let rx: Vec<f64> = window.iter().map(|(x, _)| *x).collect();
+        let rf: Vec<f64> = window.iter().map(|(_, r)| *r).collect();
+        let before = Echo::tx_correlated(&rx, &rf, lock, e.w.len());
+        let after = Echo::tx_correlated(
+            &Echo::apply_filter(&e.w, lock, &window),
+            &rf,
+            lock,
+            e.w.len(),
+        );
+        let erle = 10.0 * (before / after.max(1e-30)).log10();
+        eprintln!(
+            "    delay {delay:5} lock {lock:5} gain {gain:+.3} -> {peak_mag:+.4} \
+             ({:+.1}%), norm {norm:.4}, ERLE_tx {erle:.1} dB",
+            (peak_mag / gain - 1.0) * 100.0
+        );
+        assert!(
+            erle > 12.0,
+            "the recovered filter only removed {erle:.1} dB of the transmit"
+        );
+    }
+
+    /// The amplitude across the excitation's whole spectral range.
+    ///
+    /// This is the test that was missing. The DIL's reference spans 78.8 dB
+    /// peak to floor and the earlier one was white at about 2 dB, so every
+    /// assertion about the estimator was being made where it is easiest and
+    /// nowhere near where it is used. The spread is swept with the path held
+    /// fixed, so anything that moves is the excitation and not the path.
+    #[test]
+    fn the_identification_recovers_amplitude_across_the_spectral_range() {
+        let delay = 1320usize;
+        let gain = -0.106f64;
+        let path = [(delay, gain), (delay + 3, -0.4 * gain), (delay + 7, 0.2 * gain)];
+        let mut worst = 0.0f64;
+        eprintln!(
+            "    the DIL's own path, {gain:+.3} at {delay} samples, spread swept:\\n    \
+             spread  recovered   error    norm  ERLE_tx"
+        );
+        for spread in [2.0, 10.0, 20.0, 30.0, 40.0, 54.0, 60.0] {
+            let e = recover(&path, delay, spread, 20_000);
+            let (peak_delay, peak_mag) = peak_as_delay(&e.w, delay);
+            let norm = e.w.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let err = (peak_mag / gain - 1.0).abs();
+            worst = worst.max(err);
+            eprintln!(
+                "    {spread:5.0} dB  {peak_mag:+.4}  {:+6.1}%  {norm:.4}  at delay \
+                 {peak_delay}",
+                (peak_mag / gain - 1.0) * 100.0
+            );
+            assert!(
+                (peak_delay - delay as isize).abs() <= 4,
+                "at {spread} dB of spread the path came back at a delay of {peak_delay}"
+            );
+            assert!(
+                peak_mag.signum() == gain.signum(),
+                "at {spread} dB of spread the path came back at {peak_mag:+.4}, \
+                 inverted"
+            );
+        }
+        // Within a fifth at every spread, which is the milestone. The worst is
+        // the number quoted, because quoting the best would be choosing the
+        // case that flatters.
+        assert!(
+            worst <= 0.2,
+            "the recovered gain was {worst:.0}% out at the worst spread tried, \
+             against a tolerance of 20%"
+        );
+    }
+
+    /// The estimate must not depend on how much of the window it was given.
+    ///
+    /// This is the direct regression for the amplitude error. The old estimator
+    /// accumulated block spectra, and for a path at delay D in blocks of n it
+    /// returned `g * (1 - D / n)`: the numerator is computed over the block and
+    /// the reference it needs for the first D samples is not in the block, while
+    /// the denominator counts the block whole. The transform was sized to twice
+    /// the delay, so the answer was half, and it moved again every time the
+    /// number of blocks changed -- which is why the estimate on the line came
+    /// out 0.0241 against a path measured at 0.106 and cancelled 0.1 dB.
+    ///
+    /// Correlating linearly over the whole window instead of block by block
+    /// removes the dependence entirely, and that is what this holds down: the
+    /// recovered gain is the same to a couple of per cent from four blocks'
+    /// worth of samples to thirty.
+    #[test]
+    fn the_identification_does_not_depend_on_the_window_length() {
+        let delay = 1320usize;
+        let gain = -0.106f64;
+        let path = [
+            (delay, gain),
+            (delay + 3, -0.4 * gain),
+            (delay + 7, 0.2 * gain),
+        ];
+        eprintln!("    the same path from windows of different lengths, and the \
+                   same path from short ones:");
+        // Short windows first, because they are the interesting case and they
+        // are why the live solve has a sample gate at all. This is not the
+        // `1 - D / n` bias: it is the ridge shrinking a system that 512 taps
+        // and four samples do not determine, which is a different failure and
+        // wants a different guard.
+        for count in [2_048, 4_096, 8_192] {
+            let e = recover(&path, delay, 2.0, count);
+            let (_, mag) = peak_as_delay(&e.w, delay);
+            eprintln!(
+                "      {count:6} samples ({:4.1} per tap) -> {mag:+.5}  ({:+.1}%)",
+                count as f64 / 512.0,
+                (mag / gain - 1.0) * 100.0
+            );
+        }
+        let mut seen: Vec<(usize, f64)> = Vec::new();
+        for count in [8_192, 16_384, 32_768, 65_536] {
+            let e = recover(&path, delay, 2.0, count);
+            assert!(e.ls.as_ref().expect("window").solved, "no solve at {count}");
+            let (_, mag) = peak_as_delay(&e.w, delay);
+            eprintln!(
+                "      {count:6} samples ({:4.1} per tap) -> {mag:+.5}  ({:+.1}%)",
+                count as f64 / 512.0,
+                (mag / gain - 1.0) * 100.0
+            );
+            assert!(
+                (mag / gain - 1.0).abs() <= 0.2,
+                "at {count} samples the gain was {:+.1}% out, past the fifth",
+                (mag / gain - 1.0) * 100.0
+            );
+            seen.push((count, mag));
+        }
+        // Past sixteen samples per tap the answer has stopped moving with the
+        // window, which is the property the old estimator did not have: its
+        // factor was `1 - D / nfft` and `nfft` was a free parameter of the
+        // block layout, so doubling the window changed the answer by half again.
+        for w in seen.windows(2) {
+            let drift = (w[1].1 / w[0].1 - 1.0).abs();
+            assert!(
+                drift <= 0.1,
+                "the estimate moved {:.1}% between {} and {} samples",
+                drift * 100.0,
+                w[0].0,
+                w[1].0
+            );
+        }
+    }
+
+    /// A lock below half the tap count cannot be represented, and saying so is
+    /// better than returning half a filter.
+    ///
+    /// Tap `k` reads the reference `lock - centre + k` ago, so the window reaches
+    /// back `centre` samples from the lock and no further: a path arriving
+    /// earlier than that is outside what this filter can express. On the line
+    /// the lock is in 640 to 3072 and `centre` is 256, so it cannot happen; the
+    /// old test asked for a path at 55 samples and only passed because the
+    /// transform was folding it round into the window.
+    #[test]
+    fn the_identification_refuses_a_lock_it_cannot_reach() {
+        let e = recover(&[(55, 0.05)], 55, 2.0, 20_000);
+        let ls = e.ls.as_ref().expect("window");
+        assert!(ls.solved, "the solve was expected to run and decline");
+        assert!(
+            ls.note.contains("not solved"),
+            "the refusal was not recorded: {}",
+            ls.note
+        );
+        assert!(
+            e.w.iter().all(|v| *v == 0.0),
+            "a filter was installed for a path the window cannot reach"
+        );
+    }
+
+    #[test]
+    fn the_dil_identification_finds_a_path_at_the_lock() {
+        identification_at(1319, 0.05, 1319);
+    }
+
+    #[test]
+    fn the_dil_identification_finds_a_path_past_the_transform() {
+        // The length that matters: the delay this line's correlation actually
+        // locks, and one sample either side of the lock to show the two are no
+        // longer assumed to agree.
+        identification_at(1320, 0.04, 1319);
+    }
+
+    #[test]
+    fn the_dil_identification_finds_the_latest_lockable_path() {
+        identification_at(ECHO_LAG_HI - 64, 0.05, ECHO_LAG_HI - 64);
     }
 
     /// The A/B has to prefer the right filter for the right reason, so this
@@ -2452,41 +2705,26 @@ mod ls_tests {
         eprintln!("    old depth metric: good {d_good:.1} dB  noisy {d_noisy:.1} dB");
     }
 
-    #[test]
-    fn the_dil_identification_finds_a_short_path() {
-        // Locked where the path is. Asked for a 55-sample path with the lock at
-        // 1319 the filter comes back empty, which is right: that is 1264 samples
-        // of misalignment and a 512-tap window cannot reach it.
-        identification_at(55, 0.05, 55);
-    }
 
-    #[test]
-    fn the_dil_identification_finds_a_path_at_the_lock() {
-        identification_at(1319, 0.05, 1319);
-    }
 
-    #[test]
-    fn the_dil_identification_finds_a_path_past_the_transform() {
-        // The length that matters: longer than a 1024-point transform can hold
-        // without folding, and the delay this line's correlation actually locks.
-        identification_at(1320, 0.04, 1319);
-    }
 
-    #[test]
-    fn the_dil_identification_finds_the_latest_lockable_path() {
-        identification_at(ECHO_LAG_HI - 64, 0.05, ECHO_LAG_HI - 64);
-    }
 
     #[test]
     fn the_dil_identification_recovers_a_known_path() {
-        let path: [(usize, f64); 3] = [(0, 0.10), (5, -0.05), (11, 0.02)];
+        // One sample, not zero: a tap reads the reference from *before* the
+        // sample it is predicting, so a path component at delay zero would be
+        // read out of history that has not been written yet. At delay zero the
+        // fixture silently described a path of no gain at all and the estimate
+        // correctly reported the next tap along.
+        let path: [(usize, f64); 3] = [(1, 0.10), (5, -0.05), (11, 0.02)];
         let mut e = Echo::new();
         // The lock is a separate matter from the path and the two do not agree
-        // on a real call -- the correlation has been locking at 1159 while the
-        // identification puts the path at 55 -- so this test sets the lock
-        // where the path is, and the disagreement is the thing to look at on
-        // the line rather than something to fold in here.
-        e.delay = 11;
+        // on a real call, so this test sets the lock where the path is, and the
+        // disagreement is the thing to look at on the line rather than
+        // something to fold in here. It sits at half the tap count, which is
+        // the only lock that can express a path arriving at zero: the window
+        // reaches back exactly as far as the lock is from its own centre.
+        e.delay = 256;
         // Broadband, like four points of 22 666 bit/s: a fixed pseudorandom
         // sequence so the test is the same every run.
         let mut seed = 0x1234_5678u32;
@@ -2519,25 +2757,13 @@ mod ls_tests {
             (0.05..0.25).contains(&norm),
             "filter norm {norm:.4}, want about 0.1 for a 14 dB path"
         );
-        // The strongest tap has to sit at the path's first arrival, in the
-        // window's own frame: tap 256 is the lock, and the path is 11 samples
-        // long, so the peak belongs near 256.
-        let (at, mag) = e
-            .w
-            .iter()
-            .enumerate()
-            .fold((0usize, f64::NEG_INFINITY), |(bi, bm), (i, &v)| {
-                if v.abs() > bm {
-                    (i, v.abs())
-                } else {
-                    (bi, bm)
-                }
-            });
-        // Tap 256 is the lock, and the path is 11 samples long, so its first
-        // arrival belongs at 256.
+        // The strongest tap has to sit at the path's first arrival, and
+        // `peak_as_delay` answers in delays. The lock is 256 and the path is
+        // 255 samples ahead of it, at the far end of what the window reaches.
+        let (at, mag) = peak_as_delay(&e.w, e.delay);
         assert!(
-            (240..=270).contains(&at),
-            "peak at tap {at}, want the path's arrival inside the window at the lock"
+            (-1..=3).contains(&at),
+            "the largest tap is at a delay of {at}, the path arrives at 1"
         );
         // The exact per-tap shape is not what this test is for; what matters
         // is that the estimate is a path and not its inverse, which the norm
