@@ -651,7 +651,7 @@ fn data_points() -> Option<std::fs::File> {
 #[derive(Debug, Clone)]
 pub struct Modem {
     settings: Settings,
-    now: u64,
+    pub now: u64,
     stage: Stage,
     status: Status,
     deadline: Option<(u64, &'static str)>,
@@ -1534,14 +1534,22 @@ impl Modem {
                 }
                 if let Some(decoder) = self.decoder.as_mut() {
                     // V90_DATA_POINTS writes the equalised points the data-mode
-                    // decoder is fed, one per line, as re im. What the far end's
+                    // decoder is fed, one per line, as `now re im`, where `now`
+                    // is this modem's own sample count. What the far end's
                     // signal looks like before anything decides what it meant is
                     // the one thing that says whether the receiver is locked:
                     // clusters are a constellation, a smear is not.
+                    //
+                    // The count is on each line so that every point can be tied
+                    // to the line samples it came from, which is what makes it
+                    // possible to measure the echo on the same samples the
+                    // constellation statistics were taken from. `V90_DATA_ECHO`
+                    // writes the line, the transmit reference, the filter's
+                    // prediction and the residual on that same clock.
                     if let Some(mut f) = data_points() {
                         if self.points_written < 8192 {
                             let p = symbol.point;
-                            let _ = writeln!(f, "{:.6} {:.6}", p.re, p.im);
+                            let _ = writeln!(f, "{} {:.6} {:.6}", self.now, p.re, p.im);
                             self.points_written += 1;
                         }
                     }

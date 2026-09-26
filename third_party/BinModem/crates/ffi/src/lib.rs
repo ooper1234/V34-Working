@@ -201,6 +201,9 @@ const ECHO_QUIET_DB: f64 = -30.0; /* input loudness the far end must be under */
 const ECHO_MU: f64 = 0.5;
 /* How far apart the lags of the TX-correlation projection are, in samples. */
 const AB_LAG_STEP: usize = 8;
+/* How many line samples of one call's data-mode window are logged: the same
+   2.56 s the constellation dump covers, so the two describe one interval. */
+const DATA_LOG_SAMPLES: u64 = 20_480;
 /* How long a window the A/B is judged on.
  *
    It has to be longer than the longest delay the search can report plus half
@@ -361,6 +364,20 @@ struct Echo {
     /// The A/B between the gradient's taps and the block solve's, over a window
     /// neither of them was fitted to. See [`Echo::ab_select`].
     ab: Option<Ab>,
+    /// The last sample's line, reference and prediction, so that whoever calls
+    /// [`Echo::sample`] can log all three without this knowing about the log.
+    last: Last,
+}
+
+/// One sample's three series, kept for the data-mode log.
+#[derive(Clone, Copy, Default)]
+struct Last {
+    /// The line as it arrived, before any cancellation.
+    x: f64,
+    /// Our own transmit at that moment, which is what the filter predicted from.
+    r: f64,
+    /// What the filter predicted the line's echo of that would be.
+    yhat: f64,
 }
 
 /// The two candidate filters and the window they are judged on.
@@ -495,6 +512,7 @@ impl Echo {
             frozen: false,
             data: false,
             far_silent: false,
+            last: Last::default(),
             echo_energy: 0.0,
             residual_energy: 0.0,
             gate_samples: 0,
@@ -916,8 +934,8 @@ impl Echo {
 
         // The guard: if neither measurably beats leaving the echo in, take
         // neither. Half a decibel is noise on a window this size.
-        let MARGIN = 0.5f64;
-        let chosen = if p_grad.min(p_ls) > p_none * 10f64.powf(-MARGIN / 10.0) {
+        let margin = 0.5f64;
+        let chosen = if p_grad.min(p_ls) > p_none * 10f64.powf(-margin / 10.0) {
             "neither"
         } else if p_ls < p_grad {
             "LS"
@@ -1173,6 +1191,11 @@ impl Echo {
         if self.ab.as_ref().is_some_and(|a| a.window.len() >= AB_WINDOW) {
             self.ab_select();
         }
+        // The three series, for the data-mode log: what the line carried, which
+        // of our own transmit samples it is an echo of, and what the filter
+        // predicted. `sample` has no other way to hand them up, and the log
+        // wants them for the same sample the receiver is being given.
+        self.last = Last { x, r: self.reference(), yhat };
         left
     }
 
@@ -1291,6 +1314,21 @@ pub struct Answerer {
     echo: Echo,
     /// The call's line audio, when `BM_CAPTURE` named a directory for it.
     capture: Option<Capture>,
+    /// Where the V.90 modem's own sample zero fell in the call's sample
+    /// numbering, so that a sample count it reports can be tied to a line
+    /// sample of the capture. `V90_DATA_ECHO` writes it.
+    v90_origin: u64,
+    /// The V.90 modem's own sample count, read inside the stage match and used
+    /// outside it, where `self` is free to borrow.
+    v90_now: u64,
+    /// Whether this call's data-mode header has been written.
+    echo_state_done: bool,
+    /// The call's data-mode window, the echo canceller's state at its start, and
+    /// the four series the constellation points were made from, all appended to
+    /// one file with a header per data-mode entry. See [`Answerer::write_echo_state`].
+    data_log: Option<std::fs::File>,
+    /// Where the logged window starts, in the V.90 modem's sample numbering.
+    data_log_from: u64,
     /// Line samples stepped, for the transcript's own timestamps.
     samples: u64,
     get_bit: GetBitFn,
@@ -1373,6 +1411,11 @@ impl Answerer {
             out: VecDeque::new(),
             echo: Echo::new(),
             capture: std::env::var_os("BM_CAPTURE").map(|d| Capture::new(std::path::Path::new(&d))),
+        v90_origin: 0,
+        v90_now: 0,
+        echo_state_done: false,
+        data_log: None,
+        data_log_from: u64::MAX,
             samples: 0,
             get_bit,
             get_ud,
@@ -1452,6 +1495,7 @@ fn start_error_control(&mut self) {
     /// as the digital modem: V.90's start-up at the line's own rate, saying
     /// in INFO0d what a real server says (µ-law, the 1664-point upstream).
     fn start_v90(&mut self) {
+        self.v90_origin = self.samples;
         /* LIVE_SERVER is the habit for a real analogue modem on the far end
            rather than another engine: 4.05 s of TRN1d, where PROMPT's 0.3 s
            is all datapump's own analogue modem needs. 2040T (9.3.1.4) is a
@@ -1595,6 +1639,7 @@ fn start_error_control(&mut self) {
                         if !self.physical_connected {
                             self.physical_connected = true;
                             self.v90_in_data = true;
+                            self.v90_now = m.samples();
                             if v90_error_control() {
                                 self.start_error_control();
                             }
@@ -1635,6 +1680,19 @@ fn start_error_control(&mut self) {
             // and Done is silence by definition.
             Stage::V34(_) | Stage::Done => 0.0,
         };
+
+        if self.v90_in_data && !self.echo_state_done {
+            self.echo_state_done = true;
+            self.write_echo_state(self.v90_now);
+        }
+        // The data-mode log wants the sample the receiver was just given, and
+        // the canceller's own three series for that same one. Written here,
+        // after the stage match has finished borrowing self.
+        if self.data_log.is_some() {
+            let now = self.samples.saturating_sub(self.v90_origin);
+            let l = self.echo.last;
+            self.data_log_sample(now, l.x, l.r, l.yhat);
+        }
         let y = if self.want_v90 && self.v90_in_data && v90_tx_mute() { 0.0 } else { y };
         if y.abs() > self.peak {
             self.peak = y.abs();
@@ -1890,6 +1948,94 @@ pub extern "C" fn bm_step(a: *mut Answerer, input: c_int) -> c_int {
 }
 
 impl Answerer {
+    /// Write the echo canceller's state, once per call, when `V90_DATA_ECHO`
+    /// names a file.
+    ///
+    /// This exists so that the echo can be measured on the same line samples the
+    /// constellation statistics come from. `V90_DATA_POINTS` gives each point's
+    /// position in the V.90 modem's own sample numbering; the capture gives the
+    /// line's; and this gives the offset between them and the filter that was
+    /// in the path, so the prediction and the residual can be reproduced
+    /// exactly rather than estimated. The 29.6 dB of ERLE_tx that said the echo
+    /// was cancelled and the E[z^8] of 9.3 that said the constellation was gone
+    /// were taken half a call apart, which is a gap: they could both be true
+    /// and still not be about the same samples.
+    fn write_echo_state(&mut self, v90_now: u64) {
+        let Some(path) = std::env::var_os("V90_DATA_ECHO") else { return };
+        // The offset between this modem's sample count and the call's, read
+        // back from the modem rather than assumed. It was assumed, from the
+        // instant `start_v90` was called, and the two were 24 s apart on the
+        // 2026-09-26 21:45 call: the V.90 modem had been running since before
+        // the FTI's idea of when it started, so the constellation points and
+        // the echo series were 194 698 samples out of step and neither could be
+        // placed against the other.
+        self.v90_origin = self.samples.saturating_sub(v90_now);
+        if self.data_log.is_none()
+            && let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::path::Path::new(&path))
+        {
+            self.data_log = Some(f);
+        }
+        // Every entry, not only the first. A call that retrains reaches data mode
+        // more than once, and which of those a constellation point belongs to is
+        // settled by its count against the header nearest below it; latching on
+        // the first left that unanswerable.
+        self.data_log_from = self.samples.saturating_sub(self.v90_origin);
+        self.data_log_header();
+    }
+
+    /// The header for one call's data-mode window, written once.
+    ///
+    /// Appended and never truncated, because `V90_DATA_POINTS` is appended too
+    /// and a call that reaches data mode more than once must not be mistaken
+    /// for two calls. The V.90 modem's own sample count restarts at zero in each
+    /// new one, so `data_now` is what says which points belong here: a point is
+    /// this call's if its count is at or after this one.
+    fn data_log_header(&mut self) {
+        use std::io::Write;
+        let Some(f) = self.data_log.as_mut() else { return };
+        let _ = writeln!(f, "=== data mode");
+        let _ = writeln!(f, "v90_origin {}", self.v90_origin);
+        let _ = writeln!(f, "data_sample {}", self.samples);
+        let _ = writeln!(f, "data_now {}", self.samples.saturating_sub(self.v90_origin));
+        let _ = writeln!(f, "delay {}", self.echo.delay);
+        let _ = writeln!(f, "taps_count {}", self.echo.w.len());
+        let taps: Vec<String> = self.echo.w.iter().map(|v| format!("{v:.9}")).collect();
+        let _ = writeln!(f, "taps {}", taps.join(" "));
+        eprintln!(
+            "  echo: data-mode window logged: origin {}, data_now {}, delay {}, {} \
+             taps, norm {:.4}",
+            self.v90_origin,
+            self.samples.saturating_sub(self.v90_origin),
+            self.echo.delay,
+            self.echo.w.len(),
+            self.echo.w.iter().map(|v| v * v).sum::<f64>().sqrt()
+        );
+    }
+
+    /// One data-mode sample: its position, the line as it arrived, our own
+    /// transmit at that moment, the echo the filter predicted from it, and what
+    /// was left.
+    ///
+    /// Written from here rather than reconstructed from a capture because these
+    /// are the numbers the receiver was actually given, and the point of the
+    /// measurement is that the constellation statistics and the echo figures
+    /// come off the same samples. Reconstructing the prediction offline from a
+    /// capture and the dumped taps is the same arithmetic, but it has one more
+    /// place to be wrong: the taps drift once data mode starts, and the dump
+    /// holds only the value at the window's start.
+    fn data_log_sample(&mut self, now: u64, x: f64, r: f64, yhat: f64) {
+        use std::io::Write;
+        let start = self.samples.saturating_sub(self.v90_origin);
+        if start < self.data_log_from || start >= self.data_log_from + DATA_LOG_SAMPLES {
+            return;
+        }
+        let Some(f) = self.data_log.as_mut() else { return };
+        let _ = writeln!(f, "s {now} {x:.9} {r:.9} {yhat:.9} {:.9}", x - yhat);
+    }
+
     fn step_inner(&mut self, input: c_int) -> c_int {
         self.samples += 1;
         if self.want_v90 {

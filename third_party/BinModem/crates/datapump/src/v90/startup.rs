@@ -346,6 +346,21 @@ pub struct Digital {
 }
 
 impl Digital {
+    /// How many line samples the V.90 modem inside has been given.
+    ///
+    /// Read by the FFI so that it can put this modem's sample count and the
+    /// call's on one clock. It had been assuming the V.90 modem was created at
+    /// the instant it called `start_v90`, and on the 2026-09-26 21:45 call the
+    /// two were 24 s and 194 698 samples apart, so the constellation points and
+    /// the echo series were 194 698 samples out of step with each other and
+    /// neither could be placed against the other at all. Reading the count back
+    /// cannot drift: the offset is whatever it is at the moment it is taken.
+    pub fn samples(&self) -> u64 {
+        self.v90.as_ref().map_or(0, |m| m.now)
+    }
+}
+
+impl Digital {
     /// Whether the far modem is known to be silent, which only this end's
     /// start-up knows: 9.3.1.6 has it silent through the DIL. The echo filter
     /// needs to be told rather than left to work it out from levels, because a
