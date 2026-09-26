@@ -50,6 +50,21 @@ use super::signals::{self, J_FOUR, J_PRIME, J_SIXTEEN, Reader, Sender, Size};
 use super::trellis::Code;
 use crate::v32::Mode;
 
+/// Where `V34_DATA_POINTS` asks for the equalised points the data-mode decoder
+/// is fed to be written, one per line as re im -- the counterpart of
+/// V90_DATA_POINTS, on the path that works, so the two can be compared.
+fn data_points() -> Option<std::fs::File> {
+    use std::sync::Mutex;
+    static PATH: Mutex<Option<(std::path::PathBuf, Option<std::fs::File>)>> = Mutex::new(None);
+    let want = std::env::var_os("V34_DATA_POINTS")?;
+    let mut guard = PATH.lock().ok()?;
+    if guard.is_none() {
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&want).ok();
+        *guard = Some((std::path::PathBuf::from(&want), file));
+    }
+    guard.as_mut()?.1.as_mut()?.try_clone().ok()
+}
+
 /// How phases 3 and 4 are going.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -802,6 +817,8 @@ pub struct Modem {
     renegotiations: u32,
     /// The most this end's MP offers to receive, if less than it could.
     receive_cap: Option<u8>,
+    /// Equalised data-mode points written, for `V34_DATA_POINTS`.
+    points_written: usize,
     /// Data mode's signal to noise, sampled every [`SNR_EVERY`], newest last,
     /// and when it was last sampled.
     data_snr: VecDeque<f64>,
@@ -882,6 +899,7 @@ impl Modem {
             clearing: false,
             renegotiations: 0,
             receive_cap: None,
+            points_written: 0,
             data_snr: VecDeque::with_capacity(SNR_KEPT),
             data_snr_at: 0,
             precoding: [(0, 0); 3],
@@ -1337,6 +1355,21 @@ impl Modem {
                     return;
                 }
                 if let Some(decoder) = self.decoder.as_mut() {
+                    // V34_DATA_POINTS writes the equalised points the data-mode
+                    // decoder is fed, one per line as re im -- the same hook as
+                    // V90_DATA_POINTS, on the path that works, so that the two
+                    // can be compared. A constellation shows as discrete radii
+                    // and angles; a smear shows as neither, and the slicer's
+                    // grid is far too coarse for its SNR figure to tell the
+                    // difference.
+                    if let Some(mut f) = data_points() {
+                        if self.points_written < 8192 {
+                            let p = symbol.point;
+                            use std::io::Write as _;
+                            let _ = writeln!(f, "{:.6} {:.6}", p.re, p.im);
+                            self.points_written += 1;
+                        }
+                    }
                     decoder.feed(symbol.point);
                     let strayed = decoder.path_cost() > STRAYED_COST;
                     self.take_decoded();
