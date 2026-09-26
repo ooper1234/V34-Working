@@ -252,6 +252,12 @@ struct Echo {
     /// slow step over a start-up sequence would learn the far end's training
     /// signal instead of the path, and phase 4 stops reading altogether.
     data: bool,
+    /// The far end is known to be silent, which only the modem knows: 9.3.1.6
+    /// has it silent through the DIL, and that is the one window in the whole
+    /// call where the line is loud with nothing but our own reflection. The
+    /// filter cannot work it out from levels, because a line loud with this
+    /// end's own transmission is loud in every window.
+    far_silent: bool,
     /// The double-talk gate's running sums over one window: the energy the
     /// echo accounts for, and the energy it does not.
     echo_energy: f64,
@@ -281,6 +287,7 @@ impl Echo {
             seen: Vec::with_capacity(ECHO_WINDOW),
             frozen: false,
             data: false,
+            far_silent: false,
             echo_energy: 0.0,
             residual_energy: 0.0,
             gate_samples: 0,
@@ -424,16 +431,26 @@ impl Echo {
         rms < 10f64.powf(ECHO_QUIET_DB / 20.0)
     }
 
-    /// Whether the filter may keep adapting with the far end talking, which
-    /// `ECHO_DOUBLE_TALK` in the environment asks for: over a whole window,
-    /// only while the echo accounts for most of what has arrived, so the
-    /// filter follows a reflection that has grown without learning the far
-    /// end's signal. Measured on the 2026-09-24 call and left as it stands:
-    /// the echo there is only 1.5 to 4.3 times the residual, so the gate is
-    /// shut almost as often as the wanted signal is, and opening it changed
-    /// nothing that could be measured -- one phase 4 read four of five
-    /// sequences that way and another none, against two of 27 without it.
-    #[allow(dead_code)]
+    /// Whether the echo accounts for most of what has arrived, which is the
+    /// question that decides whether a step taken now is a gradient on the
+    /// filter or on the far end's signal.
+    ///
+    /// This is what `quiet()` cannot answer, and getting it wrong is what kept
+    /// the filter from ever converging. `quiet()` asks whether the *input* is
+    /// below -30 dBFS, and the one window where the far end is guaranteed
+    /// silent -- the DIL, 9.3.1.6 -- is the one window where this end is
+    /// transmitting four points of 22 666 bit/s and the input is loud with our
+    /// own reflection. So the DIL reads as loud, the gate that was meant to
+    /// open there never did, and the filter was last adapted on whatever gaps
+    /// the far modem's own transmissions left.
+    ///
+    /// Measured on a call of 2026-09-26 16:16 with the equalised points as the
+    /// score, which is the first score that can see this at all: the filter
+    /// reached 0.24 of tap norm and a cancellation depth of -4.6 dB in data
+    /// mode, the client's signal sat 18 dB above the floor under all of it,
+    /// and the equalised points read E[z^8] 19.3 -- noise. The same call with
+    /// this end's transmit muted reads E[z^8] 472560, a constellation. The
+    /// receiver was never the problem; it was reading our own echo.
     fn double_talk(&mut self, x: f64, yhat: f64) -> bool {
         if !double_talk() {
             return false;
@@ -486,7 +503,17 @@ impl Echo {
                 // 5.8, 6.0 dB with it and the same eight without -- because
                 // the analogue modem's S-bar is in that window too, and a fast
                 // step learns it instead of the path.
-                let mu = if self.quiet() {
+                // Three ways the far end can be quiet enough to learn the path
+                // from: the line is quiet outright; the modem says the far end
+                // is silent, which 9.3.1.6 guarantees through the DIL and which
+                // is the one wideband window in the call; or the echo already
+                // accounts for most of what has arrived, which covers the start
+                // of data mode before the far modem's own signal fills the
+                // band. The second is the one that matters and it cannot be
+                // inferred: a line loud with this end's own transmission is
+                // loud in every window, so `quiet()` alone leaves the DIL --
+                // the only wideband chance to learn the path -- shut.
+                let mu = if self.quiet() || self.far_silent || self.double_talk(x, yhat) {
                     ECHO_MU
                 } else if self.data {
                     slow_mu()
@@ -881,6 +908,13 @@ fn start_error_control(&mut self) {
                 for note in m.take_notes() {
                     eprintln!("[{at:8.3}s] BinModem V.90: {note}");
                 }
+                // 9.3.1.6: the far modem is silent through the DIL, and that is
+                // the only window in the call where the line carries this end's
+                // own transmission and nothing else. The echo filter may only
+                // learn the path there, and it cannot tell: a line loud with our
+                // own reflection is loud in every window, so the silence has to
+                // be passed to it.
+                self.echo.far_silent = m.far_end_silent();
                 // V.90 retrains in place, so C is handed no status for one
                 // failing: the reason goes to the transcript here or nowhere.
                 if let Some(why) = m.last_failure()

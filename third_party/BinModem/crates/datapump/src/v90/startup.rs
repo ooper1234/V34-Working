@@ -147,6 +147,7 @@ impl Analogue {
         self.last_failure
     }
 
+
     /// Rate renegotiations and cleardowns since the call began, V.90's and
     /// V.34's.
     pub fn renegotiations(&self) -> u32 {
@@ -345,6 +346,16 @@ pub struct Digital {
 }
 
 impl Digital {
+    /// Whether the far modem is known to be silent, which only this end's
+    /// start-up knows: 9.3.1.6 has it silent through the DIL. The echo filter
+    /// needs to be told rather than left to work it out from levels, because a
+    /// line loud with this end's own transmission is loud in every window --
+    /// so the one window in the call where the path can be learned is the one
+    /// a level test would shut.
+    pub fn far_end_silent(&self) -> bool {
+        self.v90.as_ref().is_some_and(|m| m.far_end_silent())
+    }
+
     pub fn new(info0d: Info0d) -> Self {
         let law = if info0d.a_law { Law::A } else { Law::Mu };
         // A full-scale sine is +3.17 dBm0 in G.711.
