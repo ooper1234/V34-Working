@@ -88,6 +88,63 @@ fn echo_taps() -> usize {
     }
     guard.unwrap_or(ECHO_TAPS)
 }
+/// ECHO_REFERENCE, when it names a capture, supplies the echo filter's
+/// reference from channel 1 of that recording -- the transmit channel -- instead
+/// of from what this run generated.
+///
+/// A replay generates a different transmit signal from the one in the
+/// recording, so the canceller adapts to a signal that is not the one whose
+/// echo is on the line and cancels almost none of it: that is why the replay of
+/// a V.90 call used to stop short of data mode, and why parameter sweeps had to
+/// be run on the hardware, one call each. Reading the reference off the
+/// recording puts the live path back together around a recording, and the
+/// sweep becomes a replay.
+fn recorded_next() -> Option<f64> {
+    use std::sync::Mutex;
+    static SAMPLES: Mutex<Option<(Vec<i16>, usize)>> = Mutex::new(None);
+    let mut guard = SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        let path = std::env::var("ECHO_REFERENCE").ok()?;
+        let raw = std::fs::read(&path).unwrap_or_else(|why| panic!("ECHO_REFERENCE {path}: {why}"));
+        assert_eq!(&raw[0..4], b"RIFF" as &[u8; 4], "ECHO_REFERENCE {path} is not a RIFF file");
+        let mut i = 12;
+        let (mut rate, mut data) = (0u32, Vec::new());
+        while i + 8 <= raw.len() {
+            let id = &raw[i..i + 4];
+            let n = u32::from_le_bytes(raw[i + 4..i + 8].try_into().expect("four bytes")) as usize;
+            if id == b"fmt " {
+                rate = u32::from_le_bytes(raw[i + 12..i + 16].try_into().expect("four bytes"));
+            } else if id == b"data" {
+                data = raw[i + 8..(i + 8 + n).min(raw.len())]
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+            }
+            i += 8 + n + (n & 1);
+        }
+        assert_eq!(rate, LINE_FS as u32, "ECHO_REFERENCE {path} is not a line-rate capture");
+        // Stereo, interleaved: the even samples are what arrived and the odd
+        // ones what went out, so the reference is every other sample.
+        //
+        // Start where the replay starts. A replay fed from V90_AT seconds in
+        // meets the line at that point, so a reference read from the top of the
+        // file would be that many seconds out of step with the echo on it and
+        // would cancel none of it -- which is where the replay used to stop,
+        // short of data mode.
+        let skip = std::env::var("V90_AT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+            .max(0.0);
+        *guard = Some((data, (skip * f64::from(LINE_FS)) as usize));
+    }
+    let (samples, at) = guard.as_mut().expect("set just above");
+    // 2n + 1: channel 1, the transmit channel.
+    let s = samples.get(2 * *at + 1).copied().unwrap_or(0);
+    *at += 1;
+    Some(f64::from(s) / 32768.0)
+}
+
 const ECHO_RING: usize = 8192; /* transmit history, just over a second */
 const ECHO_LAG_LO: usize = 640; /* search from 80 ms ... */
 const ECHO_LAG_HI: usize = 3072; /* ... to 384 ms */
@@ -327,7 +384,7 @@ impl Echo {
 
     /// What we put on the line (post-gain), newest last.
     fn push(&mut self, y: f64) {
-        self.tx[self.tx_pos] = y;
+        self.tx[self.tx_pos] = recorded_next().unwrap_or(y);
         self.tx_pos = (self.tx_pos + 1) % self.tx.len();
     }
 
