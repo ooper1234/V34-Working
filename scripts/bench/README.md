@@ -48,3 +48,28 @@ Notes that cost time to learn:
   lo rather than on the line, and `ping -I ppp0` bound to a device never matches
   the reply. Judge the line by the interface counters and the receive dump, not
   by ping.
+
+## Deciding whether a capture is evidence
+
+`v90-peer-gate.py CAPTURE.wav` is the first thing to run on any new capture. It
+answers whether a peer is transmitting at all, from the capture and the
+transcript, in five checks: DATA entered and with what rate and framing; TX/RX
+continuity; wideband energy in the band the carrier and symbol rate imply; the
+band *filled* rather than two tones, with our own transmit fitted out first; and
+structure at the symbol instants, off the wire, before any receiver is involved.
+Any of the first four failing means the capture says nothing about the receiver.
+
+Validated in both directions by `v90-peer-gate-control.py`, which adds a
+well-formed 3200-baud upstream to a real capture and then takes it away again:
+9.2 dB of band range with it, 17.4 dB without, against a 12 dB threshold.
+
+All eight captures in `/tmp/opencode/v90cap` fail it, at 17.4 to 19.9 dB.
+
+## The client modem
+
+`loopback-probe.py` asks whether the client modem echoes bytes written to it
+with no call up: it does not, and the kernel's line discipline is raw so nothing
+there is echoing either. `datamode-probe.py` dials to data mode holding the port
+and times what comes back -- a valid PPP frame written in returns the far end's
+genuine LCP Configure-Request 33 to 1033 ms later, never a copy. The link
+carries real PPP; `pppd` on the client declares loopback on it.
